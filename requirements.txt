@@ -1,0 +1,13 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+pydantic==2.7.4
+sqlalchemy==2.0.31
+alembic==1.13.2
+langgraph==0.1.13
+langchain-core>=0.2.22
+openai==1.35.0
+apscheduler==3.10.4
+python-multipart==0.0.9
+aiofiles==23.2.1
+pillow==10.3.0
+imagehash==4.3.1

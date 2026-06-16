@@ -1,0 +1,74 @@
+{
+  "amused": {
+    "name": "感到有趣",
+    "description": "被逗乐、调侃、看热闹不嫌事大、觉得对方很有趣"
+  },
+  "distress": {
+    "name": "悲伤委屈",
+    "description": "悲伤、委屈、挫败、请求怜悯、想哭"
+  },
+  "observing": {
+    "name": "围观观察",
+    "description": "关注、好奇、围观、暗中观察、吃瓜"
+  },
+  "disdain": {
+    "name": "反感嫌弃",
+    "description": "反感、鄙视、嫌弃、下头、看不起"
+  },
+  "overload": {
+    "name": "疲惫过载",
+    "description": "疲惫、卡顿、过载、处于困境、脑子转不动"
+  },
+  "surprised": {
+    "name": "意外震惊",
+    "description": "意外、震惊、不可思议、没想到"
+  },
+  "resting": {
+    "name": "休息睡觉",
+    "description": "休息、睡觉、准备结束对话、晚安"
+  },
+  "smiling": {
+    "name": "礼貌微笑",
+    "description": "礼貌微笑、满意、心情愉悦、温和"
+  },
+  "helpless": {
+    "name": "无奈无语",
+    "description": "无奈、无语、感慨、摆烂、没办法"
+  },
+  "confused": {
+    "name": "困惑疑问",
+    "description": "困惑、疑问、装作不知情、没听懂"
+  },
+  "affection": {
+    "name": "喜爱心动",
+    "description": "喜爱、好感、心动、示爱、星星眼"
+  },
+  "praise": {
+    "name": "认可点赞",
+    "description": "认可、点赞、鼓励、庆祝、做得好"
+  },
+  "intimidating": {
+    "name": "压迫警告",
+    "description": "压迫感、严厉警告、不满凝视、别惹我"
+  },
+  "bashful": {
+    "name": "害羞局促",
+    "description": "害羞、局促、不好意思、脸红"
+  },
+  "angry": {
+    "name": "愤怒反对",
+    "description": "愤怒、激烈反对、严辞拒绝、生气"
+  },
+  "energetic": {
+    "name": "兴奋活力",
+    "description": "兴奋、活力、搞怪、俏皮提示、元气满满"
+  },
+  "interaction": {
+    "name": "社交互动",
+    "description": "社交行为、拜年、送礼、分享、问候、要红包"
+  },
+  "miscellaneous": {
+    "name": "其他",
+    "description": "其他难以归类或多重含义，兜底分类"
+  }
+}
