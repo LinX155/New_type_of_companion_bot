@@ -1,6 +1,6 @@
 import json
 import re
-from typing import TypedDict
+from typing import Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
@@ -34,6 +34,13 @@ class CompanionGraph:
         self.meme_renderer = MemeRenderer(meme_catalog)
         self._conversation_history: list = []
         self._workflow = self._build_workflow()
+        # Debug / observability fields for the MVP status bar
+        self._last_llm_raw_output: Optional[str] = None
+        self._last_parsed_action: Optional[str] = None
+        self._last_parsed_text: Optional[str] = None
+        self._last_parse_status: str = "ok"
+        self._last_search_meme: Optional[str] = None
+        self._last_render_status: Optional[str] = None
 
     def _build_workflow(self):
         graph = StateGraph(GraphState)
@@ -106,7 +113,11 @@ class CompanionGraph:
             temperature=0.3,
             max_tokens=512,
         )
-        decision = self._parse_decision(raw_output)
+        self._last_llm_raw_output = raw_output
+        decision, parse_status = self._parse_decision(raw_output)
+        self._last_parse_status = parse_status
+        self._last_parsed_action = decision.action.value
+        self._last_parsed_text = decision.text
         decision = self._apply_protocol_guards(state["ctx"], decision)
         state["ctx"].decision = decision
         return {**state, "decision": decision}
@@ -126,7 +137,11 @@ class CompanionGraph:
         ctx = state["ctx"]
         decision = state["decision"]
 
+        self._last_search_meme = decision.text
+        self._last_render_status = None
+
         if ctx.meme_search_used:
+            self._last_render_status = "fallback"
             return {**state, "decision": ActionDecision(action=Action.LIGHT_ACK, text="嗯")}
 
         ctx.meme_search_used = True
@@ -138,6 +153,7 @@ class CompanionGraph:
         ctx.meme_candidates = candidates
 
         if not candidates:
+            self._last_render_status = "fallback"
             return {**state, "decision": ActionDecision(action=Action.LIGHT_ACK, text="嗯")}
 
         messages = build_meme_search_messages(
@@ -152,7 +168,7 @@ class CompanionGraph:
             temperature=0.2,
             max_tokens=128,
         )
-        second_decision = self._parse_decision(raw_output)
+        second_decision, _ = self._parse_decision(raw_output)
 
         if (
             second_decision.action == Action.REACT
@@ -176,12 +192,15 @@ class CompanionGraph:
             file_stem = decision.text[5:]
             path = self.meme_renderer.render_meme(file_stem)
             if not path:
+                self._last_render_status = "miss"
                 decision = ActionDecision(action=Action.LIGHT_ACK, text="嗯")
                 ctx.selected_meme = None
             else:
+                self._last_render_status = "hit"
                 ctx.selected_meme = file_stem
 
         if decision.action == Action.REACT and decision.text and decision.text.startswith("search_meme:"):
+            self._last_render_status = "fallback"
             decision = ActionDecision(action=Action.LIGHT_ACK, text="嗯")
 
         ctx.decision = decision
@@ -199,10 +218,12 @@ class CompanionGraph:
 
             self._conversation_history = self._conversation_history[-60:]
 
-    def _parse_decision(self, raw_output: str) -> ActionDecision:
+    def _parse_decision(self, raw_output: str) -> tuple[ActionDecision, str]:
         text = raw_output.strip() if raw_output else ""
         if not text:
-            return ActionDecision(action=Action.WAIT, text=None)
+            self._last_parsed_action = Action.WAIT.value
+            self._last_parsed_text = None
+            return ActionDecision(action=Action.WAIT, text=None), "fallback"
 
         json_match = re.search(r"\{.*\}", text, re.DOTALL)
         if json_match:
@@ -210,7 +231,10 @@ class CompanionGraph:
                 data = json.loads(json_match.group())
                 action_str = str(data.get("action", "REPLY")).strip().upper()
                 if action_str in [a.value for a in Action]:
-                    return ActionDecision(action=action_str, text=data.get("text"))
+                    parsed = ActionDecision(action=action_str, text=data.get("text"))
+                    self._last_parsed_action = parsed.action.value
+                    self._last_parsed_text = parsed.text
+                    return parsed, "ok"
             except Exception:
                 pass
 
@@ -220,7 +244,10 @@ class CompanionGraph:
             data = json.loads(text_clean)
             action_str = str(data.get("action", "REPLY")).strip().upper()
             if action_str in [a.value for a in Action]:
-                return ActionDecision(action=action_str, text=data.get("text"))
+                parsed = ActionDecision(action=action_str, text=data.get("text"))
+                self._last_parsed_action = parsed.action.value
+                self._last_parsed_text = parsed.text
+                return parsed, "ok"
         except Exception:
             pass
 
@@ -229,21 +256,33 @@ class CompanionGraph:
             action_str = bracket_match.group(1).upper()
             action_text = bracket_match.group(2).strip() or None
             if action_str == Action.WAIT.value:
-                return ActionDecision(action=Action.WAIT, text=None)
-            if action_str == Action.REACT.value and action_text:
-                return ActionDecision(action=Action.REACT, text=self._normalize_react_text(action_text))
-            return ActionDecision(action=action_str, text=action_text)
+                parsed = ActionDecision(action=Action.WAIT, text=None)
+            elif action_str == Action.REACT.value and action_text:
+                parsed = ActionDecision(action=Action.REACT, text=self._normalize_react_text(action_text))
+            else:
+                parsed = ActionDecision(action=action_str, text=action_text)
+            self._last_parsed_action = parsed.action.value
+            self._last_parsed_text = parsed.text
+            return parsed, "ok"
 
         upper_text = text.upper()
         if '"ACTION":"WAIT"' in upper_text or "'ACTION':'WAIT'" in upper_text:
-            return ActionDecision(action=Action.WAIT, text=None)
+            self._last_parsed_action = Action.WAIT.value
+            self._last_parsed_text = None
+            return ActionDecision(action=Action.WAIT, text=None), "ok"
 
         if '"ACTION":"REACT"' in upper_text or "'ACTION':'REACT'" in upper_text:
             text_match = re.search(r'"text"[:\s]*"([^"]*)"', text, re.IGNORECASE)
             if text_match:
-                return ActionDecision(action=Action.REACT, text=self._normalize_react_text(text_match.group(1)))
+                parsed = ActionDecision(action=Action.REACT, text=self._normalize_react_text(text_match.group(1)))
+                self._last_parsed_action = parsed.action.value
+                self._last_parsed_text = parsed.text
+                return parsed, "ok"
 
-        return ActionDecision(action=Action.REPLY, text=text)
+        parsed = ActionDecision(action=Action.REPLY, text=text)
+        self._last_parsed_action = parsed.action.value
+        self._last_parsed_text = parsed.text
+        return parsed, "fallback"
 
     def _normalize_react_text(self, action_text: str) -> str:
         valid_categories = {
@@ -287,3 +326,30 @@ class CompanionGraph:
 
     def get_history(self) -> list:
         return list(self._conversation_history)
+
+    # Debug / observability getters for the MVP status bar
+    def get_last_llm_raw_output(self) -> Optional[str]:
+        return self._last_llm_raw_output
+
+    def get_last_parsed_decision(self) -> dict:
+        return {
+            "action": self._last_parsed_action,
+            "text": self._last_parsed_text,
+            "parse_status": self._last_parse_status,
+        }
+
+    def get_last_meme_search(self) -> Optional[str]:
+        return self._last_search_meme
+
+    def get_last_render_status(self) -> Optional[str]:
+        return self._last_render_status
+
+    def get_last_llm_observability(self) -> dict:
+        return {
+            "last_llm_raw": self._last_llm_raw_output,
+            "last_parsed_action": self._last_parsed_action,
+            "last_parsed_text": self._last_parsed_text,
+            "parse_status": self._last_parse_status,
+            "last_search_meme": self._last_search_meme,
+            "last_render_status": self._last_render_status,
+        }

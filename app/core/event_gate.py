@@ -27,6 +27,11 @@ class EventGate:
         self._sent_job_ids: set = set()
         self._last_decision: Optional[ActionDecision] = None
         self._last_snapshot_result: Optional[str] = None
+        self._last_command: Optional[str] = None
+        self._last_command_result: Optional[str] = None
+        self._last_process_context: Optional[ProcessContext] = None
+        self._last_command: Optional[str] = None
+        self._last_command_result: Optional[str] = None
 
     async def handle_event(self, event: ChatEvent) -> dict:
         """处理进入的事件，返回处理结果摘要"""
@@ -144,6 +149,7 @@ class EventGate:
             job_id=job_id,
             snapshot=snapshot,
         )
+        self._last_process_context = ctx
 
         # 异步调用 LLM（不阻塞事件处理）
         asyncio.create_task(self._run_llm_task(ctx))
@@ -271,6 +277,16 @@ class EventGate:
 
     def get_last_snapshot_result(self) -> Optional[str]:
         return self._last_snapshot_result
+
+    def record_command(self, command: str, result: str):
+        self._last_command = command
+        self._last_command_result = result
+
+    def get_last_command(self) -> Optional[str]:
+        return self._last_command
+
+    def get_last_command_result(self) -> Optional[str]:
+        return self._last_command_result
 
 
 class ProcessContext:

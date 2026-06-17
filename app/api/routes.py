@@ -289,6 +289,7 @@ async def send_message(msg: ChatMessage):
 
     if event_type == EventType.COMMAND_MEM:
         success, response_text = memory_manager.apply_mem_command(text)
+        event_gate.record_command("/mem", "success" if success else "error")
         await _record_command_response("command.mem", response_text, success)
         await _emit_message({
             "type": "assistant_message",
@@ -302,6 +303,7 @@ async def send_message(msg: ChatMessage):
 
     if event_type == EventType.COMMAND_FORGET:
         success, response_text = memory_manager.apply_forget_command(text)
+        event_gate.record_command("/forget", "success" if success else "error")
         await _record_command_response("command.forget", response_text, success)
         await _emit_message({
             "type": "assistant_message",
@@ -508,8 +510,80 @@ async def get_status():
     await event_gate.maybe_exit_hot()
     last_decision = event_gate.get_last_decision()
     last_result = event_gate.get_last_snapshot_result()
+    last_snapshot = event_gate.snapshot_manager.get_last_snapshot()
+    last_ctx = event_gate._last_process_context
+
+    # 计算热聊剩余时间（分钟）
+    hot_remaining = None
+    if event_gate.state.hot_until:
+        hot_remaining = max(0, int((event_gate.state.hot_until - datetime.now()).total_seconds() / 60))
+
+    # 从 LLM 主图获取最近一次解析状态
+    parsed = companion_graph.get_last_parsed_decision() if companion_graph else {}
+
+    # 组装 Snapshot 面板数据
+    snapshot_panel = {
+        "snapshot_id": event_gate.state.current_snapshot_id,
+        "buffer_version": event_gate.state.buffer_version,
+        "status": event_gate.state.status.value,
+        "buffered_events": len(event_gate.buffer._events),
+        "memory_sources": ["SOUL", "MEMORY_CORE", "dm"],
+    }
+    if event_gate.state.status.value == "COLD":
+        if last_snapshot and last_snapshot.cold_start_meta:
+            snapshot_panel["cold_start_meta"] = {
+                "timestamp": last_snapshot.cold_start_meta.timestamp,
+                "last_user_message_age": last_snapshot.cold_start_meta.last_user_message_age,
+                "msg_index": last_snapshot.cold_start_meta.msg_index,
+                "status": last_snapshot.cold_start_meta.status.value,
+            }
+        else:
+            snapshot_panel["context_note"] = "等待第一条消息，尚未生成 cold_start_meta"
+    else:
+        snapshot_panel["hot_until"] = event_gate.state.hot_until.isoformat() if event_gate.state.hot_until else None
+        snapshot_panel["hot_remaining"] = hot_remaining
+        snapshot_panel["context_note"] = "热聊状态，不传递 cold_start_meta"
+
+    # LLM 决策结果
+    llm_panel = {
+        "last_llm_raw": companion_graph.get_last_llm_raw_output() if companion_graph else None,
+        "last_parsed_action": parsed.get("action"),
+        "last_parsed_text": parsed.get("text"),
+        "parse_status": parsed.get("parse_status"),
+        "decision_result": last_result,
+    }
+
+    # 事件门实时状态
+    gate_panel = {
+        "pending_job_id": event_gate._pending_job_id,
+        "buffered_events": len(event_gate.buffer._events),
+        "stale_jobs_count": len(event_gate._stale_job_ids),
+        "sent_jobs_count": len(event_gate._sent_job_ids),
+    }
+
+    # Meme / 命令链路
+    meme_panel = None
+    if last_ctx and (last_ctx.meme_search_used or companion_graph.get_last_meme_search()):
+        meme_panel = {
+            "search_meme": companion_graph.get_last_meme_search(),
+            "candidates": last_ctx.meme_candidates,
+            "selected_meme": last_ctx.selected_meme,
+            "render_status": companion_graph.get_last_render_status(),
+            "last_command": event_gate.get_last_command(),
+            "command_result": event_gate.get_last_command_result(),
+        }
+    elif event_gate.get_last_command():
+        meme_panel = {
+            "search_meme": None,
+            "candidates": [],
+            "selected_meme": None,
+            "render_status": None,
+            "last_command": event_gate.get_last_command(),
+            "command_result": event_gate.get_last_command_result(),
+        }
+
     return {
-        # 对话层状态
+        # 兼容旧字段
         "status": event_gate.state.status.value,
         "buffer_version": event_gate.state.buffer_version,
         "msg_index_today": event_gate.state.msg_index_today,
@@ -518,13 +592,11 @@ async def get_status():
         "last_action": last_decision.action.value if last_decision else None,
         "last_text": last_decision.text if last_decision else None,
         "last_snapshot_result": last_result,
-        # 实时事件门状态
-        "gate": {
-            "pending_job_id": event_gate._pending_job_id,
-            "stale_jobs_count": len(event_gate._stale_job_ids),
-            "sent_jobs_count": len(event_gate._sent_job_ids),
-            "buffered_events": len(event_gate.buffer._events),
-        },
+        "gate": gate_panel,
+        # 新 MVP 调试面板字段
+        "snapshot": snapshot_panel,
+        "llm": llm_panel,
+        "meme": meme_panel,
     }
 
 

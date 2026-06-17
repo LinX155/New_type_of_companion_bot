@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import DebugStatusBar, { DebugStatus } from './DebugStatusBar';
 
 interface Message {
   id: string;
@@ -11,8 +12,9 @@ interface Message {
   timestamp: string;
 }
 
-interface StatusInfo {
-  status: string;
+interface StatusInfo extends DebugStatus {
+  // 保留旧字段用于兼容
+  status?: string;
   buffer_version?: number;
   msg_index_today?: number;
   hot_until?: string;
@@ -150,12 +152,6 @@ const ChatWindow: React.FC = () => {
     await fetch(`${API_BASE}/api/conversation/clear`, { method: 'POST' });
     setMessages([]);
     setStatus(null);
-  };
-
-  const renderMemeUrl = (memePath: string) => {
-    // memePath is file_stem, we need to find category
-    // For now use a generic endpoint or infer from stem
-    return `${API_BASE}/api/memes/image/_/${memePath}`; // fallback
   };
 
   return (
@@ -299,56 +295,9 @@ const ChatWindow: React.FC = () => {
         </div>
       </div>
 
-      {/* System status panel */}
+      {/* Debug status panel */}
       {showSystem && (
-        <div style={{ width: '280px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-          {/* LLM / 对话层状态 */}
-          <div style={{
-            background: '#fff',
-            borderRadius: '8px',
-            padding: '16px',
-            fontSize: '13px',
-            lineHeight: 1.6,
-          }}>
-            <h3 style={{ marginBottom: '12px', fontSize: '15px', color: '#2c3e50' }}>对话层 (LLM)</h3>
-            {status ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <div><strong>状态:</strong> <span style={{ color: status.status === 'HOT' ? '#e74c3c' : '#3498db', fontWeight: 600 }}>{status.status}</span></div>
-                <div><strong>今日消息数:</strong> {status.msg_index_today}</div>
-                <div><strong>HOT持续时间:</strong> {status.hot_duration_minutes}分钟</div>
-                {status.hot_until && (
-                  <div><strong>HOT剩余:</strong> {Math.max(0, Math.ceil((new Date(status.hot_until).getTime() - Date.now()) / 60000))}分钟</div>
-                )}
-                <div><strong>最后动作:</strong> {status.last_action || '-'}</div>
-                <div><strong>最后文本:</strong> {status.last_text ? (status.last_text.length > 30 ? status.last_text.slice(0, 30) + '...' : status.last_text) : '-'}</div>
-                <div><strong>最后结果:</strong> {status.last_snapshot_result || '-'}</div>
-              </div>
-            ) : (
-              <div style={{ color: '#95a5a6' }}>加载中...</div>
-            )}
-          </div>
-
-          {/* EventGate 实时事件门状态 */}
-          <div style={{
-            background: '#fff',
-            borderRadius: '8px',
-            padding: '16px',
-            fontSize: '13px',
-            lineHeight: 1.6,
-          }}>
-            <h3 style={{ marginBottom: '12px', fontSize: '15px', color: '#2c3e50' }}>事件门 (EventGate)</h3>
-            {status?.gate ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <div><strong>缓冲区事件:</strong> {status.gate.buffered_events}</div>
-                <div><strong>当前Job:</strong> {status.gate.pending_job_id ? status.gate.pending_job_id.slice(-10) : '无'}</div>
-                <div><strong>已作废Job数:</strong> {status.gate.stale_jobs_count}</div>
-                <div><strong>已发送Job数:</strong> {status.gate.sent_jobs_count}</div>
-              </div>
-            ) : (
-              <div style={{ color: '#95a5a6' }}>加载中...</div>
-            )}
-          </div>
-        </div>
+        <DebugStatusBar status={status} />
       )}
     </div>
   );
