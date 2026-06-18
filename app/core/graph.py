@@ -84,6 +84,7 @@ class CompanionGraph:
             soul_md=self.memory.read_soul() if include_profile else "",
             memory_core_md=self.memory.read_memory_core() if include_profile else "",
             today_memory_md=self.memory.read_today_memory() if include_profile else "",
+            tomorrow_topics_md=self.memory.read_tomorrow_topics() if include_profile else "",
             chat_status=snapshot.status.value,
             msg_index=snapshot.cold_start_meta.msg_index if snapshot.cold_start_meta else 0,
             last_message_age=snapshot.cold_start_meta.last_user_message_age if snapshot.cold_start_meta else "unknown",

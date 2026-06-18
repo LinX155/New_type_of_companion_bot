@@ -21,6 +21,14 @@ _DEFAULTS = {
     "memory_analysis_day": {"hour": 13, "minute": 0},
     "memory_analysis_night": {"hour": 19, "minute": 0},
     "midnight_cleanup": {"hour": 3, "minute": 30},
+    "active_message": {
+        "enabled": False,
+        "hour": 10,
+        "minute": 0,
+        "daily_limit": 1,
+        "quiet_start_hour": 0,
+        "quiet_end_hour": 9,
+    },
 }
 
 

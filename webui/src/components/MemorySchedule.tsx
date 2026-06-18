@@ -15,6 +15,16 @@ const MemorySchedule: React.FC = () => {
   const [hotDuration, setHotDuration] = useState(30);
   const [savedHot, setSavedHot] = useState(false);
   const [dirtyHot, setDirtyHot] = useState(false);
+  const [activeEnabled, setActiveEnabled] = useState(false);
+  const [activeHour, setActiveHour] = useState(10);
+  const [activeMinute, setActiveMinute] = useState(0);
+  const [activeDailyLimit, setActiveDailyLimit] = useState(1);
+  const [quietStartHour, setQuietStartHour] = useState(0);
+  const [quietEndHour, setQuietEndHour] = useState(9);
+  const [savedActive, setSavedActive] = useState(false);
+  const [dirtyActive, setDirtyActive] = useState(false);
+  const [activeStatus, setActiveStatus] = useState<any>(null);
+  const [activeRunResult, setActiveRunResult] = useState('');
 
   useEffect(() => {
     fetch(`${API_BASE}/api/memory/schedule`)
@@ -43,6 +53,20 @@ const MemorySchedule: React.FC = () => {
         }
       })
       .catch(() => {});
+
+    fetch(`${API_BASE}/api/active-message/config`)
+      .then(r => r.json())
+      .then(data => {
+        setActiveEnabled(Boolean(data.enabled));
+        setActiveHour(data.hour ?? 10);
+        setActiveMinute(data.minute ?? 0);
+        setActiveDailyLimit(data.daily_limit ?? 1);
+        setQuietStartHour(data.quiet_start_hour ?? 0);
+        setQuietEndHour(data.quiet_end_hour ?? 9);
+      })
+      .catch(() => {});
+
+    loadActiveStatus();
   }, []);
 
   const handleSave = async () => {
@@ -79,6 +103,49 @@ const MemorySchedule: React.FC = () => {
       setTimeout(() => setSavedHot(false), 2000);
     } catch {
       alert('保存失败');
+    }
+  };
+
+  const loadActiveStatus = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/active-message/status`);
+      const data = await response.json();
+      setActiveStatus(data);
+    } catch {}
+  };
+
+  const handleSaveActiveMessage = async () => {
+    try {
+      await fetch(`${API_BASE}/api/active-message/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enabled: activeEnabled,
+          hour: activeHour,
+          minute: activeMinute,
+          daily_limit: activeDailyLimit,
+          quiet_start_hour: quietStartHour,
+          quiet_end_hour: quietEndHour,
+        }),
+      });
+      setSavedActive(true);
+      setDirtyActive(false);
+      setTimeout(() => setSavedActive(false), 2000);
+      loadActiveStatus();
+    } catch {
+      alert('保存失败');
+    }
+  };
+
+  const handleRunActiveMessage = async () => {
+    setActiveRunResult('检查中');
+    try {
+      const response = await fetch(`${API_BASE}/api/active-message/run`, { method: 'POST' });
+      const data = await response.json();
+      setActiveRunResult(data.status === 'sent' ? '已发送' : `未发送：${data.reason || data.status}`);
+      loadActiveStatus();
+    } catch {
+      setActiveRunResult('检查失败');
     }
   };
 
@@ -144,6 +211,113 @@ const MemorySchedule: React.FC = () => {
           >
             {saved ? '已保存 ✓' : '保存配置'}
           </button>
+        </div>
+      </div>
+
+      <div style={{ background: '#fff', padding: '24px', borderRadius: '8px' }}>
+        <h2 style={{ marginBottom: '16px' }}>主动消息配置</h2>
+        <p style={{ color: '#7f8c8d', fontSize: '13px', marginBottom: '20px' }}>
+          主动消息每天按固定时间检查一次，只在空闲、未超上限且有 pending 候选时发送。
+        </p>
+
+        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '18px', fontSize: '14px' }}>
+          <input
+            type="checkbox"
+            checked={activeEnabled}
+            onChange={e => { setActiveEnabled(e.target.checked); setDirtyActive(true); }}
+          />
+          启用主动消息
+        </label>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '18px' }}>
+          <div>
+            <h3 style={{ fontSize: '15px', marginBottom: '10px' }}>每日检查时间</h3>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <input type="number" min={0} max={23} value={activeHour} onChange={e => { setActiveHour(Number(e.target.value)); setDirtyActive(true); }} style={timeInputStyle} />
+              <span>:</span>
+              <input type="number" min={0} max={59} value={activeMinute} onChange={e => { setActiveMinute(Number(e.target.value)); setDirtyActive(true); }} style={timeInputStyle} />
+            </div>
+          </div>
+
+          <div>
+            <h3 style={{ fontSize: '15px', marginBottom: '10px' }}>每日上限</h3>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <input
+                type="number"
+                min={1}
+                max={3}
+                value={activeDailyLimit}
+                onChange={e => { setActiveDailyLimit(Number(e.target.value)); setDirtyActive(true); }}
+                style={timeInputStyle}
+              />
+              <span>条</span>
+            </div>
+          </div>
+
+          <div>
+            <h3 style={{ fontSize: '15px', marginBottom: '10px' }}>免打扰时段</h3>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <input type="number" min={0} max={23} value={quietStartHour} onChange={e => { setQuietStartHour(Number(e.target.value)); setDirtyActive(true); }} style={timeInputStyle} />
+              <span>点 到</span>
+              <input type="number" min={0} max={23} value={quietEndHour} onChange={e => { setQuietEndHour(Number(e.target.value)); setDirtyActive(true); }} style={timeInputStyle} />
+              <span>点</span>
+            </div>
+          </div>
+        </div>
+
+        <div style={{
+          marginTop: '20px',
+          padding: '12px',
+          background: '#f8f9fa',
+          borderRadius: '6px',
+          border: '1px solid #edf0f2',
+          color: '#2c3e50',
+          fontSize: '13px',
+          lineHeight: 1.7,
+        }}>
+          <div>今日已发：{activeStatus?.sent_today ?? 0} 条</div>
+          <div>未回复退避：{activeStatus?.has_unanswered_active_message ? '生效中' : '未触发'}</div>
+          <div>EventGate：{activeStatus?.gate_ready ? '空闲' : '不可发送'}</div>
+          <div>
+            候选：pending {activeStatus?.candidates?.status?.pending ?? 0} /
+            used {activeStatus?.candidates?.status?.used ?? 0} /
+            blocked {activeStatus?.candidates?.status?.blocked ?? 0} /
+            expired {activeStatus?.candidates?.status?.expired ?? 0}
+          </div>
+        </div>
+
+        <div style={{ marginTop: '18px', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+          <button
+            onClick={handleSaveActiveMessage}
+            disabled={!dirtyActive}
+            style={{
+              padding: '10px 24px',
+              background: dirtyActive ? '#3498db' : '#bdc3c7',
+              color: '#fff',
+              border: 'none',
+              borderRadius: '6px',
+              cursor: dirtyActive ? 'pointer' : 'not-allowed',
+              fontSize: '14px',
+            }}
+          >
+            {savedActive ? '已保存 ✓' : '保存配置'}
+          </button>
+          <button
+            onClick={handleRunActiveMessage}
+            disabled={!activeEnabled}
+            style={{
+              padding: '10px 18px',
+              background: activeEnabled ? '#2c3e50' : '#bdc3c7',
+              color: '#fff',
+              border: 'none',
+              borderRadius: '6px',
+              cursor: activeEnabled ? 'pointer' : 'not-allowed',
+              fontSize: '14px',
+            }}
+          >
+            立即检查一次
+          </button>
+          {activeRunResult && <span style={{ color: '#7f8c8d', fontSize: '13px' }}>{activeRunResult}</span>}
         </div>
       </div>
 

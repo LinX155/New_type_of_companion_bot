@@ -31,6 +31,9 @@ HOT_MEMORY_CORE_PLACEHOLDER = (
 HOT_TODAY_MEMORY_PLACEHOLDER = (
     "(HOT 中不重复展开当日记忆；以最近聊天和当前输入为主。)"
 )
+HOT_TOMORROW_TOPICS_PLACEHOLDER = (
+    "(HOT 中不重复展开 TOMORROW_TOPICS.md；不要强行续旧话题。)"
+)
 
 
 SYSTEM_PROMPT_TEMPLATE = """你不是大模型不是AI，是由下方 SOUL.md 定义的人，不是工具型助手、客服或心理咨询师。
@@ -83,11 +86,12 @@ JSON schema:
 - 如果需要回应，优先短句、贴近当前语境、像真实聊天一样接住对方。
 
 记忆使用方式:
-- MEMORY_CORE.md 和当日记忆只用于影响你的判断、语气、边界和接话方式。
+- MEMORY_CORE.md、当日记忆和 TOMORROW_TOPICS.md 只用于影响你的判断、语气、边界和接话方式。
 - 自然聊天中不要显式说“根据我的记忆”“我记得你的来源是”“dm 里写着”“MEMORY_CORE 里说”等审计式表述。
 - 不要把来源标记、文件名、日期路径或记忆分区名发给用户。
 - 除非用户明确问你记住了什么、要求核对记忆或正在使用 /mem、/forget，否则不要把记忆当成证据展示。
 - 可以自然地承接已知事实和相处偏好，但要像熟悉的人一样直接调整回应，而不是解释你为什么知道。
+- TOMORROW_TOPICS.md 只在自然相关、用户没有开启更明确当前话题时参考；如果用户当前输入已经开启新话题，优先当前话题，不要强行追问旧话题。
 
 角色配置 SOUL.md:
 {soul_md}
@@ -97,6 +101,9 @@ JSON schema:
 
 当日记忆 dm/{today_date}.md:
 {today_memory_md}
+
+未闭合话题 TOMORROW_TOPICS.md:
+{tomorrow_topics_md}
 
 当前运行上下文:
 - 当前时间: {current_time}
@@ -135,22 +142,26 @@ def build_system_prompt(
     msg_index: int = 0,
     last_message_age: str = "unknown",
     include_profile: bool = True,
+    tomorrow_topics_md: str = "",
 ) -> str:
     now = datetime.now()
     if include_profile:
         rendered_soul = soul_md or "(暂无 SOUL.md 配置。默认：有点懒散、有点傲娇但内心温柔的朋友。)"
         rendered_memory_core = memory_core_md or "(暂无长期核心记忆。)"
         rendered_today_memory = today_memory_md or "(暂无当日记忆。)"
+        rendered_tomorrow_topics = tomorrow_topics_md or "(暂无未闭合话题。)"
     else:
         rendered_soul = HOT_SOUL_PLACEHOLDER
         rendered_memory_core = HOT_MEMORY_CORE_PLACEHOLDER
         rendered_today_memory = HOT_TODAY_MEMORY_PLACEHOLDER
+        rendered_tomorrow_topics = HOT_TOMORROW_TOPICS_PLACEHOLDER
 
     return SYSTEM_PROMPT_TEMPLATE.format(
         meme_categories=MEME_CATEGORIES_TEXT,
         soul_md=rendered_soul,
         memory_core_md=rendered_memory_core,
         today_memory_md=rendered_today_memory,
+        tomorrow_topics_md=rendered_tomorrow_topics,
         current_time=now.strftime("%H:%M"),
         today_date=now.strftime("%Y-%m-%d"),
         chat_status=chat_status,
@@ -208,6 +219,47 @@ def build_meme_search_messages(base_messages: list, requested_text: str, categor
             ),
         },
         {"role": "user", "content": f"候选表情:\n{candidates_text}"},
+    ]
+
+
+def build_active_message_messages(
+    candidate_section: str,
+    candidate_text: str,
+    soul_md: str = "",
+    memory_core_md: str = "",
+    current_time: str = "",
+) -> list:
+    system = """你是主动消息生成线程，不是聊天角色本体。
+你的任务是把一个 TOMORROW_TOPICS.md 候选改写成一条低压力、可忽略、自然的主动开场。
+
+只输出 JSON 对象，不要输出 Markdown、解释、前后缀或额外文本。
+
+JSON schema:
+{
+  "action": "WAIT" | "REPLY" | "REACT",
+  "text": string | null
+}
+
+规则:
+- 候选只是素材，不是必须发送；不合适就输出 WAIT。
+- 主动消息不是提醒工具，不要替用户做日程提醒或强制追问结果。
+- 优先一句短话，像朋友轻轻接一下，不要长篇，不要连续提问。
+- 不要表达强烈想念、责备、不满、等待感。
+- 不要伪造真实生活经历，不要说你刚做了什么、看到什么、路过哪里。
+- 不要利用用户脆弱点做召回。
+- 不要显式提 TOMORROW_TOPICS、候选、来源、记忆文件名。
+- REACT 仅允许 emoji:*；不要输出 search_meme:* 或 meme:*。
+- 如果使用 REPLY，text 最多 30 个中文字符左右。"""
+    user = {
+        "current_time": current_time,
+        "candidate_section": candidate_section,
+        "candidate_text": candidate_text,
+        "soul_md": soul_md or "",
+        "memory_core_md": memory_core_md or "",
+    }
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
     ]
 
 

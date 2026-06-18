@@ -154,6 +154,60 @@ class EventGate:
         # 异步调用 LLM（不阻塞事件处理）
         asyncio.create_task(self._run_llm_task(ctx))
 
+    async def reserve_active_message_job(self) -> Optional[str]:
+        """为主动消息占用一次发送权。
+
+        主动消息不进入聊天 buffer，但生成期间仍需要占用 pending job，
+        这样用户突然发消息时会把主动任务标记为 stale，避免撞车。
+        """
+        await self.maybe_exit_hot()
+        async with self._pending_job_lock:
+            if self._pending_job_id is not None:
+                return None
+
+            events, version = await self.buffer.get_snapshot()
+            self.state.buffer_version = version
+            if events or self.state.status != ChatStatus.COLD:
+                return None
+
+            job_id = f"active_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+            self._pending_job_id = job_id
+            return job_id
+
+    async def can_accept_active_message(self) -> bool:
+        await self.maybe_exit_hot()
+        async with self._pending_job_lock:
+            if self._pending_job_id is not None:
+                return False
+
+        events, version = await self.buffer.get_snapshot()
+        self.state.buffer_version = version
+        return not events and self.state.status == ChatStatus.COLD
+
+    async def is_active_message_job_current(self, job_id: str) -> bool:
+        if self.is_job_stale(job_id) or self.is_job_sent(job_id):
+            return False
+
+        async with self._pending_job_lock:
+            if self._pending_job_id != job_id:
+                return False
+
+        events, version = await self.buffer.get_snapshot()
+        self.state.buffer_version = version
+        return not events and self.state.status == ChatStatus.COLD
+
+    async def finish_active_message_job(self, job_id: str, result: str):
+        async with self._pending_job_lock:
+            if self._pending_job_id == job_id:
+                self._pending_job_id = None
+
+        if result == "sent":
+            self.mark_job_sent(job_id)
+        elif result == "stale_dropped":
+            self.mark_job_stale_dropped(job_id)
+        else:
+            self.mark_job_dropped(job_id)
+
     async def _run_llm_task(self, ctx: "ProcessContext"):
         """运行 LLM 任务并处理结果"""
         try:

@@ -8,7 +8,15 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from sqlalchemy import desc
 
+from ..active.messages import (
+    count_candidates_by_status,
+    expire_stale_candidates,
+    mark_candidate_status,
+    parse_active_decision,
+    select_pending_candidate,
+)
 from ..core.event_gate import EventGate, ProcessContext
 from ..core.events import ChatEvent, EventType
 from ..core.decisions import Action
@@ -16,6 +24,7 @@ from ..core.graph import CompanionGraph
 from ..core.state import ChatStatus
 from ..core.settings import load_settings, save_settings
 from ..llm.client import LLMClient
+from ..llm.prompts import build_active_message_messages
 from ..memory.files import MemoryFileManager
 from ..memes.catalog import MemeCatalog
 from ..scheduler.jobs import SchedulerManager
@@ -79,6 +88,15 @@ event_gate: Optional[EventGate] = None
 # Store for WebUI callbacks
 message_callbacks = []
 
+ACTIVE_MESSAGE_DEFAULTS = {
+    "enabled": False,
+    "hour": 10,
+    "minute": 0,
+    "daily_limit": 1,
+    "quiet_start_hour": 0,
+    "quiet_end_hour": 9,
+}
+
 
 class ApiConfig(BaseModel):
     api_key: str
@@ -106,6 +124,15 @@ class MemoryScheduleConfig(BaseModel):
 
 class HotDurationConfig(BaseModel):
     hot_duration_minutes: int
+
+
+class ActiveMessageConfig(BaseModel):
+    enabled: bool = False
+    hour: int = 10
+    minute: int = 0
+    daily_limit: int = 1
+    quiet_start_hour: int = 0
+    quiet_end_hour: int = 9
 
 
 async def on_decision(ctx: ProcessContext):
@@ -253,6 +280,9 @@ def init_gate():
             cfg = _persisted.get(job_id)
             if isinstance(cfg, dict):
                 scheduler_manager.update_schedule(job_id, cfg.get("hour"), cfg.get("minute"))
+        active_cfg = _normalize_active_message_config(_persisted.get("active_message"))
+        scheduler_manager.update_schedule("active_message", active_cfg["hour"], active_cfg["minute"])
+        scheduler_manager.set_active_message_callback(run_active_message_once)
         scheduler_manager.start()
 
 
@@ -411,6 +441,215 @@ def _record_llm_error(ctx: ProcessContext, error_message: str):
         db.close()
 
 
+async def run_active_message_once(manual: bool = False) -> dict:
+    """执行一次主动消息检查。
+
+    MVP 只做一次轻量开场：有 pending 候选、处于 COLD、无未处理输入、未超每日上限时才发送。
+    """
+    init_gate()
+    config = _normalize_active_message_config(load_settings().get("active_message"))
+    now = datetime.now()
+
+    if not config["enabled"]:
+        return {"status": "skipped", "reason": "disabled"}
+    if not manual and _is_quiet_time(now, config):
+        return {"status": "skipped", "reason": "quiet_hours"}
+    if _active_messages_sent_today() >= config["daily_limit"]:
+        return {"status": "skipped", "reason": "daily_limit"}
+    if _has_unanswered_active_message():
+        return {"status": "skipped", "reason": "unanswered_backoff"}
+
+    job_id = await event_gate.reserve_active_message_job()
+    if not job_id:
+        return {"status": "skipped", "reason": "gate_busy"}
+
+    try:
+        topics = memory_manager.read_tomorrow_topics()
+        topics, expired_count = expire_stale_candidates(topics)
+        if expired_count and not memory_manager.write_tomorrow_topics(topics):
+            await event_gate.finish_active_message_job(job_id, "dropped")
+            return {"status": "error", "reason": "failed_to_expire_candidates"}
+
+        candidate = select_pending_candidate(topics)
+        if not candidate:
+            await event_gate.finish_active_message_job(job_id, "dropped")
+            return {"status": "skipped", "reason": "no_candidate"}
+
+        if not llm_client.api_key:
+            await event_gate.finish_active_message_job(job_id, "dropped")
+            return {"status": "skipped", "reason": "llm_not_configured"}
+
+        await _emit_llm_started()
+        messages = build_active_message_messages(
+            candidate_section=candidate.section,
+            candidate_text=candidate.text,
+            soul_md=memory_manager.read_soul(),
+            memory_core_md=memory_manager.read_memory_core(),
+            current_time=now.strftime("%H:%M"),
+        )
+        raw_output = await llm_client.chat_completion(messages=messages, temperature=0.3, max_tokens=256)
+        decision = parse_active_decision(raw_output)
+
+        if not await event_gate.is_active_message_job_current(job_id):
+            event_gate.mark_job_stale_dropped(job_id)
+            await event_gate.dispatch_latest_after_stale(job_id)
+            return {"status": "skipped", "reason": "stale_dropped"}
+
+        if decision.action == Action.WAIT:
+            if not memory_manager.write_tomorrow_topics(
+                mark_candidate_status(memory_manager.read_tomorrow_topics(), candidate, "blocked")
+            ):
+                await event_gate.finish_active_message_job(job_id, "dropped")
+                return {"status": "error", "reason": "failed_to_block_candidate"}
+            await event_gate.finish_active_message_job(job_id, "dropped")
+            await _emit_state({"job_id": job_id, "result": "active_wait"})
+            return {"status": "skipped", "reason": "llm_wait"}
+
+        from ..core.router import ActionRouter
+        routed = ActionRouter().route(decision)
+        if not routed["visible"] or not routed["text"]:
+            await event_gate.finish_active_message_job(job_id, "dropped")
+            await _emit_state({"job_id": job_id, "result": "active_dropped"})
+            return {"status": "skipped", "reason": "not_visible"}
+
+        if not memory_manager.write_tomorrow_topics(
+            mark_candidate_status(memory_manager.read_tomorrow_topics(), candidate, "used")
+        ):
+            await event_gate.finish_active_message_job(job_id, "dropped")
+            return {"status": "error", "reason": "failed_to_mark_used"}
+
+        _record_active_message(job_id, raw_output, decision, routed)
+        event_gate.record_decision(decision)
+        await event_gate.finish_active_message_job(job_id, "sent")
+
+        if companion_graph and routed["text"]:
+            companion_graph._conversation_history.append({"role": "assistant", "text": routed["text"]})
+            companion_graph._conversation_history = companion_graph._conversation_history[-60:]
+
+        await _emit_message({
+            "type": "assistant_message",
+            "action": decision.action.value,
+            "text": routed["text"],
+            "visible": True,
+            "is_meme": routed.get("is_meme", False),
+            "meme_path": None,
+            "source": "active_message",
+        })
+        return {
+            "status": "sent",
+            "job_id": job_id,
+            "action": decision.action.value,
+            "candidate_section": candidate.section,
+        }
+    except Exception as e:
+        await event_gate.finish_active_message_job(job_id, "dropped")
+        return {"status": "error", "reason": str(e)}
+
+
+def _record_active_message(job_id: str, raw_output: str, decision, routed: dict):
+    db = next(get_db())
+    try:
+        raw = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id="default",
+            event_type="active_message",
+            llm_raw_output=raw_output,
+            action=decision.action.value,
+            final_text=routed.get("text"),
+            job_id=job_id,
+            status="sent",
+        )
+        db.add(raw)
+
+        event_type = "assistant_react" if decision.action == Action.REACT else "assistant_text"
+        conv = ConversationEvent(
+            session_id="default",
+            event_type=event_type,
+            text=routed.get("text"),
+            is_visible=True,
+            action="active_message",
+        )
+        db.add(conv)
+        db.commit()
+    finally:
+        db.close()
+
+
+def _normalize_active_message_config(config: Optional[dict]) -> dict:
+    merged = dict(ACTIVE_MESSAGE_DEFAULTS)
+    if isinstance(config, dict):
+        merged.update(config)
+
+    return {
+        "enabled": bool(merged.get("enabled")),
+        "hour": _clamp_int(merged.get("hour"), 0, 23, ACTIVE_MESSAGE_DEFAULTS["hour"]),
+        "minute": _clamp_int(merged.get("minute"), 0, 59, ACTIVE_MESSAGE_DEFAULTS["minute"]),
+        "daily_limit": _clamp_int(merged.get("daily_limit"), 1, 3, ACTIVE_MESSAGE_DEFAULTS["daily_limit"]),
+        "quiet_start_hour": _clamp_int(
+            merged.get("quiet_start_hour"), 0, 23, ACTIVE_MESSAGE_DEFAULTS["quiet_start_hour"]
+        ),
+        "quiet_end_hour": _clamp_int(
+            merged.get("quiet_end_hour"), 0, 23, ACTIVE_MESSAGE_DEFAULTS["quiet_end_hour"]
+        ),
+    }
+
+
+def _clamp_int(value, min_value: int, max_value: int, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(min_value, min(max_value, parsed))
+
+
+def _is_quiet_time(now: datetime, config: dict) -> bool:
+    start = config["quiet_start_hour"]
+    end = config["quiet_end_hour"]
+    hour = now.hour
+    if start == end:
+        return False
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+def _active_messages_sent_today() -> int:
+    start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    db = next(get_db())
+    try:
+        return (
+            db.query(ConversationEvent)
+            .filter(ConversationEvent.created_at >= start)
+            .filter(ConversationEvent.action == "active_message")
+            .count()
+        )
+    finally:
+        db.close()
+
+
+def _has_unanswered_active_message() -> bool:
+    db = next(get_db())
+    try:
+        last_active = (
+            db.query(ConversationEvent)
+            .filter(ConversationEvent.action == "active_message")
+            .order_by(desc(ConversationEvent.created_at))
+            .first()
+        )
+        if not last_active:
+            return False
+
+        last_user = (
+            db.query(ConversationEvent)
+            .filter(ConversationEvent.event_type.in_(["user_text", "user_command"]))
+            .order_by(desc(ConversationEvent.created_at))
+            .first()
+        )
+        return not last_user or last_user.created_at <= last_active.created_at
+    finally:
+        db.close()
+
+
 @router.post("/api/nudge")
 async def send_nudge():
     init_gate()
@@ -462,6 +701,39 @@ async def update_memory_schedule(config: MemoryScheduleConfig):
         "midnight_cleanup": {"hour": config.midnight_cleanup_hour, "minute": config.midnight_cleanup_minute},
     })
     return {"status": "ok"}
+
+
+@router.get("/api/active-message/config")
+async def get_active_message_config():
+    return _normalize_active_message_config(load_settings().get("active_message"))
+
+
+@router.post("/api/active-message/config")
+async def update_active_message_config(config: ActiveMessageConfig):
+    init_gate()
+    normalized = _normalize_active_message_config(config.model_dump())
+    scheduler_manager.update_schedule("active_message", normalized["hour"], normalized["minute"])
+    save_settings({"active_message": normalized})
+    return {"status": "ok", "config": normalized}
+
+
+@router.get("/api/active-message/status")
+async def get_active_message_status():
+    init_gate()
+    topics = memory_manager.read_tomorrow_topics()
+    return {
+        "config": _normalize_active_message_config(load_settings().get("active_message")),
+        "sent_today": _active_messages_sent_today(),
+        "has_unanswered_active_message": _has_unanswered_active_message(),
+        "candidates": count_candidates_by_status(topics),
+        "gate_ready": await event_gate.can_accept_active_message() if hasattr(event_gate, "can_accept_active_message") else None,
+    }
+
+
+@router.post("/api/active-message/run")
+async def run_active_message_now():
+    init_gate()
+    return await run_active_message_once(manual=True)
 
 
 @router.get("/api/memes/stats")
@@ -573,7 +845,7 @@ async def get_status():
         "buffer_version": event_gate.state.buffer_version,
         "status": event_gate.state.status.value,
         "buffered_events": len(event_gate.buffer._events),
-        "memory_sources": ["SOUL", "MEMORY_CORE", "dm"],
+        "memory_sources": ["SOUL", "MEMORY_CORE", "dm", "TOMORROW_TOPICS"],
     }
     if event_gate.state.status.value == "COLD":
         if last_snapshot and last_snapshot.cold_start_meta:

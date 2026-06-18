@@ -1,6 +1,6 @@
 import json
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -17,6 +17,7 @@ class SchedulerManager:
         self.scheduler = AsyncIOScheduler()
         self.memory = memory_manager or MemoryFileManager()
         self.llm = llm_client
+        self.active_message_callback: Optional[Callable[[], Awaitable[dict]]] = None
         self._job_configs = {
             "memory_analysis_day": {
                 "hour": 13,
@@ -32,6 +33,11 @@ class SchedulerManager:
                 "hour": 3,
                 "minute": 30,
                 "func": self._run_midnight_cleanup,
+            },
+            "active_message": {
+                "hour": 10,
+                "minute": 0,
+                "func": self._run_active_message,
             },
         }
 
@@ -68,6 +74,9 @@ class SchedulerManager:
             k: {"hour": v["hour"], "minute": v["minute"]}
             for k, v in self._job_configs.items()
         }
+
+    def set_active_message_callback(self, callback: Callable[[], Awaitable[dict]]):
+        self.active_message_callback = callback
 
     async def _run_memory_analysis(self):
         job_id = f"memory_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -140,6 +149,19 @@ class SchedulerManager:
                 raise RuntimeError("failed to write TOMORROW_TOPICS.md")
 
             self._finish_job(log_id, "completed")
+        except Exception as e:
+            self._finish_job(log_id, "failed", str(e))
+
+    async def _run_active_message(self):
+        job_id = f"active_message_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        log_id = self._start_job(job_id, "active_message")
+        try:
+            if self.active_message_callback is None:
+                raise RuntimeError("active message callback is not configured")
+            result = await self.active_message_callback()
+            note = json.dumps(result, ensure_ascii=False)[:1000]
+            status = "failed" if result.get("status") == "error" else "completed"
+            self._finish_job(log_id, status, note)
         except Exception as e:
             self._finish_job(log_id, "failed", str(e))
 
