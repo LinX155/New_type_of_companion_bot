@@ -8,6 +8,7 @@ const ApiConfig: React.FC = () => {
   const [model, setModel] = useState('deepseek-v4-flash');
   const [thinkingEnabled, setThinkingEnabled] = useState(false);
   const [savedApi, setSavedApi] = useState(false);
+  const [dirty, setDirty] = useState(false);
 
   useEffect(() => {
     fetch(`${API_BASE}/api/config`)
@@ -33,6 +34,7 @@ const ApiConfig: React.FC = () => {
     try {
       await saveConfig(thinkingEnabled);
       setSavedApi(true);
+      setDirty(false);
       setTimeout(() => setSavedApi(false), 2000);
     } catch {
       alert('保存失败');
@@ -60,7 +62,7 @@ const ApiConfig: React.FC = () => {
             <input
               type="text"
               value={apiKey}
-              onChange={e => setApiKey(e.target.value)}
+              onChange={e => { setApiKey(e.target.value); setDirty(true); }}
               placeholder="输入 API Key..."
               style={{ width: '100%', padding: '10px', border: '1px solid #ddd', borderRadius: '6px', fontSize: '14px' }}
             />
@@ -70,7 +72,7 @@ const ApiConfig: React.FC = () => {
             <input
               type="text"
               value={baseUrl}
-              onChange={e => setBaseUrl(e.target.value)}
+              onChange={e => { setBaseUrl(e.target.value); setDirty(true); }}
               style={{ width: '100%', padding: '10px', border: '1px solid #ddd', borderRadius: '6px', fontSize: '14px' }}
             />
           </div>
@@ -79,7 +81,7 @@ const ApiConfig: React.FC = () => {
             <input
               type="text"
               value={model}
-              onChange={e => setModel(e.target.value)}
+              onChange={e => { setModel(e.target.value); setDirty(true); }}
               style={{ width: '100%', padding: '10px', border: '1px solid #ddd', borderRadius: '6px', fontSize: '14px' }}
             />
           </div>
@@ -128,13 +130,14 @@ const ApiConfig: React.FC = () => {
 
           <button
             onClick={handleSave}
+            disabled={!dirty}
             style={{
               padding: '12px',
-              background: '#3498db',
+              background: dirty ? '#3498db' : '#bdc3c7',
               color: '#fff',
               border: 'none',
               borderRadius: '6px',
-              cursor: 'pointer',
+              cursor: dirty ? 'pointer' : 'not-allowed',
               fontSize: '14px',
               fontWeight: 500,
             }}

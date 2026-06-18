@@ -5,6 +5,7 @@ const API_BASE = '';
 const SoulEditor: React.FC = () => {
   const [content, setContent] = useState('');
   const [saved, setSaved] = useState(false);
+  const [dirty, setDirty] = useState(false);
 
   useEffect(() => {
     fetch(`${API_BASE}/api/soul`)
@@ -21,6 +22,7 @@ const SoulEditor: React.FC = () => {
         body: JSON.stringify({ content }),
       });
       setSaved(true);
+      setDirty(false);
       setTimeout(() => setSaved(false), 2000);
     } catch {
       alert('保存失败');
@@ -35,7 +37,7 @@ const SoulEditor: React.FC = () => {
       </p>
       <textarea
         value={content}
-        onChange={e => setContent(e.target.value)}
+        onChange={e => { setContent(e.target.value); setDirty(true); }}
         style={{
           width: '100%',
           minHeight: '400px',
@@ -51,13 +53,14 @@ const SoulEditor: React.FC = () => {
       <div style={{ marginTop: '16px', display: 'flex', gap: '12px', alignItems: 'center' }}>
         <button
           onClick={handleSave}
+          disabled={!dirty}
           style={{
             padding: '10px 24px',
-            background: '#3498db',
+            background: dirty ? '#3498db' : '#bdc3c7',
             color: '#fff',
             border: 'none',
             borderRadius: '6px',
-            cursor: 'pointer',
+            cursor: dirty ? 'pointer' : 'not-allowed',
             fontSize: '14px',
           }}
         >

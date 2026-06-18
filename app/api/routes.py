@@ -14,6 +14,7 @@ from ..core.events import ChatEvent, EventType
 from ..core.decisions import Action
 from ..core.graph import CompanionGraph
 from ..core.state import ChatStatus
+from ..core.settings import load_settings, save_settings
 from ..llm.client import LLMClient
 from ..memory.files import MemoryFileManager
 from ..memes.catalog import MemeCatalog
@@ -25,35 +26,45 @@ Base.metadata.create_all(bind=engine)
 
 router = APIRouter()
 
-# Global instances (simplified for MVP)
+# 全局实例（MVP 阶段简化）
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+# 启动时加载持久化的用户配置（API key 等）
+_persisted = load_settings()
 
 
 def _load_default_llm_config() -> dict:
+    """加载 LLM 默认配置：持久化配置 > api_key.txt > 环境变量。"""
     config = {
         "api_key": os.getenv("LLM_API_KEY", ""),
         "base_url": os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
         "model": os.getenv("LLM_MODEL", "gpt-4o-mini"),
     }
     path = os.path.join(ROOT_DIR, "api_key.txt")
-    if not os.path.exists(path):
-        return config
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            api_key_match = re.search(r"api_key\s*=\s*[\"']?([A-Za-z0-9_\-]+)", content)
+            base_url_match = re.search(r"base_url\s*=\s*[\"']([^\"']+)", content)
+            model_match = re.search(r"model\s*=\s*[\"']([^\"']+)", content)
+            if api_key_match:
+                config["api_key"] = api_key_match.group(1)
+            if base_url_match:
+                config["base_url"] = base_url_match.group(1)
+            if model_match:
+                config["model"] = model_match.group(1)
+        except Exception:
+            pass
 
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-    except Exception:
-        return config
-
-    api_key_match = re.search(r"api_key\s*=\s*[\"']?([A-Za-z0-9_\-]+)", content)
-    base_url_match = re.search(r"base_url\s*=\s*[\"']([^\"']+)", content)
-    model_match = re.search(r"model\s*=\s*[\"']([^\"']+)", content)
-    if api_key_match:
-        config["api_key"] = api_key_match.group(1)
-    if base_url_match:
-        config["base_url"] = base_url_match.group(1)
-    if model_match:
-        config["model"] = model_match.group(1)
+    # 持久化配置优先级最高：前端手动保存过的值覆盖上面
+    if _persisted.get("api_key"):
+        config["api_key"] = _persisted["api_key"]
+    if _persisted.get("base_url"):
+        config["base_url"] = _persisted["base_url"]
+    if _persisted.get("model"):
+        config["model"] = _persisted["model"]
+    config["thinking_enabled"] = _persisted.get("thinking_enabled", False)
     return config
 
 
@@ -224,12 +235,20 @@ async def _emit_llm_started():
 def init_gate():
     global event_gate, companion_graph
     if event_gate is None:
-        event_gate = EventGate(on_decision=on_decision)
+        event_gate = EventGate(
+            on_decision=on_decision,
+            hot_duration_minutes=_persisted.get("hot_duration_minutes", 30),
+        )
         companion_graph = CompanionGraph(
             llm_client=llm_client,
             memory_manager=memory_manager,
             meme_catalog=meme_catalog,
         )
+        # 启动时把持久化的调度时间应用到调度器
+        for job_id in ("memory_analysis_day", "memory_analysis_night", "midnight_cleanup"):
+            cfg = _persisted.get(job_id)
+            if isinstance(cfg, dict):
+                scheduler_manager.update_schedule(job_id, cfg.get("hour"), cfg.get("minute"))
         scheduler_manager.start()
 
 
@@ -241,6 +260,12 @@ async def update_config(config: ApiConfig):
         model=config.model,
         thinking_enabled=config.thinking_enabled,
     )
+    save_settings({
+        "api_key": config.api_key,
+        "base_url": config.base_url,
+        "model": config.model,
+        "thinking_enabled": config.thinking_enabled,
+    })
     return {"status": "ok"}
 
 
@@ -427,6 +452,11 @@ async def update_memory_schedule(config: MemoryScheduleConfig):
         config.midnight_cleanup_hour,
         config.midnight_cleanup_minute,
     )
+    save_settings({
+        "memory_analysis_day": {"hour": config.memory_analysis_day_hour, "minute": config.memory_analysis_day_minute},
+        "memory_analysis_night": {"hour": config.memory_analysis_night_hour, "minute": config.memory_analysis_night_minute},
+        "midnight_cleanup": {"hour": config.midnight_cleanup_hour, "minute": config.midnight_cleanup_minute},
+    })
     return {"status": "ok"}
 
 
@@ -511,6 +541,7 @@ async def get_hot_duration():
 async def update_hot_duration(config: HotDurationConfig):
     init_gate()
     event_gate.update_hot_duration(config.hot_duration_minutes)
+    save_settings({"hot_duration_minutes": config.hot_duration_minutes})
     return {"status": "ok", "hot_duration_minutes": event_gate.hot_duration_minutes}
 
 
@@ -558,8 +589,6 @@ async def get_status():
     # LLM 决策结果
     llm_panel = {
         "last_llm_raw": companion_graph.get_last_llm_raw_output() if companion_graph else None,
-        "last_parsed_action": parsed.get("action"),
-        "last_parsed_text": parsed.get("text"),
         "parse_status": parsed.get("parse_status"),
         "decision_result": last_result,
     }

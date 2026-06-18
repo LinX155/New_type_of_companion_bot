@@ -10,9 +10,11 @@ const MemorySchedule: React.FC = () => {
   const [cleanupHour, setCleanupHour] = useState(3);
   const [cleanupMinute, setCleanupMinute] = useState(30);
   const [saved, setSaved] = useState(false);
+  const [dirtySchedule, setDirtySchedule] = useState(false);
 
   const [hotDuration, setHotDuration] = useState(30);
   const [savedHot, setSavedHot] = useState(false);
+  const [dirtyHot, setDirtyHot] = useState(false);
 
   useEffect(() => {
     fetch(`${API_BASE}/api/memory/schedule`)
@@ -58,6 +60,7 @@ const MemorySchedule: React.FC = () => {
         }),
       });
       setSaved(true);
+      setDirtySchedule(false);
       setTimeout(() => setSaved(false), 2000);
     } catch {
       alert('保存失败');
@@ -72,6 +75,7 @@ const MemorySchedule: React.FC = () => {
         body: JSON.stringify({ hot_duration_minutes: hotDuration }),
       });
       setSavedHot(true);
+      setDirtyHot(false);
       setTimeout(() => setSavedHot(false), 2000);
     } catch {
       alert('保存失败');
@@ -99,27 +103,27 @@ const MemorySchedule: React.FC = () => {
           <div>
             <h3 style={{ fontSize: '15px', marginBottom: '10px' }}>日间记忆分析</h3>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <input type="number" min={0} max={23} value={dayHour} onChange={e => setDayHour(Number(e.target.value))} style={timeInputStyle} />
+              <input type="number" min={0} max={23} value={dayHour} onChange={e => { setDayHour(Number(e.target.value)); setDirtySchedule(true); }} style={timeInputStyle} />
               <span>:</span>
-              <input type="number" min={0} max={59} value={dayMinute} onChange={e => setDayMinute(Number(e.target.value))} style={timeInputStyle} />
+              <input type="number" min={0} max={59} value={dayMinute} onChange={e => { setDayMinute(Number(e.target.value)); setDirtySchedule(true); }} style={timeInputStyle} />
             </div>
           </div>
 
           <div>
             <h3 style={{ fontSize: '15px', marginBottom: '10px' }}>晚间记忆分析</h3>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <input type="number" min={0} max={23} value={nightHour} onChange={e => setNightHour(Number(e.target.value))} style={timeInputStyle} />
+              <input type="number" min={0} max={23} value={nightHour} onChange={e => { setNightHour(Number(e.target.value)); setDirtySchedule(true); }} style={timeInputStyle} />
               <span>:</span>
-              <input type="number" min={0} max={59} value={nightMinute} onChange={e => setNightMinute(Number(e.target.value))} style={timeInputStyle} />
+              <input type="number" min={0} max={59} value={nightMinute} onChange={e => { setNightMinute(Number(e.target.value)); setDirtySchedule(true); }} style={timeInputStyle} />
             </div>
           </div>
 
           <div>
             <h3 style={{ fontSize: '15px', marginBottom: '10px' }}>凌晨整理线程</h3>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <input type="number" min={0} max={23} value={cleanupHour} onChange={e => setCleanupHour(Number(e.target.value))} style={timeInputStyle} />
+              <input type="number" min={0} max={23} value={cleanupHour} onChange={e => { setCleanupHour(Number(e.target.value)); setDirtySchedule(true); }} style={timeInputStyle} />
               <span>:</span>
-              <input type="number" min={0} max={59} value={cleanupMinute} onChange={e => setCleanupMinute(Number(e.target.value))} style={timeInputStyle} />
+              <input type="number" min={0} max={59} value={cleanupMinute} onChange={e => { setCleanupMinute(Number(e.target.value)); setDirtySchedule(true); }} style={timeInputStyle} />
             </div>
           </div>
         </div>
@@ -127,13 +131,14 @@ const MemorySchedule: React.FC = () => {
         <div style={{ marginTop: '24px' }}>
           <button
             onClick={handleSave}
+            disabled={!dirtySchedule}
             style={{
               padding: '10px 24px',
-              background: '#3498db',
+              background: dirtySchedule ? '#3498db' : '#bdc3c7',
               color: '#fff',
               border: 'none',
               borderRadius: '6px',
-              cursor: 'pointer',
+              cursor: dirtySchedule ? 'pointer' : 'not-allowed',
               fontSize: '14px',
             }}
           >
@@ -154,28 +159,29 @@ const MemorySchedule: React.FC = () => {
             min={1}
             max={1440}
             value={hotDuration}
-            onChange={e => setHotDuration(Number(e.target.value))}
+            onChange={e => { setHotDuration(Number(e.target.value)); setDirtyHot(true); }}
             style={{ width: '80px', padding: '10px', border: '1px solid #ddd', borderRadius: '6px', fontSize: '14px', textAlign: 'center' }}
           />
           <span>分钟</span>
         </div>
         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-          <button onClick={() => setHotDuration(1)} style={{ padding: '6px 12px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>1分钟（测试）</button>
-          <button onClick={() => setHotDuration(5)} style={{ padding: '6px 12px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>5分钟</button>
-          <button onClick={() => setHotDuration(10)} style={{ padding: '6px 12px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>10分钟</button>
-          <button onClick={() => setHotDuration(30)} style={{ padding: '6px 12px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>30分钟</button>
-          <button onClick={() => setHotDuration(60)} style={{ padding: '6px 12px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>1小时</button>
+          <button onClick={() => { setHotDuration(1); setDirtyHot(true); }} style={{ padding: '6px 12px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>1分钟（测试）</button>
+          <button onClick={() => { setHotDuration(5); setDirtyHot(true); }} style={{ padding: '6px 12px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>5分钟</button>
+          <button onClick={() => { setHotDuration(10); setDirtyHot(true); }} style={{ padding: '6px 12px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>10分钟</button>
+          <button onClick={() => { setHotDuration(30); setDirtyHot(true); }} style={{ padding: '6px 12px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>30分钟</button>
+          <button onClick={() => { setHotDuration(60); setDirtyHot(true); }} style={{ padding: '6px 12px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>1小时</button>
         </div>
         <button
           onClick={handleSaveHotDuration}
+          disabled={!dirtyHot}
           style={{
             marginTop: '16px',
             padding: '12px 24px',
-            background: '#e74c3c',
+            background: dirtyHot ? '#e74c3c' : '#bdc3c7',
             color: '#fff',
             border: 'none',
             borderRadius: '6px',
-            cursor: 'pointer',
+            cursor: dirtyHot ? 'pointer' : 'not-allowed',
             fontSize: '14px',
             fontWeight: 500,
           }}
