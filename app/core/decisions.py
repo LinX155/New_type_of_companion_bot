@@ -2,6 +2,8 @@ from enum import Enum
 from typing import Optional
 from pydantic import BaseModel, field_validator, model_validator
 
+REACT_PROTOCOL_PREFIXES = ("emoji:", "search_meme:", "meme:")
+
 
 class Action(str, Enum):
     WAIT = "WAIT"
@@ -36,6 +38,9 @@ class ActionDecision(BaseModel):
 
         if self.action == Action.REACT and not self.text:
             raise ValueError("REACT action requires emoji, image path, or resource id")
+
+        if self.action == Action.REACT and not self.text.startswith(REACT_PROTOCOL_PREFIXES):
+            raise ValueError("REACT text must start with emoji:, search_meme:, or meme:")
 
         if self.action == Action.END_CHAT and self.text is not None:
             raise ValueError("END_CHAT action requires text to be null")

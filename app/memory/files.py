@@ -5,14 +5,18 @@ from datetime import datetime
 
 MEMORY_CORE_TEMPLATE = """# 永久核心记忆
 
-## 用户长期事实
+## 用户明确相处偏好
+
+## 重要事实
+
+## 用户交际圈
 
 ## 相处习惯
 
-## 关系边界
+## 临时近期状态
 """
 
-_REQUIRED_CORE_SECTIONS = ("用户长期事实", "相处习惯", "关系边界")
+_REQUIRED_CORE_SECTIONS = ("用户明确相处偏好", "重要事实", "用户交际圈", "相处习惯", "临时近期状态")
 
 
 TOMORROW_TOPICS_TEMPLATE = """# 明日话题
@@ -50,6 +54,10 @@ class MemoryFileManager:
     def ensure_base_files(self):
         if not os.path.exists(self.memory_core_path):
             self._write_file(self.memory_core_path, MEMORY_CORE_TEMPLATE)
+        else:
+            existing = self._read_file(self.memory_core_path)
+            if existing and not _is_valid_core(existing):
+                self._write_file(self.memory_core_path, _migrate_core_schema(existing))
         if not os.path.exists(self.tomorrow_topics_path):
             self._write_file(self.tomorrow_topics_path, TOMORROW_TOPICS_TEMPLATE)
 
@@ -146,11 +154,10 @@ class MemoryFileManager:
         if not content:
             return False, "没有可写入的记忆内容。"
         existing = self.read_memory_core()
-        if existing and not existing.endswith("\n"):
-            existing += "\n"
         today = datetime.now().strftime("%Y-%m-%d")
-        line = f"[/mem指令 {today}]: {content}"
-        success = self.write_memory_core(existing + line + "\n")
+        line = f"- [/mem指令 {today}]: {content}"
+        new_content = _append_entry_to_core(existing, _guess_core_section(content), line)
+        success = self.write_memory_core(new_content)
         return success, "已存入记忆（同步）。" if success else "记忆文件保存失败。"
 
     async def apply_mem_via_llm(self, command_text: str, llm_client) -> tuple[bool, str]:
@@ -291,6 +298,81 @@ def _is_valid_core(content: str) -> bool:
     return all(section in content for section in _REQUIRED_CORE_SECTIONS)
 
 
+def _migrate_core_schema(content: str) -> str:
+    """把旧版 CORE 分区迁移到当前五分区结构，尽量保留已有条目。"""
+    buckets = {section: [] for section in _REQUIRED_CORE_SECTIONS}
+    current_section = "重要事实"
+    old_to_new = {
+        "用户长期事实": "重要事实",
+        "关系边界": "用户明确相处偏好",
+        "相处习惯": "相处习惯",
+        "用户明确相处偏好": "用户明确相处偏好",
+        "重要事实": "重要事实",
+        "用户交际圈": "用户交际圈",
+        "临时近期状态": "临时近期状态",
+    }
+
+    for raw in (content or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("# 永久核心记忆"):
+            continue
+        if line.startswith("## "):
+            current_section = old_to_new.get(line[3:].strip(), "重要事实")
+            continue
+        if not _has_source_marker(line):
+            line = f"- [迁移]: {line.lstrip('-*• ').strip()}"
+        buckets.setdefault(current_section, []).append(line)
+
+    parts = ["# 永久核心记忆", ""]
+    for section in _REQUIRED_CORE_SECTIONS:
+        parts.append(f"## {section}")
+        parts.extend(buckets.get(section, []))
+        parts.append("")
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def _guess_core_section(content: str) -> str:
+    text = (content or "").lower()
+    if any(word in text for word in ["最近", "这几天", "今天", "明天", "临时", "近期", "正在", "准备"]):
+        return "临时近期状态"
+    if any(word in text for word in ["老板", "同事", "朋友", "家人", "妈妈", "爸爸", "前任", "老师", "室友"]):
+        return "用户交际圈"
+    if any(word in text for word in ["不要", "别", "不喜欢", "喜欢", "希望", "称呼", "边界", "先陪", "建议"]):
+        return "用户明确相处偏好"
+    return "重要事实"
+
+
+def _append_entry_to_core(core: str, section: str, line: str) -> str:
+    if not _is_valid_core(core or ""):
+        core = _migrate_core_schema(core or MEMORY_CORE_TEMPLATE)
+
+    lines = core.rstrip().splitlines()
+    target_header = f"## {section}"
+    out = []
+    inserted = False
+    in_target = False
+
+    for raw in lines:
+        if raw.strip().startswith("## "):
+            if in_target and not inserted:
+                out.append(line)
+                inserted = True
+            in_target = raw.strip() == target_header
+        out.append(raw)
+
+    if in_target and not inserted:
+        out.append(line)
+        inserted = True
+
+    if not inserted:
+        if out and out[-1].strip():
+            out.append("")
+        out.append(target_header)
+        out.append(line)
+
+    return "\n".join(out).rstrip() + "\n"
+
+
 _SOURCE_RE = None
 
 
@@ -299,14 +381,14 @@ def _source_marker(date_str: str) -> str:
 
 
 def _has_source_marker(line: str) -> bool:
-    """该行是否已带 [/mem指令 ...] 来源标记（兼容列表符号前缀）。"""
+    """该行是否已带 [来源]: 内容 标记（兼容列表符号前缀）。"""
     body = line.lstrip()
     # 去掉可能的列表符号前缀 (- * • 或 1.)
     for b in ("- ", "-　", "* ", "*　", "• ", "•　"):
         if body.startswith(b):
             body = body[len(b):].lstrip()
             break
-    return body.startswith("[/mem指令")
+    return body.startswith("[") and "]:" in body
 
 
 def _stamp_new_entries(old_core: str, new_core: str, date_str: str) -> str:

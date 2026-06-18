@@ -30,8 +30,6 @@ class EventGate:
         self._last_command: Optional[str] = None
         self._last_command_result: Optional[str] = None
         self._last_process_context: Optional[ProcessContext] = None
-        self._last_command: Optional[str] = None
-        self._last_command_result: Optional[str] = None
 
     async def handle_event(self, event: ChatEvent) -> dict:
         """处理进入的事件，返回处理结果摘要"""
@@ -92,8 +90,10 @@ class EventGate:
     async def _handle_chat_message(self, event: ChatEvent) -> dict:
         """处理普通聊天消息"""
         await self.maybe_exit_hot()
+        previous_user_message_at = self.state.last_user_message_at
         self.state.msg_index_today += 1
         self.state.last_user_message_at = event.timestamp
+        last_message_age = self._format_message_age(previous_user_message_at, event.timestamp)
 
         # HOT 中继续互动才刷新热聊生命周期；COLD 普通消息由 LLM 决定是否进入 HOT。
         if self.state.status == ChatStatus.HOT:
@@ -123,7 +123,7 @@ class EventGate:
             buffer_version=new_version,
             status=self.state.status,
             msg_index=self.state.msg_index_today,
-            last_message_age=self._get_last_message_age(),
+            last_message_age=last_message_age,
         )
         self.state.current_snapshot_id = snapshot.snapshot_id
 
@@ -248,17 +248,26 @@ class EventGate:
         self.state.status = ChatStatus.HOT
         self._refresh_hot_timer()
 
+    async def _exit_hot(self):
+        """结束热聊状态，回到离线生活态。"""
+        self.state.status = ChatStatus.COLD
+        self.state.hot_until = None
+
     async def maybe_exit_hot(self):
         """检查是否应该退出热聊状态"""
         if self.state.status == ChatStatus.HOT and self.state.hot_until:
             if datetime.now() > self.state.hot_until:
-                self.state.status = ChatStatus.COLD
-                self.state.hot_until = None
+                await self._exit_hot()
 
     def _get_last_message_age(self) -> Optional[str]:
         if not self.state.last_user_message_at:
             return None
-        delta = datetime.now() - self.state.last_user_message_at
+        return self._format_message_age(self.state.last_user_message_at, datetime.now())
+
+    def _format_message_age(self, then: Optional[datetime], now: datetime) -> Optional[str]:
+        if not then:
+            return None
+        delta = now - then
         minutes = int(delta.total_seconds() / 60)
         if minutes < 1:
             return "just now"

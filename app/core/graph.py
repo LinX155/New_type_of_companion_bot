@@ -231,7 +231,7 @@ class CompanionGraph:
                 data = json.loads(json_match.group())
                 action_str = str(data.get("action", "REPLY")).strip().upper()
                 if action_str in [a.value for a in Action]:
-                    parsed = ActionDecision(action=action_str, text=data.get("text"))
+                    parsed = self._build_decision(action_str, data.get("text"))
                     self._last_parsed_action = parsed.action.value
                     self._last_parsed_text = parsed.text
                     return parsed, "ok"
@@ -244,7 +244,7 @@ class CompanionGraph:
             data = json.loads(text_clean)
             action_str = str(data.get("action", "REPLY")).strip().upper()
             if action_str in [a.value for a in Action]:
-                parsed = ActionDecision(action=action_str, text=data.get("text"))
+                parsed = self._build_decision(action_str, data.get("text"))
                 self._last_parsed_action = parsed.action.value
                 self._last_parsed_text = parsed.text
                 return parsed, "ok"
@@ -253,17 +253,15 @@ class CompanionGraph:
 
         bracket_match = re.match(r"\[(WAIT|REPLY|LIGHT_ACK|REACT|ENTER_CHAT|END_CHAT)\]\s*(.*)", text, re.IGNORECASE)
         if bracket_match:
-            action_str = bracket_match.group(1).upper()
-            action_text = bracket_match.group(2).strip() or None
-            if action_str == Action.WAIT.value:
-                parsed = ActionDecision(action=Action.WAIT, text=None)
-            elif action_str == Action.REACT.value and action_text:
-                parsed = ActionDecision(action=Action.REACT, text=self._normalize_react_text(action_text))
-            else:
-                parsed = ActionDecision(action=action_str, text=action_text)
-            self._last_parsed_action = parsed.action.value
-            self._last_parsed_text = parsed.text
-            return parsed, "ok"
+            try:
+                action_str = bracket_match.group(1).upper()
+                action_text = bracket_match.group(2).strip() or None
+                parsed = self._build_decision(action_str, action_text)
+                self._last_parsed_action = parsed.action.value
+                self._last_parsed_text = parsed.text
+                return parsed, "ok"
+            except Exception:
+                pass
 
         upper_text = text.upper()
         if '"ACTION":"WAIT"' in upper_text or "'ACTION':'WAIT'" in upper_text:
@@ -274,15 +272,32 @@ class CompanionGraph:
         if '"ACTION":"REACT"' in upper_text or "'ACTION':'REACT'" in upper_text:
             text_match = re.search(r'"text"[:\s]*"([^"]*)"', text, re.IGNORECASE)
             if text_match:
-                parsed = ActionDecision(action=Action.REACT, text=self._normalize_react_text(text_match.group(1)))
-                self._last_parsed_action = parsed.action.value
-                self._last_parsed_text = parsed.text
-                return parsed, "ok"
+                try:
+                    parsed = self._build_decision(Action.REACT.value, text_match.group(1))
+                    self._last_parsed_action = parsed.action.value
+                    self._last_parsed_text = parsed.text
+                    return parsed, "ok"
+                except Exception:
+                    self._last_parsed_action = Action.WAIT.value
+                    self._last_parsed_text = None
+                    return ActionDecision(action=Action.WAIT, text=None), "fallback"
+
+        if "REACT" in upper_text:
+            self._last_parsed_action = Action.WAIT.value
+            self._last_parsed_text = None
+            return ActionDecision(action=Action.WAIT, text=None), "fallback"
 
         parsed = ActionDecision(action=Action.REPLY, text=text)
         self._last_parsed_action = parsed.action.value
         self._last_parsed_text = parsed.text
         return parsed, "fallback"
+
+    def _build_decision(self, action_str: str, text_value) -> ActionDecision:
+        if action_str in (Action.WAIT.value, Action.END_CHAT.value):
+            text_value = None
+        if action_str == Action.REACT.value and isinstance(text_value, str):
+            text_value = self._normalize_react_text(text_value)
+        return ActionDecision(action=action_str, text=text_value)
 
     def _normalize_react_text(self, action_text: str) -> str:
         valid_categories = {
@@ -298,7 +313,15 @@ class CompanionGraph:
         if parts and parts[0] in valid_categories:
             keywords = parts[1] if len(parts) > 1 else ""
             return f"search_meme:{parts[0]}:{keywords}"
+        if self._looks_like_emoji(action_text):
+            return f"emoji:{action_text.strip()}"
         return action_text
+
+    def _looks_like_emoji(self, text: str) -> bool:
+        stripped = (text or "").strip()
+        if not stripped or len(stripped) > 8:
+            return False
+        return any(ord(ch) >= 0x2600 for ch in stripped)
 
     def _apply_protocol_guards(self, ctx: ProcessContext, decision: ActionDecision) -> ActionDecision:
         pending_text = "\n".join(

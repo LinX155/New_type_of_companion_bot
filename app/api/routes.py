@@ -152,8 +152,12 @@ async def on_decision(ctx: ProcessContext):
             await _emit_state({"job_id": ctx.job_id, "result": "stale_dropped"})
             return
 
-        if ctx.snapshot.status == ChatStatus.COLD:
-            await event_gate._enter_hot()
+    if decision.action == Action.ENTER_CHAT:
+        await event_gate._enter_hot()
+    elif decision.action == Action.END_CHAT:
+        await event_gate._exit_hot()
+    elif result["visible"] and ctx.snapshot.status == ChatStatus.COLD:
+        await event_gate._enter_hot()
 
     # 记录到数据库
     db = next(get_db())

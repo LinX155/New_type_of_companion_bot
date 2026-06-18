@@ -200,6 +200,8 @@ const ChatWindow: React.FC = () => {
                     {msg.text}
                   </span>
                 </div>
+              ) : msg.isMeme && msg.text?.startsWith('emoji:') ? (
+                <div style={{ fontSize: '24px', lineHeight: 1.2 }}>{msg.text.slice(6)}</div>
               ) : (
                 <div>{msg.text}</div>
               )}
