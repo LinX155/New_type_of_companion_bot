@@ -78,14 +78,16 @@ class CompanionGraph:
     async def _build_context(self, state: GraphState) -> GraphState:
         ctx = state["ctx"]
         snapshot = ctx.snapshot
+        include_profile = snapshot.status.value == "COLD"
 
         system_prompt = build_system_prompt(
-            soul_md=self.memory.read_soul(),
-            memory_core_md=self.memory.read_memory_core(),
-            today_memory_md=self.memory.read_today_memory(),
+            soul_md=self.memory.read_soul() if include_profile else "",
+            memory_core_md=self.memory.read_memory_core() if include_profile else "",
+            today_memory_md=self.memory.read_today_memory() if include_profile else "",
             chat_status=snapshot.status.value,
             msg_index=snapshot.cold_start_meta.msg_index if snapshot.cold_start_meta else 0,
             last_message_age=snapshot.cold_start_meta.last_user_message_age if snapshot.cold_start_meta else "unknown",
+            include_profile=include_profile,
         )
 
         pending_history = []

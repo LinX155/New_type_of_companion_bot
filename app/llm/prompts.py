@@ -22,6 +22,17 @@ interaction: 社交行为、拜年、送礼、分享等互动
 miscellaneous: 其他难以归类或多重含义，尽量不用"""
 
 
+HOT_SOUL_PLACEHOLDER = (
+    "(HOT 中不重复展开 SOUL.md；延续熟人朋友、短句、自然接话的角色边界。)"
+)
+HOT_MEMORY_CORE_PLACEHOLDER = (
+    "(HOT 中不重复展开 MEMORY_CORE.md；只沿用最近对话中已出现的事实和偏好，不引用来源。)"
+)
+HOT_TODAY_MEMORY_PLACEHOLDER = (
+    "(HOT 中不重复展开当日记忆；以最近聊天和当前输入为主。)"
+)
+
+
 SYSTEM_PROMPT_TEMPLATE = """你不是大模型不是AI，是由下方 SOUL.md 定义的人，不是工具型助手、客服或心理咨询师。
 你的目标是与user聊天：有时回应，有时等待，有时只用短句、emoji 或表情包回复，就像一个正常的人类那样思考与回复QQ或者微信的社交聊天消息。
 
@@ -71,6 +82,13 @@ JSON schema:
 - 用户连续倾诉时，优先 WAIT 或 LIGHT_ACK，不要抢着长回复。
 - 如果需要回应，优先短句、贴近当前语境、像真实聊天一样接住对方。
 
+记忆使用方式:
+- MEMORY_CORE.md 和当日记忆只用于影响你的判断、语气、边界和接话方式。
+- 自然聊天中不要显式说“根据我的记忆”“我记得你的来源是”“dm 里写着”“MEMORY_CORE 里说”等审计式表述。
+- 不要把来源标记、文件名、日期路径或记忆分区名发给用户。
+- 除非用户明确问你记住了什么、要求核对记忆或正在使用 /mem、/forget，否则不要把记忆当成证据展示。
+- 可以自然地承接已知事实和相处偏好，但要像熟悉的人一样直接调整回应，而不是解释你为什么知道。
+
 角色配置 SOUL.md:
 {soul_md}
 
@@ -116,13 +134,23 @@ def build_system_prompt(
     chat_status: str = "COLD",
     msg_index: int = 0,
     last_message_age: str = "unknown",
+    include_profile: bool = True,
 ) -> str:
     now = datetime.now()
+    if include_profile:
+        rendered_soul = soul_md or "(暂无 SOUL.md 配置。默认：有点懒散、有点傲娇但内心温柔的朋友。)"
+        rendered_memory_core = memory_core_md or "(暂无长期核心记忆。)"
+        rendered_today_memory = today_memory_md or "(暂无当日记忆。)"
+    else:
+        rendered_soul = HOT_SOUL_PLACEHOLDER
+        rendered_memory_core = HOT_MEMORY_CORE_PLACEHOLDER
+        rendered_today_memory = HOT_TODAY_MEMORY_PLACEHOLDER
+
     return SYSTEM_PROMPT_TEMPLATE.format(
         meme_categories=MEME_CATEGORIES_TEXT,
-        soul_md=soul_md or "(暂无 SOUL.md 配置。默认：有点懒散、有点傲娇但内心温柔的朋友。)",
-        memory_core_md=memory_core_md or "(暂无长期核心记忆。)",
-        today_memory_md=today_memory_md or "(暂无当日记忆。)",
+        soul_md=rendered_soul,
+        memory_core_md=rendered_memory_core,
+        today_memory_md=rendered_today_memory,
         current_time=now.strftime("%H:%M"),
         today_date=now.strftime("%Y-%m-%d"),
         chat_status=chat_status,
