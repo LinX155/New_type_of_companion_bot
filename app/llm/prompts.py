@@ -218,6 +218,68 @@ JSON schema:
     ]
 
 
+def build_mem_command_messages(content: str, memory_core_md: str, today_date: str = "") -> list:
+    system = """你是记忆写入线程，不是聊天角色。
+用户使用 /mem 指令，明确要求把某条内容永久记住。
+你的任务是把这条内容结构化地整合进 MEMORY_CORE.md 的合适分区，保持文件原有的分区结构和已有内容，只增补或更新相关条目。
+
+只输出 JSON 对象，不要输出 Markdown 代码块或解释。
+
+JSON schema:
+{
+  "memory_core_md": "完整的 MEMORY_CORE.md 内容",
+  "note": "简短说明做了什么（可选）"
+}
+
+规则:
+- 必须保留三个分区标题：## 用户长期事实、## 相处习惯、## 关系边界。
+- 客观长期事实（喜好、身份、家庭、工作、重要经历、健康等）放进「用户长期事实」。
+- 两人之间的相处模式、习惯、约定、偏好放进「相处习惯」。
+- 关系定位、边界、称呼、禁忌放进「关系边界」。
+- 不要把闲聊、临时情绪、当天琐事写进 CORE。
+- 不要编造，只整理用户明确给出的内容。
+- 用简洁的条目，每条一行，不要堆叠段落。
+- 本次新增或改写的每一条条目，必须在行首加上来源标记：[/mem指令 {today_date}]: ，原有未改动的条目保持原样不要动来源标记。
+- {today_date} 由系统给出，固定填入，不要自己改日期。"""
+    user = {
+        "today_date": today_date or "(未知)",
+        "content_to_remember": content,
+        "current_memory_core_md": memory_core_md or "(暂无)",
+    }
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+    ]
+
+
+def build_forget_command_messages(query: str, memory_core_md: str) -> list:
+    system = """你是记忆删除线程，不是聊天角色。
+用户使用 /forget 指令，明确要求忘记某条内容。
+你的任务是理解用户要忘记的内容，从 MEMORY_CORE.md 中移除相关条目，保持文件分区结构和其余内容。
+
+只输出 JSON 对象，不要输出 Markdown 代码块或解释。
+
+JSON schema:
+{
+  "memory_core_md": "完整的 MEMORY_CORE.md 内容",
+  "removed": "被移除条目的简述，或「未找到匹配」"
+}
+
+规则:
+- 必须保留三个分区标题：## 用户长期事实、## 相处习惯、## 关系边界。
+- 按语义匹配要删除的条目，不是只做字面匹配。
+- 如果没有匹配条目，原样返回当前内容，并在 removed 里说明「未找到匹配」。
+- 不要删除用户没要求删除的内容。"""
+    user = {
+        "query_to_forget": query,
+        "current_memory_core_md": memory_core_md or "(暂无)",
+    }
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+    ]
+
+
 def build_midnight_cleanup_messages(
     date_str: str,
     memory_core_md: str,

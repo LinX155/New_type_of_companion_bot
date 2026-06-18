@@ -108,6 +108,7 @@ async def on_decision(ctx: ProcessContext):
         return
 
     try:
+        await _emit_llm_started()
         decision = await companion_graph.run(ctx)
     except Exception as e:
         event_gate.mark_job_dropped(ctx.job_id)
@@ -215,6 +216,11 @@ async def _emit_state(data: dict):
     await _emit_message({"type": "assistant_state", **data})
 
 
+async def _emit_llm_started():
+    """LLM 真正开始思考/生成时通知前端显示“对方正在输入”。"""
+    await _emit_state({"result": "llm_started"})
+
+
 def init_gate():
     global event_gate, companion_graph
     if event_gate is None:
@@ -291,7 +297,8 @@ async def send_message(msg: ChatMessage):
     result = await event_gate.handle_event(event)
 
     if event_type == EventType.COMMAND_MEM:
-        success, response_text = memory_manager.apply_mem_command(text)
+        await _emit_llm_started()
+        success, response_text = await memory_manager.apply_mem_via_llm(text, llm_client)
         event_gate.record_command("/mem", "success" if success else "error")
         await _record_command_response("command.mem", response_text, success)
         await _emit_message({
@@ -305,7 +312,8 @@ async def send_message(msg: ChatMessage):
         return {**result, "memory_updated": success, "response": response_text}
 
     if event_type == EventType.COMMAND_FORGET:
-        success, response_text = memory_manager.apply_forget_command(text)
+        await _emit_llm_started()
+        success, response_text = await memory_manager.apply_forget_via_llm(text, llm_client)
         event_gate.record_command("/forget", "success" if success else "error")
         await _record_command_response("command.forget", response_text, success)
         await _emit_message({

@@ -88,7 +88,12 @@ const ChatWindow: React.FC = () => {
           setIsLoading(false);
           fetchStatus();
         } else if (data.type === 'assistant_state') {
-          setIsLoading(false);
+          if (data.result === 'llm_started') {
+            // LLM 真正开始思考/生成，才显示“对方正在输入”
+            setIsLoading(true);
+          } else {
+            setIsLoading(false);
+          }
           fetchStatus();
         }
       } catch {}
@@ -118,7 +123,6 @@ const ChatWindow: React.FC = () => {
     if (!input.trim()) return;
     const text = input.trim();
     setInput('');
-    setIsLoading(true);
 
     setMessages(prev => [...prev, {
       id: `msg_${Date.now()}`,
@@ -126,6 +130,7 @@ const ChatWindow: React.FC = () => {
       text,
       timestamp: new Date().toISOString(),
     }]);
+    // 不立即显示“对方正在输入”：等到后端确认 LLM 真正启动后才显示
 
     try {
       await fetch(`${API_BASE}/api/chat`, {
@@ -139,7 +144,6 @@ const ChatWindow: React.FC = () => {
   };
 
   const sendNudge = async () => {
-    setIsLoading(true);
     try {
       await fetch(`${API_BASE}/api/nudge`, { method: 'POST' });
     } catch {

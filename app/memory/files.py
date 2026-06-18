@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import datetime
 
@@ -10,6 +11,8 @@ MEMORY_CORE_TEMPLATE = """# 永久核心记忆
 
 ## 关系边界
 """
+
+_REQUIRED_CORE_SECTIONS = ("用户长期事实", "相处习惯", "关系边界")
 
 
 TOMORROW_TOPICS_TEMPLATE = """# 明日话题
@@ -127,37 +130,79 @@ class MemoryFileManager:
         return files
 
     def apply_mem_command(self, command_text: str) -> tuple[bool, str]:
+        content = self._extract_mem_content(command_text)
+        return self._sync_append_mem(content)
+
+    def _extract_mem_content(self, command_text: str) -> str:
         content = self._strip_command_prefix(command_text, "/mem").strip()
         content = content.lstrip("：: ").strip()
         if content.startswith("记住"):
             content = content[len("记住"):].lstrip("：: ").strip()
         elif content.startswith("修改"):
             content = content[len("修改"):].lstrip("：: ").strip()
+        return content.strip()
 
+    def _sync_append_mem(self, content: str) -> tuple[bool, str]:
         if not content:
             return False, "没有可写入的记忆内容。"
-
         existing = self.read_memory_core()
         if existing and not existing.endswith("\n"):
             existing += "\n"
         today = datetime.now().strftime("%Y-%m-%d")
-        line = f"[用户明确写入 {today}]: {content}"
+        line = f"[/mem指令 {today}]: {content}"
         success = self.write_memory_core(existing + line + "\n")
-        return success, "已存入记忆。" if success else "记忆文件保存失败。"
+        return success, "已存入记忆（同步）。" if success else "记忆文件保存失败。"
+
+    async def apply_mem_via_llm(self, command_text: str, llm_client) -> tuple[bool, str]:
+        """通过 LLM 记忆线程把 /mem 内容结构化写入 MEMORY_CORE.md。
+
+        无 API key 或 LLM 失败时自动降级为同步追加，保证一定落盘。
+        """
+        content = self._extract_mem_content(command_text)
+        if not content:
+            return False, "没有可写入的记忆内容。"
+
+        if llm_client is None or not getattr(llm_client, "api_key", ""):
+            return self._sync_append_mem(content)
+
+        try:
+            from ..llm.prompts import build_mem_command_messages
+            existing = self.read_memory_core()
+            today_date = datetime.now().strftime("%Y-%m-%d")
+            messages = build_mem_command_messages(content, existing, today_date)
+            raw = await llm_client.chat_completion(
+                messages=messages, temperature=0.2, max_tokens=1600
+            )
+            data = _parse_json_object(raw)
+            new_core = (data.get("memory_core_md") or "").strip()
+            if not new_core or not _is_valid_core(new_core):
+                return self._sync_append_mem(content)
+            # 兜底：给本次新增的条目补上来源标记，不依赖 LLM 是否遵守指令
+            new_core = _stamp_new_entries(existing, new_core, today_date)
+            if not self.write_memory_core(new_core):
+                return False, "记忆文件保存失败。"
+            return True, "已通过记忆线程写入 CORE。"
+        except Exception as e:
+            print(f"[mem] LLM thread failed, fallback to sync: {e}")
+            return self._sync_append_mem(content)
 
     def apply_forget_command(self, command_text: str) -> tuple[bool, str]:
+        query = self._extract_forget_query(command_text)
+        return self._sync_remove_forget(query)
+
+    def _extract_forget_query(self, command_text: str) -> str:
         query = self._strip_command_prefix(command_text, "/forget").strip()
         query = query.lstrip("：: ").strip()
         if query.startswith("忘记"):
             query = query[len("忘记"):].lstrip("：: ").strip()
+        return query.strip()
 
+    def _sync_remove_forget(self, query: str) -> tuple[bool, str]:
         if not query:
             return False, "没有指定要忘记的内容。"
-
         existing = self.read_memory_core()
         if not existing:
             return True, "记忆里暂时没有可移除的内容。"
-
         query_tokens = self._forget_tokens(query)
         kept_lines = []
         removed = 0
@@ -167,13 +212,45 @@ class MemoryFileManager:
                 removed += 1
                 continue
             kept_lines.append(line)
-
         if removed == 0:
             return True, "没有找到匹配的记忆，未改动。"
-
         new_content = "\n".join(kept_lines).rstrip() + "\n"
         success = self.write_memory_core(new_content)
-        return success, "已从记忆中移除。" if success else "记忆文件保存失败。"
+        return success, "已从记忆中移除（同步）。" if success else "记忆文件保存失败。"
+
+    async def apply_forget_via_llm(self, command_text: str, llm_client) -> tuple[bool, str]:
+        """通过 LLM 记忆线程按语义从 MEMORY_CORE.md 中移除相关内容。
+
+        无 API key 或 LLM 失败时自动降级为同步字面匹配删除。
+        """
+        query = self._extract_forget_query(command_text)
+        if not query:
+            return False, "没有指定要忘记的内容。"
+
+        if llm_client is None or not getattr(llm_client, "api_key", ""):
+            return self._sync_remove_forget(query)
+
+        existing = self.read_memory_core()
+        if not existing:
+            return True, "记忆里暂时没有可移除的内容。"
+
+        try:
+            from ..llm.prompts import build_forget_command_messages
+            messages = build_forget_command_messages(query, existing)
+            raw = await llm_client.chat_completion(
+                messages=messages, temperature=0.2, max_tokens=1600
+            )
+            data = _parse_json_object(raw)
+            new_core = (data.get("memory_core_md") or "").strip()
+            removed_note = (data.get("removed") or "").strip()
+            if not new_core or not _is_valid_core(new_core):
+                return self._sync_remove_forget(query)
+            if not self.write_memory_core(new_core):
+                return False, "记忆文件保存失败。"
+            return True, removed_note or "已通过记忆线程从 CORE 移除。"
+        except Exception as e:
+            print(f"[forget] LLM thread failed, fallback to sync: {e}")
+            return self._sync_remove_forget(query)
 
     def _strip_command_prefix(self, text: str, prefix: str) -> str:
         stripped = (text or "").strip()
@@ -187,3 +264,79 @@ class MemoryFileManager:
         for sep in separators:
             lowered = lowered.replace(sep, " ")
         return [token for token in lowered.split() if len(token) >= 2]
+
+
+def _parse_json_object(raw_output: str) -> dict:
+    text = (raw_output or "").strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except Exception:
+            return {}
+    return {}
+
+
+def _is_valid_core(content: str) -> bool:
+    """校验 LLM 输出的 MEMORY_CORE.md 保留了必要的分区结构。"""
+    if not content or "# 永久核心记忆" not in content:
+        return False
+    return all(section in content for section in _REQUIRED_CORE_SECTIONS)
+
+
+_SOURCE_RE = None
+
+
+def _source_marker(date_str: str) -> str:
+    return f"[/mem指令 {date_str}]: "
+
+
+def _has_source_marker(line: str) -> bool:
+    """该行是否已带 [/mem指令 ...] 来源标记（兼容列表符号前缀）。"""
+    body = line.lstrip()
+    # 去掉可能的列表符号前缀 (- * • 或 1.)
+    for b in ("- ", "-　", "* ", "*　", "• ", "•　"):
+        if body.startswith(b):
+            body = body[len(b):].lstrip()
+            break
+    return body.startswith("[/mem指令")
+
+
+def _stamp_new_entries(old_core: str, new_core: str, date_str: str) -> str:
+    """对比新旧 CORE，给本次新增的条目行补上来源标记。
+
+    - 只处理分区标题下的实质条目（跳过标题、空行、模板占位）。
+    - 已带来源标记或原文里已存在的行不动。
+    """
+    marker = _source_marker(date_str)
+    old_lines = {ln.strip() for ln in (old_core or "").splitlines()}
+    out = []
+    for raw in new_core.splitlines():
+        stripped = raw.strip()
+        is_entry = bool(stripped) and not stripped.startswith("#") and not _has_source_marker(stripped)
+        if is_entry and stripped not in old_lines:
+            indent = raw[: len(raw) - len(raw.lstrip())]
+            # 保留行首列表符号（- * • 1.），标记放在符号之后、内容之前
+            bullet = ""
+            body = stripped
+            for b in ("- ", "-　", "* ", "*　", "• ", "•　"):
+                if stripped.startswith(b):
+                    bullet = b
+                    body = stripped[len(b):].lstrip()
+                    break
+            else:
+                # 数字编号 1. / 2.
+                m = stripped.split(".", 1)
+                if len(m) == 2 and m[0].isdigit() and body[:2] not in ("",):
+                    pass  # 数字列表较少见，保持原样不剥离
+            out.append(f"{indent}{bullet}{marker}{body}")
+        else:
+            out.append(raw)
+    return "\n".join(out).rstrip() + "\n"
