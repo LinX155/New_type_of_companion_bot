@@ -179,7 +179,6 @@ const DebugStatusBar: React.FC<Props> = ({ status }) => {
               <div style={{ ...labelStyle, marginBottom: '8px' }}>LLM 决策结果</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                 <Field label="last_llm_raw" value={llm?.last_llm_raw ? (llm.last_llm_raw.length > 80 ? llm.last_llm_raw.slice(0, 80) + '...' : llm.last_llm_raw) : '-'} />
-                <Field label="last_parsed_action" value={llm?.last_parsed_action} />
                 <Field label="last_parsed_text" value={llm?.last_parsed_text ? (llm.last_parsed_text.length > 40 ? llm.last_parsed_text.slice(0, 40) + '...' : llm.last_parsed_text) : '-'} />
                 <Field
                   label="parse_status"

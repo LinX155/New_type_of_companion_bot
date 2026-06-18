@@ -69,9 +69,17 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # Static files (webui build)
+class NoCacheStaticFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        # 强制浏览器每次都向服务器校验，避免前端改了却显示旧缓存
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
+
+
 webui_dist = os.path.join(os.path.dirname(__file__), "..", "webui", "dist")
 if os.path.exists(webui_dist):
-    app.mount("/", StaticFiles(directory=webui_dist, html=True), name="static")
+    app.mount("/", NoCacheStaticFiles(directory=webui_dist, html=True), name="static")
 
 
 if __name__ == "__main__":

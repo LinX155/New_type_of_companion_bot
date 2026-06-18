@@ -9,7 +9,7 @@ const tabs = [
   { id: 'chat', label: '对话' },
   { id: 'memes', label: '表情包' },
   { id: 'soul', label: 'SOUL' },
-  { id: 'schedule', label: '记忆线程' },
+  { id: 'schedule', label: '其他配置' },
   { id: 'config', label: 'API配置' },
 ];
 

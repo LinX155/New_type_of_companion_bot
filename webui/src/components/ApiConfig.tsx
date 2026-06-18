@@ -4,10 +4,10 @@ const API_BASE = '';
 
 const ApiConfig: React.FC = () => {
   const [apiKey, setApiKey] = useState('');
-  const [baseUrl, setBaseUrl] = useState('https://api.xiaomimimo.com/v1');
-  const [model, setModel] = useState('mimo-v2.5');
-  const [hotDuration, setHotDuration] = useState(30);
-  const [saved, setSaved] = useState(false);
+  const [baseUrl, setBaseUrl] = useState('https://api.deepseek.com');
+  const [model, setModel] = useState('deepseek-v4-flash');
+  const [thinkingEnabled, setThinkingEnabled] = useState(false);
+  const [savedApi, setSavedApi] = useState(false);
 
   useEffect(() => {
     fetch(`${API_BASE}/api/config`)
@@ -16,42 +16,35 @@ const ApiConfig: React.FC = () => {
         if (data.api_key) setApiKey(data.api_key);
         if (data.base_url) setBaseUrl(data.base_url);
         if (data.model) setModel(data.model);
-      })
-      .catch(() => {});
-
-    fetch(`${API_BASE}/api/config/hot-duration`)
-      .then(r => r.json())
-      .then(data => {
-        if (data.hot_duration_minutes !== undefined) {
-          setHotDuration(data.hot_duration_minutes);
-        }
+        if (data.thinking_enabled !== undefined) setThinkingEnabled(data.thinking_enabled);
       })
       .catch(() => {});
   }, []);
 
+  const saveConfig = async (thinkingValue: boolean) => {
+    await fetch(`${API_BASE}/api/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: apiKey, base_url: baseUrl, model, thinking_enabled: thinkingValue }),
+    });
+  };
+
   const handleSave = async () => {
     try {
-      await fetch(`${API_BASE}/api/config`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_key: apiKey, base_url: baseUrl, model }),
-      });
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
+      await saveConfig(thinkingEnabled);
+      setSavedApi(true);
+      setTimeout(() => setSavedApi(false), 2000);
     } catch {
       alert('保存失败');
     }
   };
 
-  const handleSaveHotDuration = async () => {
+  const handleToggleThinking = async (next: boolean) => {
+    setThinkingEnabled(next);
     try {
-      await fetch(`${API_BASE}/api/config/hot-duration`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ hot_duration_minutes: hotDuration }),
-      });
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
+      await saveConfig(next);
+      setSavedApi(true);
+      setTimeout(() => setSavedApi(false), 2000);
     } catch {
       alert('保存失败');
     }
@@ -59,7 +52,6 @@ const ApiConfig: React.FC = () => {
 
   return (
     <div style={{ maxWidth: '600px', display: 'flex', flexDirection: 'column', gap: '20px' }}>
-      {/* API Config */}
       <div style={{ background: '#fff', padding: '24px', borderRadius: '8px' }}>
         <h2 style={{ marginBottom: '20px' }}>大模型 API 配置</h2>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
@@ -91,6 +83,49 @@ const ApiConfig: React.FC = () => {
               style={{ width: '100%', padding: '10px', border: '1px solid #ddd', borderRadius: '6px', fontSize: '14px' }}
             />
           </div>
+
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            padding: '12px',
+            background: '#f8f9fa',
+            borderRadius: '6px',
+          }}>
+            <div>
+              <div style={{ fontWeight: 500, fontSize: '14px' }}>是否开启思考模式</div>
+              <div style={{ color: '#7f8c8d', fontSize: '12px', marginTop: '2px' }}>
+                开启后 LLM 会先思考再回复（更慢、更强），关闭则直接快速回复。
+              </div>
+            </div>
+            <label style={{ position: 'relative', display: 'inline-block', width: '44px', height: '24px', flexShrink: 0 }}>
+              <input
+                type="checkbox"
+                checked={thinkingEnabled}
+                onChange={e => handleToggleThinking(e.target.checked)}
+                style={{ opacity: 0, width: 0, height: 0 }}
+              />
+              <span style={{
+                position: 'absolute',
+                cursor: 'pointer',
+                top: 0, left: 0, right: 0, bottom: 0,
+                background: thinkingEnabled ? '#27ae60' : '#ccc',
+                borderRadius: '24px',
+                transition: '0.2s',
+              }}>
+                <span style={{
+                  position: 'absolute',
+                  height: '18px', width: '18px',
+                  left: thinkingEnabled ? '23px' : '3px',
+                  bottom: '3px',
+                  background: '#fff',
+                  borderRadius: '50%',
+                  transition: '0.2s',
+                }} />
+              </span>
+            </label>
+          </div>
+
           <button
             onClick={handleSave}
             style={{
@@ -104,52 +139,9 @@ const ApiConfig: React.FC = () => {
               fontWeight: 500,
             }}
           >
-            {saved ? '已保存 ✓' : '保存配置'}
+            {savedApi ? '已保存 ✓' : '保存配置'}
           </button>
         </div>
-      </div>
-
-      {/* Hot Duration Config */}
-      <div style={{ background: '#fff', padding: '24px', borderRadius: '8px' }}>
-        <h2 style={{ marginBottom: '16px' }}>状态机配置</h2>
-        <p style={{ color: '#7f8c8d', fontSize: '13px', marginBottom: '16px' }}>
-          设置热聊在场态（HOT）持续多久后自动退回离线生活态（COLD）。
-        </p>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
-          <label style={{ fontWeight: 500 }}>HOT 持续时间：</label>
-          <input
-            type="number"
-            min={1}
-            max={1440}
-            value={hotDuration}
-            onChange={e => setHotDuration(Number(e.target.value))}
-            style={{ width: '80px', padding: '10px', border: '1px solid #ddd', borderRadius: '6px', fontSize: '14px', textAlign: 'center' }}
-          />
-          <span>分钟</span>
-        </div>
-        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-          <button onClick={() => setHotDuration(1)} style={{ padding: '6px 12px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>1分钟（测试）</button>
-          <button onClick={() => setHotDuration(5)} style={{ padding: '6px 12px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>5分钟</button>
-          <button onClick={() => setHotDuration(10)} style={{ padding: '6px 12px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>10分钟</button>
-          <button onClick={() => setHotDuration(30)} style={{ padding: '6px 12px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>30分钟</button>
-          <button onClick={() => setHotDuration(60)} style={{ padding: '6px 12px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>1小时</button>
-        </div>
-        <button
-          onClick={handleSaveHotDuration}
-          style={{
-            marginTop: '16px',
-            padding: '12px 24px',
-            background: '#e74c3c',
-            color: '#fff',
-            border: 'none',
-            borderRadius: '6px',
-            cursor: 'pointer',
-            fontSize: '14px',
-            fontWeight: 500,
-          }}
-        >
-          保存状态机配置
-        </button>
       </div>
     </div>
   );

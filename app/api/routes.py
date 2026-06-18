@@ -73,6 +73,7 @@ class ApiConfig(BaseModel):
     api_key: str
     base_url: str
     model: str
+    thinking_enabled: bool = False
 
 
 class ChatMessage(BaseModel):
@@ -232,6 +233,7 @@ async def update_config(config: ApiConfig):
         api_key=config.api_key,
         base_url=config.base_url,
         model=config.model,
+        thinking_enabled=config.thinking_enabled,
     )
     return {"status": "ok"}
 
@@ -242,6 +244,7 @@ async def get_config():
         "api_key": llm_client.api_key,
         "base_url": llm_client.base_url,
         "model": llm_client.model,
+        "thinking_enabled": llm_client.thinking_enabled,
     }
 
 
