@@ -68,13 +68,31 @@ class EventGate:
     async def _handle_nudge(self, event: ChatEvent) -> dict:
         """拍一拍强制刷新注意力"""
         self.clear_user_composing()
-        self.state.last_user_message_at = datetime.now()
+        if not event.text:
+            event.text = "拍了拍你"
+
+        self.state.last_user_message_at = event.timestamp
         # 如果当前是 COLD，进入 HOT
         if self.state.status != ChatStatus.HOT:
             self.state.status = ChatStatus.HOT
         self._refresh_hot_timer()
+        new_version = await self.buffer.append(event)
         events, version = await self.buffer.get_snapshot()
         self.state.buffer_version = version
+
+        async with self._pending_job_lock:
+            has_pending = self._pending_job_id is not None
+
+        if has_pending:
+            self._mark_current_job_stale()
+            return {
+                "handled": True,
+                "type": "nudge",
+                "status": self.state.status.value,
+                "buffer_version": new_version,
+                "pending": True,
+            }
+
         snapshot = self.snapshot_manager.create_snapshot(
             events=events,
             buffer_version=version,
@@ -85,9 +103,7 @@ class EventGate:
         )
         self.state.current_snapshot_id = snapshot.snapshot_id
 
-        # 如果有未处理消息，立即触发 LLM
-        if events:
-            await self._dispatch_llm(snapshot)
+        await self._dispatch_llm(snapshot)
 
         return {
             "handled": True,

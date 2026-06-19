@@ -926,6 +926,7 @@ async def send_nudge():
     event = ChatEvent(
         event_id=f"evt_{uuid.uuid4().hex[:8]}",
         event_type=EventType.NUDGE,
+        text="拍了拍你",
         timestamp=datetime.now(),
         raw={"source": "webui"},
     )

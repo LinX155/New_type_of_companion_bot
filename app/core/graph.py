@@ -318,6 +318,13 @@ class CompanionGraph:
             self._last_parsed_items = None
             return ActionDecision(action=Action.WAIT, text=None), "fallback"
 
+        text_clean = self._strip_json_fence(text)
+        json_decisions = self._parse_json_decisions(text_clean)
+        if json_decisions:
+            parsed = self._merge_json_decisions(json_decisions) if len(json_decisions) > 1 else json_decisions[0]
+            self._record_parsed_decision(parsed)
+            return parsed, "repaired_multi_json" if len(json_decisions) > 1 else "ok"
+
         json_match = re.search(r"\{.*\}", text, re.DOTALL)
         if json_match:
             try:
@@ -325,23 +332,17 @@ class CompanionGraph:
                 action_str = str(data.get("action", "REPLY")).strip().upper()
                 if action_str in [a.value for a in Action]:
                     parsed = self._build_decision(action_str, data.get("text"), data.get("items"))
-                    self._last_parsed_action = parsed.action.value
-                    self._last_parsed_text = parsed.text
-                    self._last_parsed_items = [item.model_dump(mode="json") for item in parsed.all_items()]
+                    self._record_parsed_decision(parsed)
                     return parsed, "ok"
             except Exception:
                 pass
 
         try:
-            text_clean = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
-            text_clean = re.sub(r"\s*```$", "", text_clean)
             data = json.loads(text_clean)
             action_str = str(data.get("action", "REPLY")).strip().upper()
             if action_str in [a.value for a in Action]:
                 parsed = self._build_decision(action_str, data.get("text"), data.get("items"))
-                self._last_parsed_action = parsed.action.value
-                self._last_parsed_text = parsed.text
-                self._last_parsed_items = [item.model_dump(mode="json") for item in parsed.all_items()]
+                self._record_parsed_decision(parsed)
                 return parsed, "ok"
         except Exception:
             pass
@@ -352,9 +353,7 @@ class CompanionGraph:
                 action_str = bracket_match.group(1).upper()
                 action_text = bracket_match.group(2).strip() or None
                 parsed = self._build_decision(action_str, action_text)
-                self._last_parsed_action = parsed.action.value
-                self._last_parsed_text = parsed.text
-                self._last_parsed_items = [item.model_dump(mode="json") for item in parsed.all_items()]
+                self._record_parsed_decision(parsed)
                 return parsed, "ok"
             except Exception:
                 pass
@@ -371,9 +370,7 @@ class CompanionGraph:
             if text_match:
                 try:
                     parsed = self._build_decision(Action.REACT.value, text_match.group(1))
-                    self._last_parsed_action = parsed.action.value
-                    self._last_parsed_text = parsed.text
-                    self._last_parsed_items = [item.model_dump(mode="json") for item in parsed.all_items()]
+                    self._record_parsed_decision(parsed)
                     return parsed, "ok"
                 except Exception:
                     self._last_parsed_action = Action.WAIT.value
@@ -388,10 +385,77 @@ class CompanionGraph:
             return ActionDecision(action=Action.WAIT, text=None), "fallback"
 
         parsed = ActionDecision(action=Action.REPLY, text=text)
+        self._record_parsed_decision(parsed)
+        return parsed, "fallback"
+
+    def _strip_json_fence(self, text: str) -> str:
+        text_clean = re.sub(r"^```json\s*", "", text.strip(), flags=re.IGNORECASE)
+        text_clean = re.sub(r"^```\s*", "", text_clean)
+        return re.sub(r"\s*```$", "", text_clean).strip()
+
+    def _parse_json_decisions(self, text: str) -> list[ActionDecision]:
+        """Parse one or more top-level JSON decisions from model output."""
+        decoder = json.JSONDecoder()
+        decisions: list[ActionDecision] = []
+        idx = 0
+        action_values = {a.value for a in Action}
+
+        while idx < len(text):
+            match = re.search(r"\{", text[idx:])
+            if not match:
+                break
+
+            start = idx + match.start()
+            try:
+                data, end = decoder.raw_decode(text, start)
+            except json.JSONDecodeError:
+                idx = start + 1
+                continue
+
+            idx = end
+            if not isinstance(data, dict):
+                continue
+
+            action_str = str(data.get("action", "REPLY")).strip().upper()
+            if action_str not in action_values:
+                continue
+
+            try:
+                decisions.append(self._build_decision(action_str, data.get("text"), data.get("items")))
+            except Exception:
+                continue
+
+        return decisions
+
+    def _merge_json_decisions(self, decisions: list[ActionDecision]) -> ActionDecision:
+        """Repair accidental multi-action output into one action+items decision."""
+        merged_items: list[SendItem] = []
+        item_actions: list[Action] = []
+        for decision in decisions:
+            items = decision.all_items()
+            if not items:
+                continue
+            merged_items.extend(items)
+            item_actions.append(decision.action)
+
+        if not merged_items:
+            return decisions[-1]
+
+        if Action.ENTER_CHAT in item_actions:
+            action = Action.ENTER_CHAT
+        elif any(item.type == SendItemType.TEXT for item in merged_items):
+            action = Action.LIGHT_ACK if item_actions and all(item_action == Action.LIGHT_ACK for item_action in item_actions) else Action.REPLY
+        elif Action.REPLY in item_actions:
+            action = Action.REPLY
+        else:
+            action = Action.REACT
+
+        return ActionDecision(action=action, items=merged_items)
+
+    def _record_parsed_decision(self, parsed: ActionDecision):
         self._last_parsed_action = parsed.action.value
         self._last_parsed_text = parsed.text
         self._last_parsed_items = [item.model_dump(mode="json") for item in parsed.all_items()]
-        return parsed, "fallback"
 
     def _build_decision(self, action_str: str, text_value, items_value=None) -> ActionDecision:
         if action_str in (Action.WAIT.value, Action.END_CHAT.value):

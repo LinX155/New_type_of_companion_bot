@@ -3,7 +3,7 @@ import DebugStatusBar, { DebugStatus } from './DebugStatusBar';
 
 interface Message {
   id: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   text: string;
   itemType?: 'text' | 'emoji' | 'meme' | 'search_meme';
   action?: string;
@@ -100,8 +100,8 @@ const ChatWindow: React.FC = () => {
       .then(data => {
         const loaded = data.map((e: any, idx: number) => ({
           id: `hist_${idx}`,
-          role: e.event_type?.startsWith('user') ? 'user' : 'assistant',
-          text: e.text || '',
+          role: e.event_type === 'nudge' ? 'system' : e.event_type?.startsWith('user') ? 'user' : 'assistant',
+          text: e.event_type === 'nudge' ? '已拍一拍' : e.text || '',
           itemType: inferItemType(e.text, e.event_type),
           action: e.action,
           isMeme: e.event_type === 'assistant_react' || e.text?.startsWith('meme:') || e.text?.startsWith('emoji:'),
@@ -216,6 +216,13 @@ const ChatWindow: React.FC = () => {
   const sendNudge = async () => {
     try {
       await fetch(`${API_BASE}/api/nudge`, { method: 'POST' });
+      setMessages(prev => [...prev, {
+        id: `nudge_${Date.now()}_${prev.length}`,
+        role: 'system',
+        text: '已拍一拍',
+        timestamp: new Date().toISOString(),
+      }]);
+      fetchStatus();
     } catch {
       setIsLoading(false);
     }
@@ -246,14 +253,14 @@ const ChatWindow: React.FC = () => {
         }}>
           {messages.map(msg => (
             <div key={msg.id} style={{
-              alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
-              maxWidth: '70%',
-              background: msg.role === 'user' ? '#3498db' : '#ecf0f1',
-              color: msg.role === 'user' ? '#fff' : '#2c3e50',
-              padding: '10px 14px',
-              borderRadius: msg.role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
-              fontSize: '14px',
-              lineHeight: 1.5,
+              alignSelf: msg.role === 'system' ? 'center' : msg.role === 'user' ? 'flex-end' : 'flex-start',
+              maxWidth: msg.role === 'system' ? 'none' : '70%',
+              background: msg.role === 'system' ? '#f4f6f7' : msg.role === 'user' ? '#3498db' : '#ecf0f1',
+              color: msg.role === 'system' ? '#7f8c8d' : msg.role === 'user' ? '#fff' : '#2c3e50',
+              padding: msg.role === 'system' ? '5px 10px' : '10px 14px',
+              borderRadius: msg.role === 'system' ? '999px' : msg.role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
+              fontSize: msg.role === 'system' ? '12px' : '14px',
+              lineHeight: msg.role === 'system' ? 1.2 : 1.5,
             }}>
               {msg.itemType === 'meme' && msg.text?.startsWith('meme:') ? (
                 <div>
