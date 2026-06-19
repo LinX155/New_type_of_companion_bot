@@ -40,6 +40,14 @@ class MemeStealAnalyzer:
     def __init__(self, catalog: MemeCatalog, root_dir: str):
         self.catalog = catalog
         self.root_dir = os.path.abspath(root_dir)
+        self.allowed_local_roots = [
+            os.path.abspath(self.catalog.assets_dir),
+            os.path.abspath(os.path.join(self.catalog.base_dir, "inbox")),
+            os.path.abspath(os.path.join(self.catalog.base_dir, "tmp")),
+            os.path.abspath(os.path.join(self.root_dir, "data", "onebot_media")),
+        ]
+        for path in self.allowed_local_roots[1:]:
+            os.makedirs(path, exist_ok=True)
 
     async def analyze(
         self,
@@ -87,6 +95,11 @@ class MemeStealAnalyzer:
             return image_ref
 
         path = self._local_path_from_ref(image_ref, parsed)
+        if not self._is_allowed_local_path(path):
+            raise ValueError(
+                "local image_ref must be under an allowed meme media directory: "
+                "memes/assets, memes/inbox, memes/tmp, or data/onebot_media"
+            )
         if not os.path.isfile(path):
             raise ValueError(f"image file not found: {image_ref}")
 
@@ -119,6 +132,17 @@ class MemeStealAnalyzer:
         if not os.path.isabs(path):
             path = os.path.join(self.root_dir, path)
         return os.path.abspath(path)
+
+    def _is_allowed_local_path(self, path: str) -> bool:
+        candidate = os.path.normcase(os.path.abspath(path))
+        for root in self.allowed_local_roots:
+            allowed = os.path.normcase(os.path.abspath(root))
+            try:
+                if os.path.commonpath([candidate, allowed]) == allowed:
+                    return True
+            except ValueError:
+                continue
+        return False
 
     def _detect_mime(self, image_bytes: bytes, ext: str) -> str:
         if image_bytes.startswith(b"\xff\xd8\xff"):

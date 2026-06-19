@@ -11,6 +11,9 @@ from ..storage.models import ScheduledJobLog, ConversationEvent
 from ..storage.db import SessionLocal
 from ..memory.files import MemoryFileManager
 
+TOMORROW_TOPIC_SECTIONS = ("未闭合话题", "昨日记忆", "生活感消息备选")
+MEMORY_ANALYSIS_TOMORROW_SECTIONS = {"未闭合话题"}
+
 
 class SchedulerManager:
     def __init__(self, memory_manager: MemoryFileManager = None, llm_client: Optional[LLMClient] = None):
@@ -108,7 +111,12 @@ class SchedulerManager:
 
             if not self.memory.write_today_memory(today_memory):
                 raise RuntimeError("failed to write today's dm file")
-            if not self.memory.write_tomorrow_topics(tomorrow_topics):
+            scoped_tomorrow_topics = self._merge_tomorrow_topics_sections(
+                current=self.memory.read_tomorrow_topics(),
+                proposed=tomorrow_topics,
+                owned_sections=MEMORY_ANALYSIS_TOMORROW_SECTIONS,
+            )
+            if not self.memory.write_tomorrow_topics(scoped_tomorrow_topics):
                 raise RuntimeError("failed to write TOMORROW_TOPICS.md")
 
             self._finish_job(log_id, "completed")
@@ -174,16 +182,15 @@ class SchedulerManager:
                 db.query(ConversationEvent)
                 .filter(ConversationEvent.created_at >= start)
                 .filter(ConversationEvent.created_at < end)
-                .filter(ConversationEvent.event_type.in_(["user_text", "assistant_text", "assistant_react"]))
+                .filter(ConversationEvent.event_type == "user_text")
                 .order_by(ConversationEvent.created_at)
                 .all()
             )
             transcript = []
             for row in rows:
-                role = "assistant" if row.event_type.startswith("assistant") else "user"
                 transcript.append(
                     {
-                        "role": role,
+                        "role": "user",
                         "text": row.text,
                         "action": row.action,
                         "created_at": row.created_at.isoformat() if row.created_at else "",
@@ -192,6 +199,67 @@ class SchedulerManager:
             return transcript
         finally:
             db.close()
+
+    def _merge_tomorrow_topics_sections(
+        self,
+        current: str,
+        proposed: str,
+        owned_sections: set[str],
+    ) -> str:
+        """Keep non-owned TOMORROW_TOPICS.md sections unchanged.
+
+        Memory analysis may only maintain "未闭合话题"; midnight cleanup owns
+        "昨日记忆" and may also validate "未闭合话题".
+        """
+        current_sections = self._extract_tomorrow_sections(current)
+        proposed_sections = self._extract_tomorrow_sections(proposed)
+        lines = ["# 明日话题", ""]
+
+        for section in TOMORROW_TOPIC_SECTIONS:
+            lines.append(f"## {section}")
+            body = (
+                proposed_sections.get(section, [])
+                if section in owned_sections
+                else current_sections.get(section, [])
+            )
+            lines.extend(body)
+            lines.append("")
+
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _extract_tomorrow_sections(self, markdown: str) -> dict[str, list[str]]:
+        sections: dict[str, list[str]] = {section: [] for section in TOMORROW_TOPIC_SECTIONS}
+        current_section: Optional[str] = None
+
+        for raw in (markdown or "").splitlines():
+            header = self._parse_tomorrow_section_header(raw)
+            if header:
+                current_section = header if header in sections else None
+                continue
+            if current_section:
+                sections[current_section].append(raw)
+
+        return {
+            section: self._trim_blank_edges(lines)
+            for section, lines in sections.items()
+        }
+
+    def _parse_tomorrow_section_header(self, line: str) -> Optional[str]:
+        stripped = (line or "").strip()
+        if stripped.startswith("## "):
+            return stripped[3:].strip()
+        if stripped.startswith("**") and stripped.endswith("**") and len(stripped) > 4:
+            return stripped.strip("*").strip()
+        return None
+
+    def _trim_blank_edges(self, lines: list[str]) -> list[str]:
+        start = 0
+        end = len(lines)
+        while start < end and not lines[start].strip():
+            start += 1
+        while end > start and not lines[end - 1].strip():
+            end -= 1
+        return lines[start:end]
 
     def _parse_json_object(self, raw_output: str) -> dict:
         text = (raw_output or "").strip()

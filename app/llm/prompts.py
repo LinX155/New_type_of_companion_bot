@@ -472,7 +472,8 @@ def build_memory_analysis_messages(
         if item.get("text")
     )
     system = """你是记忆分析线程，不是聊天角色。
-你的任务是根据当天 conversation_events / transcript_view，维护 dm/YYYY-MM-DD.md 和 TOMORROW_TOPICS.md 的“未闭合话题”。
+你的任务是根据当天用户侧可见输入 user_visible_events，维护 dm/YYYY-MM-DD.md 和 TOMORROW_TOPICS.md 的“未闭合话题”。
+不要读取或推断助手自己的回复。不要读取 raw chat log。
 不要修改 MEMORY_CORE.md。不要模仿角色说话。不要把所有闲聊都写成记忆。
 只输出 JSON 对象，不要输出 Markdown 代码块或解释。
 
@@ -485,6 +486,7 @@ JSON schema:
 规则:
 - dm 文件记录今日大事、重要事实、相处习惯、临时近期状态。
 - 相处习惯可以记录用户当天明确表达或反复表现出的回应风格偏好，例如喜欢短句、少分析、先陪吐槽、少用 emoji、喜欢表情包；不要从一次偶然反应过度推断。
+- TOMORROW_TOPICS.md 只允许你维护“未闭合话题”部分；“昨日记忆”和“生活感消息备选”不是你的职责，必须原样保留。
 - TOMORROW_TOPICS.md 的未闭合话题只保留未来还可能自然续上的事项。
 - 不生成“昨日记忆”，那是凌晨整理线程职责。
 """
@@ -492,7 +494,7 @@ JSON schema:
         "date": date_str,
         "current_today_memory_md": today_memory_md or "",
         "current_tomorrow_topics_md": tomorrow_topics_md or "",
-        "conversation_events": transcript_text or "(今天还没有可整理的可见对话。)",
+        "user_visible_events": transcript_text or "(今天还没有可整理的用户侧可见输入。)",
     }
     return [
         {"role": "system", "content": system},
