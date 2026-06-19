@@ -28,6 +28,7 @@ from ..llm.client import LLMClient
 from ..llm.prompts import build_active_message_messages
 from ..memory.files import MemoryFileManager
 from ..memes.catalog import MemeCatalog
+from ..memes.steal import MemeStealAnalyzer
 from ..scheduler.jobs import SchedulerManager
 from ..storage.db import get_db, engine
 from ..storage.models import Base, RawChatLog, ConversationEvent, ensure_storage_schema
@@ -83,6 +84,7 @@ def _load_default_llm_config() -> dict:
 llm_client = LLMClient(**_load_default_llm_config())
 memory_manager = MemoryFileManager()
 meme_catalog = MemeCatalog()
+meme_steal_analyzer = MemeStealAnalyzer(meme_catalog, ROOT_DIR)
 scheduler_manager = SchedulerManager(memory_manager, llm_client)
 
 companion_graph: Optional[CompanionGraph] = None
@@ -141,6 +143,12 @@ class ActiveMessageConfig(BaseModel):
 class InputStatusConfig(BaseModel):
     composing: bool = True
     ttl_ms: int = 3000
+
+
+class MemeStealAnalyzeRequest(BaseModel):
+    image_ref: str
+    context_text: str = ""
+
 
 def init_gate():
     global event_gate, companion_graph
@@ -1076,6 +1084,24 @@ async def get_filtered_memes():
             data = json.load(f)
         return {"count": len(data), "items": data}
     return {"count": 0, "items": []}
+
+
+@router.post("/api/memes/steal/analyze")
+async def analyze_meme_for_steal(req: MemeStealAnalyzeRequest):
+    """分析图片是否适合偷表情并生成 category/save_name；不保存文件。"""
+    if not llm_client.api_key:
+        raise HTTPException(status_code=400, detail="LLM API key is not configured")
+    try:
+        result = await meme_steal_analyzer.analyze(
+            image_ref=req.image_ref,
+            llm_client=llm_client,
+            context_text=req.context_text,
+        )
+        return result.model_dump(mode="json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"meme steal analysis failed: {e}")
 
 
 @router.get("/api/config/hot-duration")

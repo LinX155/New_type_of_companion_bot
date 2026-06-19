@@ -89,7 +89,14 @@ JSON schema:
 - 想发表情但还没有候选时，输出 type=search_meme，content 为 search_meme:<category>:<keywords>，category 必须是固定英文分类 ID。
 - 只在系统给出候选后，才输出 type=meme，content 为 meme:<file_stem>。
 - 不要直接输出本地文件路径。
+- 表情包不是只能在用户点名时使用；在轻松吐槽、惊讶、无语、尴尬、疲惫、撒娇、夸奖、庆祝、调侃、贴贴、互动打招呼等场景，应主动考虑用 REACT 或在 REPLY 里混入 search_meme/meme item。
+- 当一句文字解释会显得啰嗦、人机或太正经，而一个表情包能更自然地表达态度时，优先用表情包替代那句文字。
+- 表情包也可以用于软化语气：当你要轻轻提醒、反问、拒绝、吐槽、转移话题，或回复里出现“但是”“要不”“先别”“等下”这类容易显得生硬的表达时，可以用一个合适表情降低服务感和命令感。
+- 表情包可以作为第一反应、情绪承接或收尾，例如“短文字 + 表情包”“表情包 + 短追问”“只发一个表情包”。
+- 用户发“哈哈哈”“救命”“绷不住了”“离谱”“无语”“累死”“笑死”“贴贴”等明显情绪/网络聊天信号时，优先考虑表情包，而不是只回纯文字。
 - 如果用户明确提到“表情包”“表情”“meme”“斗图”，必须使用 REACT 或带 search_meme/meme item 的 REPLY，不要 WAIT 或纯文字敷衍。
+- 选择表情包时按这个内部顺序判断：当前语境是否适合表情包 -> 选择最贴近的 category -> 用简短关键词生成 search_meme -> 判断是否还需要补一句文字；如果没有合适 category 或表情会破坏气氛，就不用。
+- 不要为了完成指标每轮都发表情包；严肃求助、事实问答、用户明确要求纯文字或不适合玩梗时，少用或不用表情包。
 - 表情包不可用或不合适时，降级为 LIGHT_ACK、REPLY 或 WAIT，不要解释技术原因。
 
 表情分类:
@@ -277,6 +284,64 @@ def build_meme_search_messages(
             ),
         },
         {"role": "user", "content": f"候选表情 JSON:\n{candidates_text}"},
+    ]
+
+
+def build_meme_steal_analysis_messages(
+    image_url: str,
+    categories_text: str,
+    context_text: str = "",
+) -> list:
+    """构建偷表情分析/命名的多模态提示词。"""
+    context = context_text.strip() or "(没有额外聊天上下文，只根据图片本身判断。)"
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是本地表情包入库分析器。你的任务是看一张用户发来的图片，"
+                "判断它是否适合被静默收进情感陪伴机器人的本地表情包库，并按规则生成稳定文件名。\n"
+                "只输出一个 JSON 对象，不要输出 Markdown、解释、前后缀或额外文本。\n\n"
+                "输出 schema:\n"
+                "{\n"
+                '  "should_steal": true | false,\n'
+                '  "category": "固定分类ID或null",\n'
+                '  "save_name": "lower_snake_case_without_ext或null",\n'
+                '  "keywords": ["英文检索词"],\n'
+                '  "reason": "一句中文原因",\n'
+                '  "safety": "ok | privacy | not_meme | unclear"\n'
+                "}\n\n"
+                "判断边界:\n"
+                "- 只收适合作为聊天表情/梗图/反应图/贴纸的图片。\n"
+                "- 不要保存普通照片、真人自拍、聊天截图、二维码、付款码、账号信息、证件、隐私内容或难以复用的图片。\n"
+                "- 不确定时 should_steal=false。\n"
+                "- 偷表情是内部静默行为，不要生成面向用户的提示语。\n\n"
+                "命名规则:\n"
+                "- should_steal=false 时 category、save_name 可以为 null。\n"
+                "- should_steal=true 时 category 必须从固定分类 ID 中选择，尽量不要用 miscellaneous。\n"
+                "- save_name 必须是英文小写、数字和下划线，不带扩展名，不含空格、中文、标点或路径。\n"
+                "- save_name 推荐 3-6 个语义 token，格式为 <category>_<subject>_<expression_or_action>[_scene_or_text]。\n"
+                "- 文件名要服务未来检索，优先保留主体、表情/动作、图中文字或典型使用场景。\n"
+                "- 不要使用 generic、random、image、sticker、meme 这类空泛词作为主要 token。\n\n"
+                "固定分类 ID:\n"
+                f"{categories_text}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "请分析这张图片是否值得收进表情包库，并给出分类和 save_name。\n"
+                        f"聊天上下文: {context}"
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                },
+            ],
+        },
     ]
 
 

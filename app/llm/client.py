@@ -1,5 +1,5 @@
 import os
-from typing import List, Dict, Optional, AsyncGenerator
+from typing import Any, List, Dict, Optional, AsyncGenerator
 from openai import AsyncOpenAI
 
 
@@ -27,7 +27,7 @@ class LLMClient:
 
     def _build_kwargs(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         temperature: float,
         max_tokens: int,
         stream: bool,
@@ -50,7 +50,7 @@ class LLMClient:
 
     async def chat_completion(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         temperature: float = 0.7,
         max_tokens: int = 1024,
         stream: bool = False,
@@ -71,7 +71,7 @@ class LLMClient:
 
     async def chat_completion_stream(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         temperature: float = 0.7,
         max_tokens: int = 1024,
     ) -> AsyncGenerator[str, None]:
