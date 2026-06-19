@@ -1,13 +1,21 @@
-import json
-import re
 from typing import Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
 from .event_gate import ProcessContext
 from .decisions import ActionDecision, Action, SendItem, SendItemType
+from .protocol import (
+    ProtocolResult,
+    build_repair_messages,
+    parse_and_validate_raw_decision,
+    validate_executable,
+)
 from ..llm.client import LLMClient
-from ..llm.prompts import build_system_prompt, build_messages, build_meme_search_messages
+from ..llm.prompts import (
+    build_system_prompt,
+    build_messages,
+    build_meme_search_messages,
+)
 from ..memory.files import MemoryFileManager
 from ..memes.catalog import MemeCatalog
 from ..memes.search import MemeSearch
@@ -70,6 +78,7 @@ class CompanionGraph:
         result = await self._workflow.ainvoke({"ctx": ctx})
         decision = result.get("decision") or ActionDecision(action=Action.WAIT, text=None)
         ctx.decision = decision
+        self._record_parsed_decision(decision)
 
         return decision
 
@@ -118,12 +127,15 @@ class CompanionGraph:
             max_tokens=512,
         )
         self._last_llm_raw_output = raw_output
-        decision, parse_status = self._parse_decision(raw_output)
+        decision, parse_status = await self._parse_decision_with_harness(
+            ctx=state["ctx"],
+            base_messages=state["messages"],
+            raw_output=raw_output,
+            repair=True,
+        )
         self._last_parse_status = parse_status
         decision = self._apply_protocol_guards(state["ctx"], decision)
-        self._last_parsed_action = decision.action.value
-        self._last_parsed_text = decision.text
-        self._last_parsed_items = [item.model_dump(mode="json") for item in decision.all_items()]
+        self._record_parsed_decision(decision)
         state["ctx"].decision = decision
         return {**state, "decision": decision}
 
@@ -132,6 +144,68 @@ class CompanionGraph:
         if decision and decision.search_meme_items():
             return "search_meme"
         return "validate_decision"
+
+    async def _parse_decision_with_harness(
+        self,
+        ctx: ProcessContext,
+        base_messages: list,
+        raw_output: str,
+        repair: bool,
+    ) -> tuple[ActionDecision, str]:
+        result = parse_and_validate_raw_decision(raw_output)
+        if result.ok and result.decision:
+            return result.decision, result.status
+
+        if repair:
+            repaired = await self._repair_protocol_decision(
+                base_messages=base_messages,
+                raw_output=raw_output,
+                result=result,
+            )
+            if repaired.ok and repaired.decision:
+                return repaired.decision, "repair_ok"
+            return self._fallback_decision(ctx), "repair_failed"
+
+        return self._fallback_decision(ctx), result.status
+
+    async def _repair_protocol_decision(
+        self,
+        base_messages: list,
+        raw_output: str,
+        result: ProtocolResult,
+    ) -> ProtocolResult:
+        messages = build_repair_messages(
+            base_messages=base_messages,
+            errors=result.errors,
+            original_raw=raw_output,
+            original_decision=result.decision,
+        )
+        try:
+            repaired_raw = await self.llm.chat_completion(
+                messages=messages,
+                temperature=0.2,
+                max_tokens=512,
+            )
+        except Exception as exc:
+            return ProtocolResult(status="repair_failed", errors=[str(exc)])
+
+        repaired = parse_and_validate_raw_decision(repaired_raw)
+        if repaired.ok:
+            return repaired
+        return ProtocolResult(
+            status="repair_failed",
+            decision=repaired.decision,
+            errors=repaired.errors,
+            raw_data=repaired.raw_data,
+        )
+
+    def _fallback_decision(self, ctx: ProcessContext) -> ActionDecision:
+        if ctx.snapshot.events:
+            return ActionDecision(
+                action=Action.LIGHT_ACK,
+                items=[SendItem(type=SendItemType.TEXT, content="嗯")],
+            )
+        return ActionDecision(action=Action.WAIT, items=None)
 
     async def _search_meme(self, state: GraphState) -> GraphState:
         ctx = state["ctx"]
@@ -181,29 +255,39 @@ class CompanionGraph:
             temperature=0.2,
             max_tokens=512,
         )
-        second_decision, _ = self._parse_decision(raw_output)
+        second_result = parse_and_validate_raw_decision(raw_output)
+        if not second_result.ok or not second_result.decision:
+            fallback_decision = self._replace_search_items_with_first_candidates(decision, search_results)
+            selected = self._selected_meme_stems(fallback_decision)
+            ctx.selected_memes = selected
+            ctx.selected_meme = selected[0] if selected else None
+            self._last_render_status = "fallback"
+            return {**state, "decision": fallback_decision}
+
+        second_decision = second_result.decision
 
         if self._meme_selection_is_valid(second_decision, candidate_union):
             selected = self._selected_meme_stems(second_decision)
             ctx.selected_memes = selected
             ctx.selected_meme = selected[0] if selected else None
+            self._last_render_status = "hit"
             return {**state, "decision": second_decision}
 
         fallback_decision = self._replace_search_items_with_first_candidates(decision, search_results)
         selected = self._selected_meme_stems(fallback_decision)
         ctx.selected_memes = selected
         ctx.selected_meme = selected[0] if selected else None
+        self._last_render_status = "fallback"
         return {**state, "decision": fallback_decision}
 
     def _meme_selection_is_valid(self, decision: ActionDecision, candidate_union: set[str]) -> bool:
-        if decision.search_meme_items():
+        executable = validate_executable(
+            decision,
+            allowed_meme_stems=candidate_union,
+            allow_search_meme=False,
+        )
+        if not executable.ok:
             return False
-
-        for item in decision.all_items():
-            if item.type == SendItemType.MEME:
-                stem = item.content[5:]
-                if stem not in candidate_union:
-                    return False
         return bool(decision.send_items())
 
     def _selected_meme_stems(self, decision: ActionDecision) -> list[str]:
@@ -239,11 +323,11 @@ class CompanionGraph:
     async def _validate_decision(self, state: GraphState) -> GraphState:
         decision = state["decision"]
         ctx = state["ctx"]
-
         validated_items: list[SendItem] = []
         selected_memes: list[str] = []
         dropped_internal = False
         missed_meme = False
+        missing_meme_stems: list[str] = []
 
         for item in decision.all_items():
             if item.type == SendItemType.SEARCH_MEME:
@@ -255,10 +339,21 @@ class CompanionGraph:
                 path = self.meme_renderer.render_meme(file_stem)
                 if not path:
                     missed_meme = True
+                    if file_stem not in missing_meme_stems:
+                        missing_meme_stems.append(file_stem)
                     continue
                 selected_memes.append(file_stem)
 
             validated_items.append(item)
+
+        if missing_meme_stems and not ctx.missing_meme_repair_used:
+            ctx.missing_meme_repair_used = True
+            repaired = await self._repair_missing_meme_decision(state, decision, missing_meme_stems)
+            if repaired:
+                if repaired.search_meme_items():
+                    searched_state = await self._search_meme({**state, "decision": repaired})
+                    return await self._validate_decision({**state, "decision": searched_state["decision"]})
+                return await self._validate_decision({**state, "decision": repaired})
 
         if selected_memes:
             self._last_render_status = "hit"
@@ -281,6 +376,35 @@ class CompanionGraph:
 
         ctx.decision = decision
         return {**state, "decision": decision}
+
+    async def _repair_missing_meme_decision(
+        self,
+        state: GraphState,
+        decision: ActionDecision,
+        missing_meme_stems: list[str],
+    ) -> Optional[ActionDecision]:
+        errors = [f"meme:{stem} 在本地表情库中不存在。" for stem in missing_meme_stems]
+        messages = build_repair_messages(
+            base_messages=state["messages"],
+            errors=errors,
+            original_raw=self._last_llm_raw_output or "",
+            original_decision=decision,
+        )
+        try:
+            raw_output = await self.llm.chat_completion(
+                messages=messages,
+                temperature=0.2,
+                max_tokens=512,
+            )
+            result = parse_and_validate_raw_decision(raw_output)
+            if result.ok and result.decision:
+                self._last_parse_status = "repair_ok"
+                return result.decision
+            self._last_parse_status = "repair_failed"
+            return None
+        except Exception:
+            self._last_parse_status = "repair_failed"
+            return None
 
     def commit_turn(self, ctx: ProcessContext, decision: ActionDecision, visible: bool):
         if visible:
@@ -310,189 +434,10 @@ class CompanionGraph:
             return item.content[6:]
         return f"[表情: {item.content}]"
 
-    def _parse_decision(self, raw_output: str) -> tuple[ActionDecision, str]:
-        text = raw_output.strip() if raw_output else ""
-        if not text:
-            self._last_parsed_action = Action.WAIT.value
-            self._last_parsed_text = None
-            self._last_parsed_items = None
-            return ActionDecision(action=Action.WAIT, text=None), "fallback"
-
-        text_clean = self._strip_json_fence(text)
-        json_decisions = self._parse_json_decisions(text_clean)
-        if json_decisions:
-            parsed = self._merge_json_decisions(json_decisions) if len(json_decisions) > 1 else json_decisions[0]
-            self._record_parsed_decision(parsed)
-            return parsed, "repaired_multi_json" if len(json_decisions) > 1 else "ok"
-
-        json_match = re.search(r"\{.*\}", text, re.DOTALL)
-        if json_match:
-            try:
-                data = json.loads(json_match.group())
-                action_str = str(data.get("action", "REPLY")).strip().upper()
-                if action_str in [a.value for a in Action]:
-                    parsed = self._build_decision(action_str, data.get("text"), data.get("items"))
-                    self._record_parsed_decision(parsed)
-                    return parsed, "ok"
-            except Exception:
-                pass
-
-        try:
-            data = json.loads(text_clean)
-            action_str = str(data.get("action", "REPLY")).strip().upper()
-            if action_str in [a.value for a in Action]:
-                parsed = self._build_decision(action_str, data.get("text"), data.get("items"))
-                self._record_parsed_decision(parsed)
-                return parsed, "ok"
-        except Exception:
-            pass
-
-        bracket_match = re.match(r"\[(WAIT|REPLY|LIGHT_ACK|REACT|ENTER_CHAT|END_CHAT)\]\s*(.*)", text, re.IGNORECASE)
-        if bracket_match:
-            try:
-                action_str = bracket_match.group(1).upper()
-                action_text = bracket_match.group(2).strip() or None
-                parsed = self._build_decision(action_str, action_text)
-                self._record_parsed_decision(parsed)
-                return parsed, "ok"
-            except Exception:
-                pass
-
-        upper_text = text.upper()
-        if '"ACTION":"WAIT"' in upper_text or "'ACTION':'WAIT'" in upper_text:
-            self._last_parsed_action = Action.WAIT.value
-            self._last_parsed_text = None
-            self._last_parsed_items = None
-            return ActionDecision(action=Action.WAIT, text=None), "ok"
-
-        if '"ACTION":"REACT"' in upper_text or "'ACTION':'REACT'" in upper_text:
-            text_match = re.search(r'"text"[:\s]*"([^"]*)"', text, re.IGNORECASE)
-            if text_match:
-                try:
-                    parsed = self._build_decision(Action.REACT.value, text_match.group(1))
-                    self._record_parsed_decision(parsed)
-                    return parsed, "ok"
-                except Exception:
-                    self._last_parsed_action = Action.WAIT.value
-                    self._last_parsed_text = None
-                    self._last_parsed_items = None
-                    return ActionDecision(action=Action.WAIT, text=None), "fallback"
-
-        if "REACT" in upper_text:
-            self._last_parsed_action = Action.WAIT.value
-            self._last_parsed_text = None
-            self._last_parsed_items = None
-            return ActionDecision(action=Action.WAIT, text=None), "fallback"
-
-        parsed = ActionDecision(action=Action.REPLY, text=text)
-        self._record_parsed_decision(parsed)
-        return parsed, "fallback"
-
-    def _strip_json_fence(self, text: str) -> str:
-        text_clean = re.sub(r"^```json\s*", "", text.strip(), flags=re.IGNORECASE)
-        text_clean = re.sub(r"^```\s*", "", text_clean)
-        return re.sub(r"\s*```$", "", text_clean).strip()
-
-    def _parse_json_decisions(self, text: str) -> list[ActionDecision]:
-        """Parse one or more top-level JSON decisions from model output."""
-        decoder = json.JSONDecoder()
-        decisions: list[ActionDecision] = []
-        idx = 0
-        action_values = {a.value for a in Action}
-
-        while idx < len(text):
-            match = re.search(r"\{", text[idx:])
-            if not match:
-                break
-
-            start = idx + match.start()
-            try:
-                data, end = decoder.raw_decode(text, start)
-            except json.JSONDecodeError:
-                idx = start + 1
-                continue
-
-            idx = end
-            if not isinstance(data, dict):
-                continue
-
-            action_str = str(data.get("action", "REPLY")).strip().upper()
-            if action_str not in action_values:
-                continue
-
-            try:
-                decisions.append(self._build_decision(action_str, data.get("text"), data.get("items")))
-            except Exception:
-                continue
-
-        return decisions
-
-    def _merge_json_decisions(self, decisions: list[ActionDecision]) -> ActionDecision:
-        """Repair accidental multi-action output into one action+items decision."""
-        merged_items: list[SendItem] = []
-        item_actions: list[Action] = []
-        for decision in decisions:
-            items = decision.all_items()
-            if not items:
-                continue
-            merged_items.extend(items)
-            item_actions.append(decision.action)
-
-        if not merged_items:
-            return decisions[-1]
-
-        if Action.ENTER_CHAT in item_actions:
-            action = Action.ENTER_CHAT
-        elif any(item.type != SendItemType.TEXT for item in merged_items):
-            action = Action.REACT
-        elif item_actions and all(item_action == Action.LIGHT_ACK for item_action in item_actions):
-            action = Action.LIGHT_ACK
-        elif Action.REPLY in item_actions:
-            action = Action.REPLY
-        else:
-            action = Action.REPLY
-
-        return ActionDecision(action=action, items=merged_items)
-
     def _record_parsed_decision(self, parsed: ActionDecision):
         self._last_parsed_action = parsed.action.value
         self._last_parsed_text = parsed.text
         self._last_parsed_items = [item.model_dump(mode="json") for item in parsed.all_items()]
-
-    def _build_decision(self, action_str: str, text_value, items_value=None) -> ActionDecision:
-        if action_str in (Action.WAIT.value, Action.END_CHAT.value):
-            text_value = None
-            items_value = None
-        if action_str == Action.REACT.value and isinstance(text_value, list):
-            text_value = [self._normalize_react_text(item) for item in text_value]
-        if action_str == Action.REACT.value and isinstance(text_value, str):
-            text_value = self._normalize_react_text(text_value)
-
-        return ActionDecision(action=action_str, text=text_value, items=items_value)
-
-    def _normalize_react_text(self, action_text: str) -> str:
-        valid_categories = {
-            "amused", "distress", "observing", "disdain", "overload",
-            "surprised", "resting", "smiling", "helpless", "confused",
-            "affection", "praise", "intimidating", "bashful", "angry",
-            "energetic", "interaction", "miscellaneous",
-        }
-        lower_text = action_text.lower().strip()
-        if lower_text.startswith(("search_meme:", "meme:", "emoji:")):
-            return action_text
-        parts = lower_text.split(maxsplit=1)
-        if parts and parts[0] in valid_categories:
-            keywords = parts[1] if len(parts) > 1 else ""
-            return f"search_meme:{parts[0]}:{keywords}"
-        if self._looks_like_emoji(action_text):
-            return f"emoji:{action_text.strip()}"
-        return action_text
-
-    def _looks_like_emoji(self, text: str) -> bool:
-        stripped = (text or "").strip()
-        if not stripped or len(stripped) > 8:
-            return False
-        return any(ord(ch) >= 0x2600 for ch in stripped)
 
     def _apply_protocol_guards(self, ctx: ProcessContext, decision: ActionDecision) -> ActionDecision:
         pending_text = "\n".join(

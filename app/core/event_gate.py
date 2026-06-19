@@ -471,3 +471,4 @@ class ProcessContext:
         self.selected_meme: Optional[str] = None
         self.selected_memes: list[str] = []
         self.meme_search_used: bool = False
+        self.missing_meme_repair_used: bool = False
