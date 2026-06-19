@@ -5,7 +5,7 @@ from typing import Optional, TypedDict
 from langgraph.graph import END, StateGraph
 
 from .event_gate import ProcessContext
-from .decisions import ActionDecision, Action
+from .decisions import ActionDecision, Action, SendItem, SendItemType
 from ..llm.client import LLMClient
 from ..llm.prompts import build_system_prompt, build_messages, build_meme_search_messages
 from ..memory.files import MemoryFileManager
@@ -37,7 +37,8 @@ class CompanionGraph:
         # Debug / observability fields for the MVP status bar
         self._last_llm_raw_output: Optional[str] = None
         self._last_parsed_action: Optional[str] = None
-        self._last_parsed_text: Optional[str] = None
+        self._last_parsed_text: Optional[str | list[str]] = None
+        self._last_parsed_items: Optional[list[dict]] = None
         self._last_parse_status: str = "ok"
         self._last_search_meme: Optional[str] = None
         self._last_render_status: Optional[str] = None
@@ -119,113 +120,202 @@ class CompanionGraph:
         self._last_llm_raw_output = raw_output
         decision, parse_status = self._parse_decision(raw_output)
         self._last_parse_status = parse_status
+        decision = self._apply_protocol_guards(state["ctx"], decision)
         self._last_parsed_action = decision.action.value
         self._last_parsed_text = decision.text
-        decision = self._apply_protocol_guards(state["ctx"], decision)
+        self._last_parsed_items = [item.model_dump(mode="json") for item in decision.all_items()]
         state["ctx"].decision = decision
         return {**state, "decision": decision}
 
     def _route_after_first_decision(self, state: GraphState) -> str:
         decision = state.get("decision")
-        if (
-            decision
-            and decision.action == Action.REACT
-            and decision.text
-            and decision.text.startswith("search_meme:")
-        ):
+        if decision and decision.search_meme_items():
             return "search_meme"
         return "validate_decision"
 
     async def _search_meme(self, state: GraphState) -> GraphState:
         ctx = state["ctx"]
         decision = state["decision"]
+        search_items = decision.search_meme_items()
 
-        self._last_search_meme = decision.text
+        self._last_search_meme = "\n".join(item.content for item in search_items) or None
         self._last_render_status = None
 
         if ctx.meme_search_used:
             self._last_render_status = "fallback"
-            return {**state, "decision": ActionDecision(action=Action.LIGHT_ACK, text="嗯")}
+            return {**state, "decision": self._drop_search_items_or_fallback(decision)}
 
         ctx.meme_search_used = True
-        parsed = self.meme_renderer.parse_react_text(decision.text or "")
-        category = parsed.get("category", "")
-        keywords = parsed.get("keywords", "")
+        search_results = []
+        candidate_union: set[str] = set()
 
-        candidates = self.meme_search.search(category, keywords, top_k=5)
-        ctx.meme_candidates = candidates
+        for item in search_items:
+            parsed = self.meme_renderer.parse_react_text(item.content)
+            category = parsed.get("category", "")
+            keywords = parsed.get("keywords", "")
+            candidates = self.meme_search.search(category, keywords, top_k=5)
+            search_results.append(
+                {
+                    "request": item.content,
+                    "category": category,
+                    "keywords": keywords,
+                    "candidates": candidates,
+                }
+            )
+            candidate_union.update(candidates)
 
-        if not candidates:
+        ctx.meme_candidates = search_results
+
+        if not candidate_union:
             self._last_render_status = "fallback"
-            return {**state, "decision": ActionDecision(action=Action.LIGHT_ACK, text="嗯")}
+            return {**state, "decision": self._drop_search_items_or_fallback(decision)}
 
         messages = build_meme_search_messages(
             base_messages=state["messages"],
-            requested_text=decision.text or "",
-            category=category,
-            candidates=candidates,
+            search_results=search_results,
+            original_decision=decision.model_dump(mode="json", exclude_none=True),
         )
 
         raw_output = await self.llm.chat_completion(
             messages=messages,
             temperature=0.2,
-            max_tokens=128,
+            max_tokens=512,
         )
         second_decision, _ = self._parse_decision(raw_output)
 
-        if (
-            second_decision.action == Action.REACT
-            and second_decision.text
-            and second_decision.text.startswith("meme:")
-        ):
-            selected_stem = second_decision.text[5:]
-            if selected_stem in candidates:
-                ctx.selected_meme = selected_stem
-                return {**state, "decision": second_decision}
+        if self._meme_selection_is_valid(second_decision, candidate_union):
+            selected = self._selected_meme_stems(second_decision)
+            ctx.selected_memes = selected
+            ctx.selected_meme = selected[0] if selected else None
+            return {**state, "decision": second_decision}
 
-        first = candidates[0]
-        ctx.selected_meme = first
-        return {**state, "decision": ActionDecision(action=Action.REACT, text=f"meme:{first}")}
+        fallback_decision = self._replace_search_items_with_first_candidates(decision, search_results)
+        selected = self._selected_meme_stems(fallback_decision)
+        ctx.selected_memes = selected
+        ctx.selected_meme = selected[0] if selected else None
+        return {**state, "decision": fallback_decision}
+
+    def _meme_selection_is_valid(self, decision: ActionDecision, candidate_union: set[str]) -> bool:
+        if decision.search_meme_items():
+            return False
+
+        for item in decision.all_items():
+            if item.type == SendItemType.MEME:
+                stem = item.content[5:]
+                if stem not in candidate_union:
+                    return False
+        return bool(decision.send_items())
+
+    def _selected_meme_stems(self, decision: ActionDecision) -> list[str]:
+        return [item.content[5:] for item in decision.all_items() if item.type == SendItemType.MEME]
+
+    def _replace_search_items_with_first_candidates(
+        self,
+        decision: ActionDecision,
+        search_results: list[dict],
+    ) -> ActionDecision:
+        results_by_request = {item.get("request"): item.get("candidates") or [] for item in search_results}
+        replaced_items: list[SendItem] = []
+
+        for item in decision.all_items():
+            if item.type != SendItemType.SEARCH_MEME:
+                replaced_items.append(item)
+                continue
+
+            candidates = results_by_request.get(item.content) or []
+            if candidates:
+                replaced_items.append(SendItem(type=SendItemType.MEME, content=f"meme:{candidates[0]}"))
+
+        if replaced_items:
+            return decision.with_items(replaced_items)
+        return ActionDecision(action=Action.LIGHT_ACK, items=[SendItem(type=SendItemType.TEXT, content="嗯")])
+
+    def _drop_search_items_or_fallback(self, decision: ActionDecision) -> ActionDecision:
+        kept_items = [item for item in decision.all_items() if item.type != SendItemType.SEARCH_MEME]
+        if kept_items:
+            return decision.with_items(kept_items)
+        return ActionDecision(action=Action.LIGHT_ACK, items=[SendItem(type=SendItemType.TEXT, content="嗯")])
 
     async def _validate_decision(self, state: GraphState) -> GraphState:
         decision = state["decision"]
         ctx = state["ctx"]
 
-        if decision.action == Action.REACT and decision.text and decision.text.startswith("meme:"):
-            file_stem = decision.text[5:]
-            path = self.meme_renderer.render_meme(file_stem)
-            if not path:
-                self._last_render_status = "miss"
-                decision = ActionDecision(action=Action.LIGHT_ACK, text="嗯")
-                ctx.selected_meme = None
-            else:
-                self._last_render_status = "hit"
-                ctx.selected_meme = file_stem
+        validated_items: list[SendItem] = []
+        selected_memes: list[str] = []
+        dropped_internal = False
+        missed_meme = False
 
-        if decision.action == Action.REACT and decision.text and decision.text.startswith("search_meme:"):
+        for item in decision.all_items():
+            if item.type == SendItemType.SEARCH_MEME:
+                dropped_internal = True
+                continue
+
+            if item.type == SendItemType.MEME:
+                file_stem = item.content[5:]
+                path = self.meme_renderer.render_meme(file_stem)
+                if not path:
+                    missed_meme = True
+                    continue
+                selected_memes.append(file_stem)
+
+            validated_items.append(item)
+
+        if selected_memes:
+            self._last_render_status = "hit"
+            ctx.selected_memes = selected_memes
+            ctx.selected_meme = selected_memes[0]
+        elif missed_meme:
+            self._last_render_status = "miss"
+            ctx.selected_memes = []
+            ctx.selected_meme = None
+        elif dropped_internal:
             self._last_render_status = "fallback"
-            decision = ActionDecision(action=Action.LIGHT_ACK, text="嗯")
+
+        if validated_items != decision.all_items():
+            if validated_items:
+                decision = decision.with_items(validated_items)
+            elif decision.action in (Action.WAIT, Action.END_CHAT, Action.ENTER_CHAT):
+                decision = ActionDecision(action=decision.action, items=None)
+            else:
+                decision = ActionDecision(action=Action.LIGHT_ACK, items=[SendItem(type=SendItemType.TEXT, content="嗯")])
 
         ctx.decision = decision
         return {**state, "decision": decision}
 
     def commit_turn(self, ctx: ProcessContext, decision: ActionDecision, visible: bool):
         if visible:
-            for evt in ctx.snapshot.events:
-                text = evt.get("text")
-                if text:
-                    self._conversation_history.append({"role": "user", "text": text})
+            self.commit_sent_items(ctx, decision.send_items())
 
-            if decision.text:
-                self._conversation_history.append({"role": "assistant", "text": decision.text})
+    def commit_sent_bubbles(self, ctx: ProcessContext, bubbles: list[str]):
+        self.commit_sent_items(ctx, [SendItem(type=SendItemType.TEXT, content=bubble) for bubble in bubbles])
 
-            self._conversation_history = self._conversation_history[-60:]
+    def commit_sent_items(self, ctx: ProcessContext, items: list[SendItem]):
+        if not items:
+            return
+
+        for evt in ctx.snapshot.events:
+            text = evt.get("text")
+            if text:
+                self._conversation_history.append({"role": "user", "text": text})
+
+        for item in items:
+            self._conversation_history.append({"role": "assistant", "text": self._history_text_for_item(item)})
+
+        self._conversation_history = self._conversation_history[-60:]
+
+    def _history_text_for_item(self, item: SendItem) -> str:
+        if item.type == SendItemType.TEXT:
+            return item.content
+        if item.type == SendItemType.EMOJI:
+            return item.content[6:]
+        return f"[表情: {item.content}]"
 
     def _parse_decision(self, raw_output: str) -> tuple[ActionDecision, str]:
         text = raw_output.strip() if raw_output else ""
         if not text:
             self._last_parsed_action = Action.WAIT.value
             self._last_parsed_text = None
+            self._last_parsed_items = None
             return ActionDecision(action=Action.WAIT, text=None), "fallback"
 
         json_match = re.search(r"\{.*\}", text, re.DOTALL)
@@ -234,9 +324,10 @@ class CompanionGraph:
                 data = json.loads(json_match.group())
                 action_str = str(data.get("action", "REPLY")).strip().upper()
                 if action_str in [a.value for a in Action]:
-                    parsed = self._build_decision(action_str, data.get("text"))
+                    parsed = self._build_decision(action_str, data.get("text"), data.get("items"))
                     self._last_parsed_action = parsed.action.value
                     self._last_parsed_text = parsed.text
+                    self._last_parsed_items = [item.model_dump(mode="json") for item in parsed.all_items()]
                     return parsed, "ok"
             except Exception:
                 pass
@@ -247,9 +338,10 @@ class CompanionGraph:
             data = json.loads(text_clean)
             action_str = str(data.get("action", "REPLY")).strip().upper()
             if action_str in [a.value for a in Action]:
-                parsed = self._build_decision(action_str, data.get("text"))
+                parsed = self._build_decision(action_str, data.get("text"), data.get("items"))
                 self._last_parsed_action = parsed.action.value
                 self._last_parsed_text = parsed.text
+                self._last_parsed_items = [item.model_dump(mode="json") for item in parsed.all_items()]
                 return parsed, "ok"
         except Exception:
             pass
@@ -262,6 +354,7 @@ class CompanionGraph:
                 parsed = self._build_decision(action_str, action_text)
                 self._last_parsed_action = parsed.action.value
                 self._last_parsed_text = parsed.text
+                self._last_parsed_items = [item.model_dump(mode="json") for item in parsed.all_items()]
                 return parsed, "ok"
             except Exception:
                 pass
@@ -270,6 +363,7 @@ class CompanionGraph:
         if '"ACTION":"WAIT"' in upper_text or "'ACTION':'WAIT'" in upper_text:
             self._last_parsed_action = Action.WAIT.value
             self._last_parsed_text = None
+            self._last_parsed_items = None
             return ActionDecision(action=Action.WAIT, text=None), "ok"
 
         if '"ACTION":"REACT"' in upper_text or "'ACTION':'REACT'" in upper_text:
@@ -279,28 +373,35 @@ class CompanionGraph:
                     parsed = self._build_decision(Action.REACT.value, text_match.group(1))
                     self._last_parsed_action = parsed.action.value
                     self._last_parsed_text = parsed.text
+                    self._last_parsed_items = [item.model_dump(mode="json") for item in parsed.all_items()]
                     return parsed, "ok"
                 except Exception:
                     self._last_parsed_action = Action.WAIT.value
                     self._last_parsed_text = None
+                    self._last_parsed_items = None
                     return ActionDecision(action=Action.WAIT, text=None), "fallback"
 
         if "REACT" in upper_text:
             self._last_parsed_action = Action.WAIT.value
             self._last_parsed_text = None
+            self._last_parsed_items = None
             return ActionDecision(action=Action.WAIT, text=None), "fallback"
 
         parsed = ActionDecision(action=Action.REPLY, text=text)
         self._last_parsed_action = parsed.action.value
         self._last_parsed_text = parsed.text
+        self._last_parsed_items = [item.model_dump(mode="json") for item in parsed.all_items()]
         return parsed, "fallback"
 
-    def _build_decision(self, action_str: str, text_value) -> ActionDecision:
+    def _build_decision(self, action_str: str, text_value, items_value=None) -> ActionDecision:
         if action_str in (Action.WAIT.value, Action.END_CHAT.value):
             text_value = None
+            items_value = None
+        if action_str == Action.REACT.value and isinstance(text_value, list):
+            text_value = [self._normalize_react_text(item) for item in text_value]
         if action_str == Action.REACT.value and isinstance(text_value, str):
             text_value = self._normalize_react_text(text_value)
-        return ActionDecision(action=action_str, text=text_value)
+        return ActionDecision(action=action_str, text=text_value, items=items_value)
 
     def _normalize_react_text(self, action_text: str) -> str:
         valid_categories = {
@@ -333,12 +434,15 @@ class CompanionGraph:
             if evt.get("text")
         )
         if self._requires_meme_response(pending_text):
-            if not (
-                decision.action == Action.REACT
-                and decision.text
-                and decision.text.startswith(("search_meme:", "meme:", "emoji:"))
-            ):
-                return ActionDecision(action=Action.REACT, text="search_meme:amused:funny")
+            has_react_item = any(
+                item.type in (SendItemType.SEARCH_MEME, SendItemType.MEME, SendItemType.EMOJI)
+                for item in decision.all_items()
+            )
+            if not has_react_item:
+                return ActionDecision(
+                    action=Action.REACT,
+                    items=[SendItem(type=SendItemType.SEARCH_MEME, content="search_meme:amused:funny")],
+                )
         return decision
 
     def _requires_meme_response(self, text: str) -> bool:
@@ -361,6 +465,7 @@ class CompanionGraph:
         return {
             "action": self._last_parsed_action,
             "text": self._last_parsed_text,
+            "items": self._last_parsed_items,
             "parse_status": self._last_parse_status,
         }
 
@@ -375,6 +480,7 @@ class CompanionGraph:
             "last_llm_raw": self._last_llm_raw_output,
             "last_parsed_action": self._last_parsed_action,
             "last_parsed_text": self._last_parsed_text,
+            "last_parsed_items": self._last_parsed_items,
             "parse_status": self._last_parse_status,
             "last_search_meme": self._last_search_meme,
             "last_render_status": self._last_render_status,

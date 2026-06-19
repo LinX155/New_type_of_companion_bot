@@ -25,8 +25,10 @@ class EventGate:
         self._pending_job_id: Optional[str] = None
         self._stale_job_ids: set = set()
         self._sent_job_ids: set = set()
+        self._sent_send_keys: set = set()
         self._last_decision: Optional[ActionDecision] = None
         self._last_snapshot_result: Optional[str] = None
+        self._last_send_meta: Optional[dict] = None
         self._last_command: Optional[str] = None
         self._last_command_result: Optional[str] = None
         self._last_process_context: Optional[ProcessContext] = None
@@ -227,11 +229,19 @@ class EventGate:
         self.state.buffer_version = current_version
         return current_version == ctx.snapshot.buffer_version
 
-    async def clear_buffer_after_visible_send(self, expected_version: int) -> bool:
+    async def clear_buffer_after_visible_send(self, expected_version: int) -> tuple[bool, int]:
         """有效可见回复发送后，清空已回应的 pending buffer。"""
         cleared, new_version = await self.buffer.clear_if_version(expected_version)
         self.state.buffer_version = new_version
-        return cleared
+        return cleared, new_version
+
+    async def is_send_group_current(self, ctx: "ProcessContext", expected_buffer_version: int) -> bool:
+        """检查同一轮多气泡发送期间是否仍然拥有发送权。"""
+        if self.is_job_stale(ctx.job_id) or self.is_job_sent(ctx.job_id):
+            return False
+        _, current_version = await self.buffer.get_snapshot()
+        self.state.buffer_version = current_version
+        return current_version == expected_buffer_version
 
     async def dispatch_latest_after_stale(self, stale_job_id: str):
         """旧 job 作废后，如仍有未回应输入，用最新 buffer 重新启动一轮。"""
@@ -282,6 +292,27 @@ class EventGate:
 
     def is_job_sent(self, job_id: str) -> bool:
         return job_id in self._sent_job_ids
+
+    def build_send_key(self, ctx: "ProcessContext", send_index: int) -> str:
+        return f"{ctx.job_id}:{ctx.snapshot.snapshot_id}:{send_index}"
+
+    def is_send_key_sent(self, send_key: str) -> bool:
+        return send_key in self._sent_send_keys
+
+    def mark_send_key_sent(self, send_key: str):
+        self._sent_send_keys.add(send_key)
+
+    def record_send_meta(self, ctx: "ProcessContext", send_index: int, send_count: int, item_type: Optional[str] = None):
+        self._last_send_meta = {
+            "job_id": ctx.job_id,
+            "snapshot_id": ctx.snapshot.snapshot_id,
+            "send_index": send_index,
+            "send_count": send_count,
+            "item_type": item_type,
+        }
+
+    def get_last_send_meta(self) -> Optional[dict]:
+        return self._last_send_meta
 
     def update_hot_duration(self, minutes: int):
         """更新热聊持续时间"""
@@ -360,4 +391,5 @@ class ProcessContext:
         self.decision: Optional[ActionDecision] = None
         self.meme_candidates: list = []
         self.selected_meme: Optional[str] = None
+        self.selected_memes: list[str] = []
         self.meme_search_used: bool = False

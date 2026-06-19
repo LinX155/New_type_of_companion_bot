@@ -19,7 +19,7 @@ from ..active.messages import (
 )
 from ..core.event_gate import EventGate, ProcessContext
 from ..core.events import ChatEvent, EventType
-from ..core.decisions import Action
+from ..core.decisions import Action, SendItem, SendItemType
 from ..core.graph import CompanionGraph
 from ..core.state import ChatStatus
 from ..core.settings import load_settings, save_settings
@@ -170,14 +170,17 @@ async def on_decision(ctx: ProcessContext):
     from ..core.router import ActionRouter
     router_inst = ActionRouter()
     result = router_inst.route(decision)
+    items = list(result.get("items") or [])
 
-    if result["visible"]:
-        cleared = await event_gate.clear_buffer_after_visible_send(ctx.snapshot.buffer_version)
+    if result["visible"] and items:
+        cleared, send_group_version = await event_gate.clear_buffer_after_visible_send(ctx.snapshot.buffer_version)
         if not cleared:
             event_gate.mark_job_stale_dropped(ctx.job_id)
             await event_gate.dispatch_latest_after_stale(ctx.job_id)
             await _emit_state({"job_id": ctx.job_id, "result": "stale_dropped"})
             return
+    else:
+        send_group_version = ctx.snapshot.buffer_version
 
     if decision.action == Action.ENTER_CHAT:
         await event_gate._enter_hot()
@@ -186,64 +189,85 @@ async def on_decision(ctx: ProcessContext):
     elif result["visible"] and ctx.snapshot.status == ChatStatus.COLD:
         await event_gate._enter_hot()
 
-    # 记录到数据库
-    db = next(get_db())
-    try:
-        log = RawChatLog(
-            event_id=f"evt_{uuid.uuid4().hex[:8]}",
-            session_id="default",
-            event_type="llm_decision",
-            llm_raw_output=json.dumps({"action": decision.action.value, "text": decision.text}),
-            action=decision.action.value,
-            final_text=decision.text,
-            snapshot_id=ctx.snapshot.snapshot_id,
-            buffer_version=ctx.snapshot.buffer_version,
-            job_id=ctx.job_id,
-            status="sent" if result["visible"] else "dropped",
-        )
-        db.add(log)
-
-        if result["visible"] and result["text"]:
-            event_type = "assistant_react" if decision.action == Action.REACT else "assistant_text"
-            conv = ConversationEvent(
-                session_id="default",
-                event_type=event_type,
-                text=result["text"],
-                is_visible=True,
-                action=decision.action.value,
-            )
-            db.add(conv)
-
-        db.commit()
-    except Exception as e:
-        print(f"DB error: {e}")
-    finally:
-        db.close()
-
-    if result["visible"]:
-        companion_graph.commit_turn(ctx, decision, visible=True)
-        event_gate.mark_job_sent(ctx.job_id)
-    else:
+    if not result["visible"] or not items:
+        _record_decision_drop(ctx, decision)
         event_gate.mark_job_dropped(ctx.job_id)
-
-    # 触发回调
-    if result["visible"]:
-        await _emit_message({
-                "type": "assistant_message",
-                "action": decision.action.value,
-                "text": result["text"],
-                "visible": result["visible"],
-                "is_meme": result.get("is_meme", False),
-                "meme_path": ctx.selected_meme,
-                "snapshot_id": ctx.snapshot.snapshot_id,
-        })
-    else:
         await _emit_state({
             "job_id": ctx.job_id,
             "snapshot_id": ctx.snapshot.snapshot_id,
             "action": decision.action.value,
             "result": "dropped",
         })
+        return
+
+    sent_items: list[SendItem] = []
+    send_count = len(items)
+    for send_index, item in enumerate(items):
+        if not await event_gate.is_send_group_current(ctx, send_group_version):
+            if sent_items:
+                companion_graph.commit_sent_items(ctx, sent_items)
+            event_gate.mark_job_stale_dropped(ctx.job_id)
+            await event_gate.dispatch_latest_after_stale(ctx.job_id)
+            await _emit_state({
+                "job_id": ctx.job_id,
+                "snapshot_id": ctx.snapshot.snapshot_id,
+                "send_index": send_index,
+                "send_count": send_count,
+                "result": "stale_dropped",
+            })
+            return
+
+        send_key = event_gate.build_send_key(ctx, send_index)
+        if event_gate.is_send_key_sent(send_key):
+            continue
+
+        content = item.content
+        item_type = item.type.value
+        per_send_result = {**result, "text": content, "texts": [content], "item": item}
+        event_gate.record_send_meta(ctx, send_index, send_count, item_type)
+        if not await event_gate.is_send_group_current(ctx, send_group_version):
+            if sent_items:
+                companion_graph.commit_sent_items(ctx, sent_items)
+            event_gate.mark_job_stale_dropped(ctx.job_id)
+            await event_gate.dispatch_latest_after_stale(ctx.job_id)
+            await _emit_state({
+                "job_id": ctx.job_id,
+                "snapshot_id": ctx.snapshot.snapshot_id,
+                "send_index": send_index,
+                "send_count": send_count,
+                "result": "stale_dropped",
+            })
+            return
+
+        await _emit_message({
+            "type": "assistant_message",
+            "action": decision.action.value,
+            "text": content,
+            "content": content,
+            "item_type": item_type,
+            "visible": True,
+            "is_meme": item.type in (SendItemType.MEME, SendItemType.EMOJI),
+            "meme_path": content[5:] if item.type == SendItemType.MEME else None,
+            "job_id": ctx.job_id,
+            "snapshot_id": ctx.snapshot.snapshot_id,
+            "send_index": send_index,
+            "send_count": send_count,
+            "send_key": send_key,
+        })
+        event_gate.mark_send_key_sent(send_key)
+        _record_assistant_send(
+            ctx=ctx,
+            decision=decision,
+            item=item,
+            routed=per_send_result,
+            send_index=send_index,
+            send_count=send_count,
+            send_key=send_key,
+        )
+        sent_items.append(item)
+
+    companion_graph.commit_sent_items(ctx, sent_items)
+    event_gate.mark_job_sent(ctx.job_id)
 
 
 async def _emit_message(data: dict):
@@ -441,6 +465,70 @@ def _record_llm_error(ctx: ProcessContext, error_message: str):
         db.close()
 
 
+def _record_decision_drop(ctx: ProcessContext, decision):
+    db = next(get_db())
+    try:
+        log = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id="default",
+            event_type="llm_decision",
+            llm_raw_output=json.dumps(decision.model_dump(mode="json", exclude_none=True), ensure_ascii=False),
+            action=decision.action.value,
+            final_text=None,
+            snapshot_id=ctx.snapshot.snapshot_id,
+            buffer_version=ctx.snapshot.buffer_version,
+            job_id=ctx.job_id,
+            status="dropped",
+        )
+        db.add(log)
+        db.commit()
+    except Exception as e:
+        print(f"DB error: {e}")
+    finally:
+        db.close()
+
+
+def _record_assistant_send(
+    ctx: ProcessContext,
+    decision,
+    item: SendItem,
+    routed: dict,
+    send_index: int,
+    send_count: int,
+    send_key: str,
+):
+    db = next(get_db())
+    try:
+        log = RawChatLog(
+            event_id=send_key,
+            session_id="default",
+            event_type="llm_decision",
+            llm_raw_output=json.dumps(decision.model_dump(mode="json", exclude_none=True), ensure_ascii=False),
+            action=decision.action.value,
+            final_text=item.content,
+            snapshot_id=ctx.snapshot.snapshot_id,
+            buffer_version=ctx.snapshot.buffer_version,
+            job_id=ctx.job_id,
+            status=f"sent:{send_index + 1}/{send_count}",
+        )
+        db.add(log)
+
+        event_type = "assistant_react" if item.type in (SendItemType.EMOJI, SendItemType.MEME) else "assistant_text"
+        conv = ConversationEvent(
+            session_id="default",
+            event_type=event_type,
+            text=item.content,
+            is_visible=True,
+            action=routed.get("action") or decision.action.value,
+        )
+        db.add(conv)
+        db.commit()
+    except Exception as e:
+        print(f"DB error: {e}")
+    finally:
+        db.close()
+
+
 async def run_active_message_once(manual: bool = False) -> dict:
     """执行一次主动消息检查。
 
@@ -511,6 +599,8 @@ async def run_active_message_once(manual: bool = False) -> dict:
             await event_gate.finish_active_message_job(job_id, "dropped")
             await _emit_state({"job_id": job_id, "result": "active_dropped"})
             return {"status": "skipped", "reason": "not_visible"}
+        active_items = list(routed.get("items") or [])
+        active_item = active_items[0] if active_items else None
 
         if not memory_manager.write_tomorrow_topics(
             mark_candidate_status(memory_manager.read_tomorrow_topics(), candidate, "used")
@@ -530,9 +620,11 @@ async def run_active_message_once(manual: bool = False) -> dict:
             "type": "assistant_message",
             "action": decision.action.value,
             "text": routed["text"],
+            "content": routed["text"],
+            "item_type": active_item.type.value if active_item else "text",
             "visible": True,
             "is_meme": routed.get("is_meme", False),
-            "meme_path": None,
+            "meme_path": active_item.content[5:] if active_item and active_item.type == SendItemType.MEME else None,
             "source": "active_message",
         })
         return {
@@ -553,7 +645,7 @@ def _record_active_message(job_id: str, raw_output: str, decision, routed: dict)
             event_id=f"evt_{uuid.uuid4().hex[:8]}",
             session_id="default",
             event_type="active_message",
-            llm_raw_output=raw_output,
+            llm_raw_output=json.dumps(decision.model_dump(mode="json", exclude_none=True), ensure_ascii=False),
             action=decision.action.value,
             final_text=routed.get("text"),
             job_id=job_id,
@@ -561,7 +653,12 @@ def _record_active_message(job_id: str, raw_output: str, decision, routed: dict)
         )
         db.add(raw)
 
-        event_type = "assistant_react" if decision.action == Action.REACT else "assistant_text"
+        first_item = (routed.get("items") or [None])[0]
+        event_type = (
+            "assistant_react"
+            if first_item and first_item.type in (SendItemType.EMOJI, SendItemType.MEME)
+            else "assistant_text"
+        )
         conv = ConversationEvent(
             session_id="default",
             event_type=event_type,
@@ -867,6 +964,7 @@ async def get_status():
         "last_llm_raw": companion_graph.get_last_llm_raw_output() if companion_graph else None,
         "parse_status": parsed.get("parse_status"),
         "decision_result": last_result,
+        "last_send": event_gate.get_last_send_meta(),
     }
 
     # 事件门实时状态
@@ -883,7 +981,7 @@ async def get_status():
         meme_panel = {
             "search_meme": companion_graph.get_last_meme_search(),
             "candidates": last_ctx.meme_candidates,
-            "selected_meme": last_ctx.selected_meme,
+            "selected_meme": ", ".join(last_ctx.selected_memes) if last_ctx.selected_memes else last_ctx.selected_meme,
             "render_status": companion_graph.get_last_render_status(),
             "last_command": event_gate.get_last_command(),
             "command_result": event_gate.get_last_command_result(),
@@ -949,6 +1047,8 @@ async def clear_conversation():
         event_gate._pending_job_id = None
         event_gate._stale_job_ids.clear()
         event_gate._sent_job_ids.clear()
+        event_gate._sent_send_keys.clear()
+        event_gate._last_send_meta = None
     if companion_graph:
         companion_graph._conversation_history.clear()
 

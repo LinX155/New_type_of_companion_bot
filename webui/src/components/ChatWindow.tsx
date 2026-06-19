@@ -5,10 +5,16 @@ interface Message {
   id: string;
   role: 'user' | 'assistant';
   text: string;
+  itemType?: 'text' | 'emoji' | 'meme' | 'search_meme';
   action?: string;
   visible?: boolean;
   isMeme?: boolean;
   memePath?: string;
+  jobId?: string;
+  snapshotId?: number;
+  sendIndex?: number;
+  sendCount?: number;
+  sendKey?: string;
   timestamp: string;
 }
 
@@ -31,6 +37,13 @@ interface StatusInfo extends DebugStatus {
 }
 
 const API_BASE = '';
+
+const inferItemType = (text?: string, eventType?: string): Message['itemType'] => {
+  if (text?.startsWith('meme:')) return 'meme';
+  if (text?.startsWith('emoji:')) return 'emoji';
+  if (eventType === 'assistant_react') return 'emoji';
+  return 'text';
+};
 
 const ChatWindow: React.FC = () => {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -58,8 +71,9 @@ const ChatWindow: React.FC = () => {
           id: `hist_${idx}`,
           role: e.event_type?.startsWith('user') ? 'user' : 'assistant',
           text: e.text || '',
+          itemType: inferItemType(e.text, e.event_type),
           action: e.action,
-          isMeme: e.event_type === 'assistant_react' || e.text?.startsWith('meme:'),
+          isMeme: e.event_type === 'assistant_react' || e.text?.startsWith('meme:') || e.text?.startsWith('emoji:'),
           timestamp: e.created_at,
         }));
         setMessages(loaded);
@@ -75,14 +89,22 @@ const ChatWindow: React.FC = () => {
       try {
         const data = JSON.parse(event.data);
         if (data.type === 'assistant_message') {
+          const content = data.content ?? data.text ?? '';
+          const itemType = data.item_type ?? inferItemType(content);
           setMessages(prev => [...prev, {
-            id: `msg_${Date.now()}`,
+            id: data.send_key || `msg_${Date.now()}_${prev.length}`,
             role: 'assistant',
-            text: data.text || '',
+            text: content,
+            itemType,
             action: data.action,
             visible: data.visible,
-            isMeme: data.is_meme,
+            isMeme: data.is_meme || itemType === 'meme' || itemType === 'emoji',
             memePath: data.meme_path,
+            jobId: data.job_id,
+            snapshotId: data.snapshot_id,
+            sendIndex: data.send_index,
+            sendCount: data.send_count,
+            sendKey: data.send_key,
             timestamp: new Date().toISOString(),
           }]);
           setIsLoading(false);
@@ -184,7 +206,7 @@ const ChatWindow: React.FC = () => {
               fontSize: '14px',
               lineHeight: 1.5,
             }}>
-              {msg.isMeme && msg.text?.startsWith('meme:') ? (
+              {msg.itemType === 'meme' && msg.text?.startsWith('meme:') ? (
                 <div>
                   <img
                     src={`${API_BASE}/api/memes/render?stem=${encodeURIComponent(msg.text.slice(5))}`}
@@ -200,14 +222,34 @@ const ChatWindow: React.FC = () => {
                     {msg.text}
                   </span>
                 </div>
-              ) : msg.isMeme && msg.text?.startsWith('emoji:') ? (
-                <div style={{ fontSize: '24px', lineHeight: 1.2 }}>{msg.text.slice(6)}</div>
+              ) : msg.itemType === 'emoji' ? (
+                <div style={{ fontSize: '24px', lineHeight: 1.2 }}>
+                  {msg.text?.startsWith('emoji:') ? msg.text.slice(6) : msg.text}
+                </div>
               ) : (
                 <div>{msg.text}</div>
               )}
               {msg.action && (
                 <div style={{ fontSize: '11px', opacity: 0.6, marginTop: '4px' }}>
                   action: {msg.action}
+                  {msg.sendIndex !== undefined && msg.sendCount !== undefined && (
+                    <>
+                      {' · '}
+                      #{msg.sendIndex + 1}/{msg.sendCount}
+                    </>
+                  )}
+                  {msg.snapshotId !== undefined && (
+                    <>
+                      {' · '}
+                      snapshot: {msg.snapshotId}
+                    </>
+                  )}
+                  {msg.jobId && (
+                    <>
+                      {' · '}
+                      job: {msg.jobId.slice(-14)}
+                    </>
+                  )}
                 </div>
               )}
             </div>

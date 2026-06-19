@@ -23,6 +23,13 @@ interface LlmPanel {
   last_llm_raw?: string;
   parse_status?: string;
   decision_result?: string;
+  last_send?: {
+    job_id: string;
+    snapshot_id: number;
+    send_index: number;
+    send_count: number;
+    item_type?: string;
+  } | null;
 }
 
 interface GatePanel {
@@ -34,7 +41,7 @@ interface GatePanel {
 
 interface MemePanel {
   search_meme?: string;
-  candidates?: string[];
+  candidates?: any[];
   selected_meme?: string;
   render_status?: string;
   last_command?: string;
@@ -185,6 +192,14 @@ const DebugStatusBar: React.FC<Props> = ({ status }) => {
                   label="决策结果"
                   value={<span style={badgeStyle(statusColor(llm?.decision_result === 'sent' ? 'HOT' : llm?.decision_result === 'dropped' ? 'COLD' : undefined))}>{llm?.decision_result ?? '-'}</span>}
                 />
+                {llm?.last_send && (
+                  <>
+                    <Field label="响应任务ID" value={llm.last_send.job_id.slice(-14)} />
+                    <Field label="响应快照ID" value={llm.last_send.snapshot_id} />
+                    <Field label="气泡序号" value={`${llm.last_send.send_index + 1}/${llm.last_send.send_count}`} />
+                    <Field label="消息类型" value={llm.last_send.item_type} />
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -217,7 +232,12 @@ const DebugStatusBar: React.FC<Props> = ({ status }) => {
           <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
             {meme.search_meme && <Field label="表情检索" value={meme.search_meme} />}
             {meme.candidates && meme.candidates.length > 0 && (
-              <Field label="候选表情" value={meme.candidates.slice(0, 5).join(', ')} />
+              <Field
+                label="候选表情"
+                value={meme.candidates.slice(0, 5).map(item => (
+                  typeof item === 'string' ? item : `${item.category || '-'}: ${(item.candidates || []).slice(0, 3).join(', ')}`
+                )).join(' / ')}
+              />
             )}
             {meme.selected_meme && <Field label="选中表情" value={meme.selected_meme} />}
             {meme.render_status && (

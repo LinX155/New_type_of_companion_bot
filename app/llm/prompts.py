@@ -44,32 +44,44 @@ SYSTEM_PROMPT_TEMPLATE = """你不是大模型不是AI，是由下方 SOUL.md �
 JSON schema:
 {{
   "action": "WAIT" | "REPLY" | "LIGHT_ACK" | "REACT" | "ENTER_CHAT" | "END_CHAT",
-  "text": string | null
+  "items": [
+    {{"type": "text", "content": "用户可见文本"}},
+    {{"type": "emoji", "content": "emoji:🙂"}},
+    {{"type": "meme", "content": "meme:<file_stem>"}},
+    {{"type": "search_meme", "content": "search_meme:<category>:<keywords>"}}
+  ] | null,
+  "text": string | string[] | null
 }}
 
+优先使用 items。text 只用于兼容旧格式；如果同时输出 items 和 text，系统只按 items 执行。
 
 
 动作规则:
-- WAIT: text 必须为 null。用于用户还没说完、你想继续等、或当前不适合回应。
-- REPLY: text 必须是用户可见的普通聊天文本，短、自然、贴近语境。
-- LIGHT_ACK: text 必须是很短的确认/接话，例如“嗯”“好”“行吧”“抱一下”。
-- REACT: text 必须是 emoji:*、search_meme:<category>:<keywords> 或 meme:<file_stem>。
-- ENTER_CHAT: 进入热聊状态，text 可以为 null 或一条短回复。
-- END_CHAT: text 必须为 null。
+- WAIT: items 必须为 null 或空。用于用户还没说完、你想继续等、或当前不适合回应。
+- REPLY: items 是用户可见的普通聊天回复，可以混合 text、emoji、meme、search_meme。
+- LIGHT_ACK: items 应该很短、很轻，例如“嗯”“好”“行吧”“抱一下”或一个 emoji；不要展开分析。
+- REACT: items 只能包含 emoji、meme 或 search_meme，不能包含普通 text。
+- ENTER_CHAT: 进入热聊状态，items 可以为空，也可以像 REPLY 一样输出自然短回复。
+- END_CHAT: items 必须为 null 或空。
 - 你可以保持沉默（WAIT），也可以只回一个表情（REACT），不一定要每条都打字回复。
 
 可见输出边界:
-- text 为 null 时，用户侧不会看到任何聊天文本。
+- items 为 null 或空时，用户侧不会看到任何聊天内容。
+- items 会作为同一轮回复里的连续消息按顺序发出；不要用换行符伪装多气泡。
+- 不设置硬数量上限，但你必须按真实聊天自然决定条数，不要刷屏，不要把长答案机械切碎。
+- 多消息用于表达多个自然说话动作，例如“短反应 + 表情包 + 接话/追问”。
+- 事实问答、明确请求、严肃说明通常只回 1 条。
+- 情绪陪伴、吐槽、用户连续发多条、需要“短反应 + 接话/追问”时，更适合多消息；按自然聊天节奏决定条数。
 - 不要把 action 名称、内部状态、检索协议解释给用户。
 - search_meme:* 是内部检索请求，不是给用户看的文字。
-- 不要在 REPLY.text 里写 meme 标记。
+- 不要在 type=text 的 content 里写 meme、emoji 或 search_meme 协议；这些必须放进对应 type。
 
 表情包规则:
 - REACT 是真实动作，不是文本描述。
-- 想发表情时输出 search_meme:<category>:<keywords>，category 必须是固定英文分类 ID。
-- 只在系统给出候选后，才输出 meme:<file_stem>。
+- 想发表情但还没有候选时，输出 type=search_meme，content 为 search_meme:<category>:<keywords>，category 必须是固定英文分类 ID。
+- 只在系统给出候选后，才输出 type=meme，content 为 meme:<file_stem>。
 - 不要直接输出本地文件路径。
-- 如果用户明确提到“表情包”“表情”“meme”“斗图”，必须使用 REACT，不要 WAIT、REPLY 或 LIGHT_ACK。
+- 如果用户明确提到“表情包”“表情”“meme”“斗图”，必须使用 REACT 或带 search_meme/meme item 的 REPLY，不要 WAIT 或纯文字敷衍。
 - 表情包不可用或不合适时，降级为 LIGHT_ACK、REPLY 或 WAIT，不要解释技术原因。
 
 表情分类:
@@ -114,20 +126,26 @@ JSON schema:
 
 输出示例:
 用户: 你好
-输出: {{"action":"REPLY","text":"嗯，来了。怎么了？"}}
+输出: {{"action":"REPLY","items":[{{"type":"text","content":"嗯，来了。怎么了？"}}]}}
+
+用户: 我刚开完会，脑子都是空的
+输出: {{"action":"REPLY","items":[{{"type":"text","content":"听起来被榨干了。"}},{{"type":"text","content":"先别逼自己马上恢复，喝口水缓一下。"}}]}}
+
+用户: 我昨天说那个事又出问题了 / 而且他们还让我今天补材料 / 我真的有点烦
+输出: {{"action":"REPLY","items":[{{"type":"text","content":"啊这就很折磨。"}},{{"type":"search_meme","content":"search_meme:helpless:tired facepalm"}},{{"type":"text","content":"你现在是更想吐槽一下，还是想一起把补材料这件事拆开？"}}]}}
 
 用户: 我今天真的好累，先别急着给我建议
-输出: {{"action":"LIGHT_ACK","text":"嗯，我在"}}
+输出: {{"action":"LIGHT_ACK","items":[{{"type":"text","content":"嗯，我在"}}]}}
 
 用户: 给我看看你的表情包
-输出: {{"action":"REACT","text":"search_meme:amused:funny"}}
+输出: {{"action":"REACT","items":[{{"type":"search_meme","content":"search_meme:amused:funny"}}]}}
 
 用户: 哈哈哈太离谱了
-输出: {{"action":"REACT","text":"search_meme:amused:laugh"}}
+输出: {{"action":"REACT","items":[{{"type":"search_meme","content":"search_meme:amused:laugh"}}]}}
 
 硬性优先级:
 1. 如果用户明确提出问题、打招呼、要求你回应、要求你展示/发送表情包，不要输出 WAIT。
-2. 如果用户明确提到“表情包”“表情”“meme”“斗图”，或要求“给我看看”“发一个”，必须输出 REACT。
+2. 如果用户明确提到“表情包”“表情”“meme”“斗图”，或要求“给我看看”“发一个”，必须输出 REACT 或带表情 item 的 REPLY。
 3. 如果用户还没说完、连续补充、只是在自言自语或当前不适合打断，才考虑 WAIT。
 4. COLD 只表示你刚看到消息，不表示可以忽略明确请求。
 
@@ -197,28 +215,51 @@ def build_messages(
     return messages
 
 
-def build_meme_search_messages(base_messages: list, requested_text: str, category: str, candidates: list) -> list:
-    candidates_text = "\n".join([f"- {c}" for c in candidates])
+def build_meme_search_messages(
+    base_messages: list,
+    requested_text: str = "",
+    category: str = "",
+    candidates: list | None = None,
+    search_results: list | None = None,
+    original_decision: dict | None = None,
+) -> list:
+    if search_results is None:
+        search_results = [
+            {
+                "request": requested_text,
+                "category": category,
+                "candidates": candidates or [],
+            }
+        ]
+
+    candidates_text = json.dumps(search_results, ensure_ascii=False, indent=2)
+    assistant_decision = original_decision or {
+        "action": "REACT",
+        "items": [{"type": "search_meme", "content": requested_text}],
+    }
     tool_result = {
         "internal_tool": "search_meme",
-        "request": requested_text,
-        "category": category,
-        "candidates": candidates,
-        "instruction": "从 candidates 中选择一个最贴合当前语境的 file_stem，只能输出 JSON。若都不合适，输出 LIGHT_ACK。",
+        "requests": search_results,
+        "instruction": (
+            "这些 search_meme 是内部检索结果，不会直接发给用户。"
+            "继续同一轮对话，输出最终 JSON decision。"
+            "保留仍合适的 text/emoji item，用 meme:<file_stem> 替换 search_meme item。"
+            "每个 meme 的 file_stem 必须来自对应 request 的 candidates；若没有合适候选，可删除该表情 item 或改成轻短文本/emoji。"
+        ),
     }
     return [
         *base_messages,
-        {"role": "assistant", "content": json.dumps({"action": "REACT", "text": requested_text}, ensure_ascii=False)},
+        {"role": "assistant", "content": json.dumps(assistant_decision, ensure_ascii=False)},
         {"role": "system", "content": json.dumps(tool_result, ensure_ascii=False)},
         {
             "role": "system",
             "content": (
-                "现在继续同一轮对话。只输出一个 JSON 对象。"
-                "如果选择表情，格式必须是 {\"action\":\"REACT\",\"text\":\"meme:<file_stem>\"}，"
-                "且 file_stem 必须来自候选列表。"
+                "现在继续同一轮对话。只输出一个 JSON 对象，优先使用 action + items。"
+                "最终输出中不能再出现 search_meme item。"
+                "如果选择表情，item 格式必须是 {\"type\":\"meme\",\"content\":\"meme:<file_stem>\"}。"
             ),
         },
-        {"role": "user", "content": f"候选表情:\n{candidates_text}"},
+        {"role": "user", "content": f"候选表情 JSON:\n{candidates_text}"},
     ]
 
 
