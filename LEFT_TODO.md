@@ -32,5 +32,8 @@
 - [√] 主动消息模块未实现：缺少 WebUI 主动消息设定/查看入口、主动消息调度、每日上限、免打扰、未回复退避、候选 `used/expired/blocked` 状态更新，以及发送前经 EventGate 做撞车和幂等检查。
 - [√] 主回复上下文没有读取 `TOMORROW_TOPICS.md`。
 - [√] 系统提示词缺少“记忆使用方式”边界：自然聊天中不应显式说“根据我的记忆/来源”，记忆应该改变行为而不是审计式展示。
-- [ ] `conversation_events` / `raw_chat_log` 记录不完整：`nudge` 事件未入库；LLM 原始输出、解析状态、`search_meme` 候选/二轮选择、stale/drop 细节未完整持久化；当前 LLM 决策 raw log 存的是解析后的 action/text，不是模型原始输出。
-- [ ] Alembic 迁移和 repository/storage 边界未落地：当前通过 `Base.metadata.create_all` 建表，路由层直接操作 DB session，和 MVP 技术栈中的 SQLAlchemy 2.x + Alembic + repository 分层不一致。
+
+## P2 / 轻量优化
+
+- [ ] 凌晨整理线程 prompt 增加“共同梗 / 暗号 / 昵称 / 专属表情含义”的轻提示：不新增独立模块，不新增关系系统；只把长期稳定、自然反复出现或用户通过 `/mem` 明确要求的共同语境，克制写入 `MEMORY_CORE.md` 的“相处习惯”；长期未出现、用户否定或明显过期的内容应删除或降权；主回复使用时避免机械复读和显式炫耀记忆。
+- [ ] 重构 COLD/HOT 进入规则以增加 WAIT 机会：COLD 状态下的普通可见 `REPLY` / `LIGHT_ACK` / `REACT` 先按 one-shot reply 处理，不自动进入 HOT；只有 `ENTER_CHAT`、拍一拍 / 戳一戳、或后续明确形成连续互动时才进入 HOT。同步收窄 prompt 中 `ENTER_CHAT` 的触发条件，补充 COLD 下 `WAIT` 的正向示例，避免模型把“刚看到消息”误判成“必须立刻进入热聊”。该改动涉及状态迁移、prompt 和测试，先作为 P2 重构项保留。
