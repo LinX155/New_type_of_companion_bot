@@ -14,9 +14,12 @@ class MessageBuffer:
         async with self._lock:
             self._events.append({
                 "event_id": event.event_id,
+                "platform": event.platform,
+                "user_id": event.user_id,
                 "event_type": event.event_type.value,
                 "text": event.text,
                 "timestamp": event.timestamp.isoformat(),
+                "raw": event.raw,
             })
             self._version += 1
             return self._version

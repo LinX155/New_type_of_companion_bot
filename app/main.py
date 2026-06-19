@@ -41,11 +41,10 @@ async def websocket_endpoint(websocket: WebSocket):
     connected_websockets.append(websocket)
 
     async def forward_message(data: dict):
-        for ws in connected_websockets:
-            try:
-                await ws.send_json(data)
-            except Exception:
-                pass
+        try:
+            await websocket.send_json(data)
+        except Exception:
+            pass
 
     message_callbacks.append(forward_message)
 

@@ -53,6 +53,7 @@ const ChatWindow: React.FC = () => {
   const [showSystem, setShowSystem] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const inputStatusTimerRef = useRef<number | null>(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -61,6 +62,36 @@ const ChatWindow: React.FC = () => {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  const fetchStatus = useCallback(() => {
+    fetch(`${API_BASE}/api/status`)
+      .then(r => r.json())
+      .then(data => setStatus(data))
+      .catch(() => {});
+  }, []);
+
+  const sendInputStatus = useCallback((composing: boolean, ttlMs = 3000) => {
+    if (inputStatusTimerRef.current !== null) {
+      window.clearTimeout(inputStatusTimerRef.current);
+      inputStatusTimerRef.current = null;
+    }
+
+    const post = () => {
+      fetch(`${API_BASE}/api/input-status`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ composing, ttl_ms: ttlMs }),
+      })
+        .then(() => fetchStatus())
+        .catch(() => {});
+    };
+
+    if (composing) {
+      inputStatusTimerRef.current = window.setTimeout(post, 250);
+    } else {
+      post();
+    }
+  }, [fetchStatus]);
 
   // Load conversation history
   useEffect(() => {
@@ -91,22 +122,27 @@ const ChatWindow: React.FC = () => {
         if (data.type === 'assistant_message') {
           const content = data.content ?? data.text ?? '';
           const itemType = data.item_type ?? inferItemType(content);
-          setMessages(prev => [...prev, {
-            id: data.send_key || `msg_${Date.now()}_${prev.length}`,
-            role: 'assistant',
-            text: content,
-            itemType,
-            action: data.action,
-            visible: data.visible,
-            isMeme: data.is_meme || itemType === 'meme' || itemType === 'emoji',
-            memePath: data.meme_path,
-            jobId: data.job_id,
-            snapshotId: data.snapshot_id,
-            sendIndex: data.send_index,
-            sendCount: data.send_count,
-            sendKey: data.send_key,
-            timestamp: new Date().toISOString(),
-          }]);
+          setMessages(prev => {
+            if (data.send_key && prev.some(msg => msg.sendKey === data.send_key || msg.id === data.send_key)) {
+              return prev;
+            }
+            return [...prev, {
+              id: data.send_key || `msg_${Date.now()}_${prev.length}`,
+              role: 'assistant',
+              text: content,
+              itemType,
+              action: data.action,
+              visible: data.visible,
+              isMeme: data.is_meme || itemType === 'meme' || itemType === 'emoji',
+              memePath: data.meme_path,
+              jobId: data.job_id,
+              snapshotId: data.snapshot_id,
+              sendIndex: data.send_index,
+              sendCount: data.send_count,
+              sendKey: data.send_key,
+              timestamp: new Date().toISOString(),
+            }];
+          });
           setIsLoading(false);
           fetchStatus();
         } else if (data.type === 'assistant_state') {
@@ -128,18 +164,24 @@ const ChatWindow: React.FC = () => {
     return () => ws.close();
   }, []);
 
-  const fetchStatus = useCallback(() => {
-    fetch(`${API_BASE}/api/status`)
-      .then(r => r.json())
-      .then(data => setStatus(data))
-      .catch(() => {});
-  }, []);
-
   useEffect(() => {
     const interval = setInterval(fetchStatus, 3000);
     fetchStatus();
     return () => clearInterval(interval);
   }, [fetchStatus]);
+
+  useEffect(() => {
+    return () => {
+      if (inputStatusTimerRef.current !== null) {
+        window.clearTimeout(inputStatusTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleInputChange = (value: string) => {
+    setInput(value);
+    sendInputStatus(value.trim().length > 0, 3000);
+  };
 
   const sendMessage = async () => {
     if (!input.trim()) return;
@@ -155,6 +197,10 @@ const ChatWindow: React.FC = () => {
     // 不立即显示“对方正在输入”：等到后端确认 LLM 真正启动后才显示
 
     try {
+      if (inputStatusTimerRef.current !== null) {
+        window.clearTimeout(inputStatusTimerRef.current);
+        inputStatusTimerRef.current = null;
+      }
       await fetch(`${API_BASE}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -162,6 +208,8 @@ const ChatWindow: React.FC = () => {
       });
     } catch {
       setIsLoading(false);
+    } finally {
+      sendInputStatus(false);
     }
   };
 
@@ -175,6 +223,7 @@ const ChatWindow: React.FC = () => {
 
   const clearConversation = async () => {
     if (!confirm('确定要清空对话吗？')) return;
+    sendInputStatus(false);
     await fetch(`${API_BASE}/api/conversation/clear`, { method: 'POST' });
     setMessages([]);
     setStatus(null);
@@ -267,7 +316,8 @@ const ChatWindow: React.FC = () => {
           <input
             type="text"
             value={input}
-            onChange={e => setInput(e.target.value)}
+            onChange={e => handleInputChange(e.target.value)}
+            onBlur={() => sendInputStatus(false)}
             onKeyDown={e => e.key === 'Enter' && sendMessage()}
             placeholder="输入消息..."
             style={{
@@ -281,7 +331,7 @@ const ChatWindow: React.FC = () => {
           />
           <button
             onClick={sendMessage}
-            disabled={isLoading}
+            disabled={!input.trim()}
             style={{
               padding: '12px 24px',
               background: '#3498db',

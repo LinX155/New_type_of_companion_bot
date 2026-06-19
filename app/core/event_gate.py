@@ -32,6 +32,8 @@ class EventGate:
         self._last_command: Optional[str] = None
         self._last_command_result: Optional[str] = None
         self._last_process_context: Optional[ProcessContext] = None
+        self._user_composing_until: Optional[datetime] = None
+        self._last_composing_event: Optional[dict] = None
 
     async def handle_event(self, event: ChatEvent) -> dict:
         """处理进入的事件，返回处理结果摘要"""
@@ -40,6 +42,10 @@ class EventGate:
             return {"handled": True, "type": "command_mem", "text": event.text}
         if event.event_type == EventType.COMMAND_FORGET:
             return {"handled": True, "type": "command_forget", "text": event.text}
+
+        # 用户正在输入 / 正在组织下一条消息：只影响发送权，不进入聊天 buffer。
+        if event.event_type == EventType.USER_COMPOSING:
+            return await self._handle_user_composing(event)
 
         # 撤回处理
         if event.event_type == EventType.RECALL:
@@ -61,6 +67,7 @@ class EventGate:
 
     async def _handle_nudge(self, event: ChatEvent) -> dict:
         """拍一拍强制刷新注意力"""
+        self.clear_user_composing()
         self.state.last_user_message_at = datetime.now()
         # 如果当前是 COLD，进入 HOT
         if self.state.status != ChatStatus.HOT:
@@ -91,6 +98,7 @@ class EventGate:
 
     async def _handle_chat_message(self, event: ChatEvent) -> dict:
         """处理普通聊天消息"""
+        self.clear_user_composing()
         await self.maybe_exit_hot()
         previous_user_message_at = self.state.last_user_message_at
         self.state.msg_index_today += 1
@@ -137,6 +145,38 @@ class EventGate:
             "buffer_version": new_version,
             "snapshot_id": snapshot.snapshot_id,
         }
+
+    async def _handle_user_composing(self, event: ChatEvent) -> dict:
+        raw = event.raw or {}
+        composing = self._parse_bool(raw.get("composing", True))
+        ttl_ms = int(raw.get("ttl_ms") or 6000)
+        ttl_ms = max(500, min(ttl_ms, 30000))
+
+        if composing:
+            self._user_composing_until = event.timestamp + timedelta(milliseconds=ttl_ms)
+        else:
+            self._user_composing_until = None
+
+        self._last_composing_event = {
+            "platform": event.platform,
+            "user_id": event.user_id,
+            "composing": composing,
+            "ttl_ms": ttl_ms,
+            "until": self._user_composing_until.isoformat() if self._user_composing_until else None,
+        }
+        return {
+            "handled": True,
+            "type": "user_composing",
+            "composing": self.is_user_composing(),
+            "until": self._user_composing_until.isoformat() if self._user_composing_until else None,
+        }
+
+    def _parse_bool(self, value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() not in ("0", "false", "no", "off", "")
+        return bool(value)
 
     async def _dispatch_llm(self, snapshot: ConversationSnapshot):
         """调度 LLM 处理 snapshot"""
@@ -243,6 +283,24 @@ class EventGate:
         self.state.buffer_version = current_version
         return current_version == expected_buffer_version
 
+    def is_user_composing(self) -> bool:
+        if not self._user_composing_until:
+            return False
+        if datetime.now() <= self._user_composing_until:
+            return True
+        self._user_composing_until = None
+        return False
+
+    def clear_user_composing(self):
+        self._user_composing_until = None
+
+    def get_user_composing_meta(self) -> dict:
+        return {
+            "active": self.is_user_composing(),
+            "until": self._user_composing_until.isoformat() if self._user_composing_until else None,
+            "last_event": self._last_composing_event,
+        }
+
     async def dispatch_latest_after_stale(self, stale_job_id: str):
         """旧 job 作废后，如仍有未回应输入，用最新 buffer 重新启动一轮。"""
         async with self._pending_job_lock:
@@ -281,6 +339,10 @@ class EventGate:
         """标记 job 因 stale 被丢弃"""
         self._stale_job_ids.add(job_id)
         self._last_snapshot_result = "stale_dropped"
+
+    def mark_job_deferred(self, job_id: str, reason: str = "deferred_user_composing"):
+        """标记 job 已生成但因发送门禁暂缓。"""
+        self._last_snapshot_result = reason
 
     def _mark_current_job_stale(self):
         """标记当前 pending job 为 stale"""

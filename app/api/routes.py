@@ -1,4 +1,5 @@
 import os
+import asyncio
 import json
 import re
 import uuid
@@ -29,14 +30,16 @@ from ..memory.files import MemoryFileManager
 from ..memes.catalog import MemeCatalog
 from ..scheduler.jobs import SchedulerManager
 from ..storage.db import get_db, engine
-from ..storage.models import Base, RawChatLog, ConversationEvent
+from ..storage.models import Base, RawChatLog, ConversationEvent, ensure_storage_schema
 
 Base.metadata.create_all(bind=engine)
+ensure_storage_schema(engine)
 
 router = APIRouter()
 
 # 全局实例（MVP 阶段简化）
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DEFAULT_SESSION_ID = "default"
 
 # 启动时加载持久化的用户配置（API key 等）
 _persisted = load_settings()
@@ -135,6 +138,44 @@ class ActiveMessageConfig(BaseModel):
     quiet_end_hour: int = 9
 
 
+class InputStatusConfig(BaseModel):
+    composing: bool = True
+    ttl_ms: int = 3000
+
+def init_gate():
+    global event_gate, companion_graph
+    if event_gate is None:
+        event_gate = EventGate(
+            on_decision=on_decision,
+            hot_duration_minutes=_persisted.get("hot_duration_minutes", 30),
+        )
+        companion_graph = CompanionGraph(
+            llm_client=llm_client,
+            memory_manager=memory_manager,
+            meme_catalog=meme_catalog,
+        )
+        # 启动时把持久化的调度时间应用到调度器
+        for job_id in ("memory_analysis_day", "memory_analysis_night", "midnight_cleanup"):
+            cfg = _persisted.get(job_id)
+            if isinstance(cfg, dict):
+                scheduler_manager.update_schedule(job_id, cfg.get("hour"), cfg.get("minute"))
+        active_cfg = _normalize_active_message_config(_persisted.get("active_message"))
+        scheduler_manager.update_schedule("active_message", active_cfg["hour"], active_cfg["minute"])
+        scheduler_manager.set_active_message_callback(run_active_message_once)
+        scheduler_manager.start()
+
+
+def _json_dumps(value) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return str(value)
+
+
+def _event_payload(event: ChatEvent) -> dict:
+    return event.model_dump(mode="json")
+
+
 async def on_decision(ctx: ProcessContext):
     """LLM 决策回调"""
     global companion_graph, event_gate
@@ -142,7 +183,8 @@ async def on_decision(ctx: ProcessContext):
     if event_gate.is_job_stale(ctx.job_id):
         event_gate.mark_job_stale_dropped(ctx.job_id)
         await event_gate.dispatch_latest_after_stale(ctx.job_id)
-        await _emit_state({"job_id": ctx.job_id, "result": "stale_dropped"})
+        _record_job_state(ctx, "stale_dropped", {"reason": "job_already_stale"})
+        await _emit_state({"session_id": ctx.snapshot.session_id, "job_id": ctx.job_id, "result": "stale_dropped"})
         return
 
     try:
@@ -161,7 +203,8 @@ async def on_decision(ctx: ProcessContext):
     if not await event_gate.is_snapshot_current(ctx):
         event_gate.mark_job_stale_dropped(ctx.job_id)
         await event_gate.dispatch_latest_after_stale(ctx.job_id)
-        await _emit_state({"job_id": ctx.job_id, "result": "stale_dropped"})
+        _record_job_state(ctx, "stale_dropped", {"reason": "snapshot_not_current"})
+        await _emit_state({"session_id": ctx.snapshot.session_id, "job_id": ctx.job_id, "result": "stale_dropped"})
         return
 
     event_gate.record_decision(decision)
@@ -173,11 +216,14 @@ async def on_decision(ctx: ProcessContext):
     items = list(result.get("items") or [])
 
     if result["visible"] and items:
+        if not await _wait_until_user_not_composing(ctx):
+            return
         cleared, send_group_version = await event_gate.clear_buffer_after_visible_send(ctx.snapshot.buffer_version)
         if not cleared:
             event_gate.mark_job_stale_dropped(ctx.job_id)
             await event_gate.dispatch_latest_after_stale(ctx.job_id)
-            await _emit_state({"job_id": ctx.job_id, "result": "stale_dropped"})
+            _record_job_state(ctx, "stale_dropped", {"reason": "buffer_version_changed_before_send"})
+            await _emit_state({"session_id": ctx.snapshot.session_id, "job_id": ctx.job_id, "result": "stale_dropped"})
             return
     else:
         send_group_version = ctx.snapshot.buffer_version
@@ -193,6 +239,7 @@ async def on_decision(ctx: ProcessContext):
         _record_decision_drop(ctx, decision)
         event_gate.mark_job_dropped(ctx.job_id)
         await _emit_state({
+            "session_id": ctx.snapshot.session_id,
             "job_id": ctx.job_id,
             "snapshot_id": ctx.snapshot.snapshot_id,
             "action": decision.action.value,
@@ -208,7 +255,13 @@ async def on_decision(ctx: ProcessContext):
                 companion_graph.commit_sent_items(ctx, sent_items)
             event_gate.mark_job_stale_dropped(ctx.job_id)
             await event_gate.dispatch_latest_after_stale(ctx.job_id)
+            _record_job_state(ctx, "stale_dropped", {
+                "reason": "send_group_changed",
+                "send_index": send_index,
+                "send_count": send_count,
+            })
             await _emit_state({
+                "session_id": ctx.snapshot.session_id,
                 "job_id": ctx.job_id,
                 "snapshot_id": ctx.snapshot.snapshot_id,
                 "send_index": send_index,
@@ -230,7 +283,13 @@ async def on_decision(ctx: ProcessContext):
                 companion_graph.commit_sent_items(ctx, sent_items)
             event_gate.mark_job_stale_dropped(ctx.job_id)
             await event_gate.dispatch_latest_after_stale(ctx.job_id)
+            _record_job_state(ctx, "stale_dropped", {
+                "reason": "send_group_changed_after_meta",
+                "send_index": send_index,
+                "send_count": send_count,
+            })
             await _emit_state({
+                "session_id": ctx.snapshot.session_id,
                 "job_id": ctx.job_id,
                 "snapshot_id": ctx.snapshot.snapshot_id,
                 "send_index": send_index,
@@ -241,6 +300,7 @@ async def on_decision(ctx: ProcessContext):
 
         await _emit_message({
             "type": "assistant_message",
+            "session_id": ctx.snapshot.session_id,
             "action": decision.action.value,
             "text": content,
             "content": content,
@@ -287,28 +347,55 @@ async def _emit_llm_started():
     await _emit_state({"result": "llm_started"})
 
 
-def init_gate():
-    global event_gate, companion_graph
-    if event_gate is None:
-        event_gate = EventGate(
-            on_decision=on_decision,
-            hot_duration_minutes=_persisted.get("hot_duration_minutes", 30),
-        )
-        companion_graph = CompanionGraph(
-            llm_client=llm_client,
-            memory_manager=memory_manager,
-            meme_catalog=meme_catalog,
-        )
-        # 启动时把持久化的调度时间应用到调度器
-        for job_id in ("memory_analysis_day", "memory_analysis_night", "midnight_cleanup"):
-            cfg = _persisted.get(job_id)
-            if isinstance(cfg, dict):
-                scheduler_manager.update_schedule(job_id, cfg.get("hour"), cfg.get("minute"))
-        active_cfg = _normalize_active_message_config(_persisted.get("active_message"))
-        scheduler_manager.update_schedule("active_message", active_cfg["hour"], active_cfg["minute"])
-        scheduler_manager.set_active_message_callback(run_active_message_once)
-        scheduler_manager.start()
+async def _wait_until_user_not_composing(ctx: ProcessContext) -> bool:
+    gate = ctx.gate
+    if not gate.is_user_composing():
+        return True
 
+    gate.mark_job_deferred(ctx.job_id)
+    composing_meta = gate.get_user_composing_meta()
+    await _emit_state({
+        "session_id": ctx.snapshot.session_id,
+        "job_id": ctx.job_id,
+        "snapshot_id": ctx.snapshot.snapshot_id,
+        "result": "deferred_user_composing",
+        "composing": composing_meta,
+    })
+
+    while gate.is_user_composing():
+        if gate.is_job_stale(ctx.job_id):
+            gate.mark_job_stale_dropped(ctx.job_id)
+            await gate.dispatch_latest_after_stale(ctx.job_id)
+            _record_job_state(ctx, "stale_dropped", {"reason": "user_message_while_composing"})
+            await _emit_state({
+                "session_id": ctx.snapshot.session_id,
+                "job_id": ctx.job_id,
+                "snapshot_id": ctx.snapshot.snapshot_id,
+                "result": "stale_dropped",
+                "reason": "user_message_while_composing",
+            })
+            return False
+        await asyncio.sleep(0.2)
+
+    if gate.is_job_stale(ctx.job_id) or not await gate.is_snapshot_current(ctx):
+        gate.mark_job_stale_dropped(ctx.job_id)
+        await gate.dispatch_latest_after_stale(ctx.job_id)
+        _record_job_state(ctx, "stale_dropped", {"reason": "stale_after_user_composing"})
+        await _emit_state({
+            "session_id": ctx.snapshot.session_id,
+            "job_id": ctx.job_id,
+            "snapshot_id": ctx.snapshot.snapshot_id,
+            "result": "stale_dropped",
+        })
+        return False
+
+    await _emit_state({
+        "session_id": ctx.snapshot.session_id,
+        "job_id": ctx.job_id,
+        "snapshot_id": ctx.snapshot.snapshot_id,
+        "result": "resumed_after_user_composing",
+    })
+    return True
 
 @router.post("/api/config")
 async def update_config(config: ApiConfig):
@@ -348,34 +435,10 @@ async def send_message(msg: ChatMessage):
         event_type=event_type,
         text=text,
         timestamp=datetime.now(),
+        raw={"source": "webui"},
     )
 
-    # 记录用户消息
-    db = next(get_db())
-    try:
-        conv = ConversationEvent(
-            session_id="default",
-            event_type="user_command" if event_type in (EventType.COMMAND_MEM, EventType.COMMAND_FORGET) else "user_text",
-            text=text,
-            is_visible=True,
-            action=event_type.value if event_type in (EventType.COMMAND_MEM, EventType.COMMAND_FORGET) else None,
-        )
-        db.add(conv)
-        raw = RawChatLog(
-            event_id=event.event_id,
-            session_id="default",
-            event_type=event_type.value,
-            platform=event.platform,
-            user_id=event.user_id,
-            input_text=text,
-            status="received",
-        )
-        db.add(raw)
-        db.commit()
-    except Exception as e:
-        print(f"DB error: {e}")
-    finally:
-        db.close()
+    _record_incoming_event(event)
 
     result = await event_gate.handle_event(event)
 
@@ -383,11 +446,14 @@ async def send_message(msg: ChatMessage):
         await _emit_llm_started()
         success, response_text = await memory_manager.apply_mem_via_llm(text, llm_client)
         event_gate.record_command("/mem", "success" if success else "error")
-        await _record_command_response("command.mem", response_text, success)
+        await _record_command_response(DEFAULT_SESSION_ID, "command.mem", response_text, success)
         await _emit_message({
             "type": "assistant_message",
+            "session_id": DEFAULT_SESSION_ID,
             "action": "COMMAND_MEM",
             "text": response_text,
+            "content": response_text,
+            "item_type": "text",
             "visible": True,
             "is_meme": False,
             "meme_path": None,
@@ -398,17 +464,42 @@ async def send_message(msg: ChatMessage):
         await _emit_llm_started()
         success, response_text = await memory_manager.apply_forget_via_llm(text, llm_client)
         event_gate.record_command("/forget", "success" if success else "error")
-        await _record_command_response("command.forget", response_text, success)
+        await _record_command_response(DEFAULT_SESSION_ID, "command.forget", response_text, success)
         await _emit_message({
             "type": "assistant_message",
+            "session_id": DEFAULT_SESSION_ID,
             "action": "COMMAND_FORGET",
             "text": response_text,
+            "content": response_text,
+            "item_type": "text",
             "visible": True,
             "is_meme": False,
             "meme_path": None,
         })
         return {**result, "memory_updated": success, "response": response_text}
 
+    return result
+
+
+@router.post("/api/input-status")
+async def update_input_status(config: InputStatusConfig):
+    init_gate()
+    event = ChatEvent(
+        event_id=f"evt_{uuid.uuid4().hex[:8]}",
+        event_type=EventType.USER_COMPOSING,
+        timestamp=datetime.now(),
+        raw={
+            "composing": config.composing,
+            "ttl_ms": config.ttl_ms,
+            "source": "webui",
+        },
+    )
+    result = await event_gate.handle_event(event)
+    await _emit_state({
+        "session_id": DEFAULT_SESSION_ID,
+        "result": "user_composing",
+        "composing": event_gate.get_user_composing_meta(),
+    })
     return result
 
 
@@ -421,11 +512,55 @@ def _event_type_for_text(text: str) -> EventType:
     return EventType.TEXT
 
 
-async def _record_command_response(action: str, response_text: str, success: bool):
+def _record_incoming_event(event: ChatEvent):
+    db = next(get_db())
+    try:
+        session_id = DEFAULT_SESSION_ID
+        event_type = (
+            "user_command"
+            if event.event_type in (EventType.COMMAND_MEM, EventType.COMMAND_FORGET)
+            else "user_text"
+        )
+        if event.event_type == EventType.NUDGE:
+            event_type = "nudge"
+        elif event.event_type == EventType.RECALL:
+            event_type = "recall"
+        elif event.event_type == EventType.IMAGE:
+            event_type = "user_image"
+        elif event.event_type == EventType.STICKER:
+            event_type = "user_sticker"
+
+        conv = ConversationEvent(
+            session_id=session_id,
+            event_type=event_type,
+            text=event.text,
+            is_visible=event.event_type not in (EventType.USER_COMPOSING,),
+            action=event.event_type.value if event.event_type != EventType.TEXT else None,
+        )
+        db.add(conv)
+        raw = RawChatLog(
+            event_id=event.event_id,
+            session_id=session_id,
+            event_type=event.event_type.value,
+            platform=event.platform,
+            user_id=event.user_id,
+            input_text=event.text,
+            raw_payload=_json_dumps(_event_payload(event)),
+            status="received",
+        )
+        db.add(raw)
+        db.commit()
+    except Exception as e:
+        print(f"DB error: {e}")
+    finally:
+        db.close()
+
+
+async def _record_command_response(session_id: str, action: str, response_text: str, success: bool):
     db = next(get_db())
     try:
         conv = ConversationEvent(
-            session_id="default",
+            session_id=session_id,
             event_type="assistant_system",
             text=response_text,
             is_visible=True,
@@ -434,10 +569,11 @@ async def _record_command_response(action: str, response_text: str, success: boo
         db.add(conv)
         raw = RawChatLog(
             event_id=f"evt_{uuid.uuid4().hex[:8]}",
-            session_id="default",
+            session_id=session_id,
             event_type=action,
             action=action,
             final_text=response_text,
+            item_type="text",
             status="sent" if success else "error",
         )
         db.add(raw)
@@ -451,7 +587,7 @@ def _record_llm_error(ctx: ProcessContext, error_message: str):
     try:
         log = RawChatLog(
             event_id=f"evt_{uuid.uuid4().hex[:8]}",
-            session_id="default",
+            session_id=ctx.snapshot.session_id,
             event_type="llm_decision",
             snapshot_id=ctx.snapshot.snapshot_id,
             buffer_version=ctx.snapshot.buffer_version,
@@ -470,15 +606,37 @@ def _record_decision_drop(ctx: ProcessContext, decision):
     try:
         log = RawChatLog(
             event_id=f"evt_{uuid.uuid4().hex[:8]}",
-            session_id="default",
+            session_id=ctx.snapshot.session_id,
             event_type="llm_decision",
-            llm_raw_output=json.dumps(decision.model_dump(mode="json", exclude_none=True), ensure_ascii=False),
+            llm_raw_output=companion_graph.get_last_llm_raw_output() if companion_graph else None,
+            parsed_payload=_json_dumps(decision.model_dump(mode="json", exclude_none=True)),
             action=decision.action.value,
             final_text=None,
             snapshot_id=ctx.snapshot.snapshot_id,
             buffer_version=ctx.snapshot.buffer_version,
             job_id=ctx.job_id,
             status="dropped",
+        )
+        db.add(log)
+        db.commit()
+    except Exception as e:
+        print(f"DB error: {e}")
+    finally:
+        db.close()
+
+
+def _record_job_state(ctx: ProcessContext, status: str, payload: Optional[dict] = None):
+    db = next(get_db())
+    try:
+        log = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id=ctx.snapshot.session_id,
+            event_type="job_state",
+            raw_payload=_json_dumps(payload or {}),
+            snapshot_id=ctx.snapshot.snapshot_id,
+            buffer_version=ctx.snapshot.buffer_version,
+            job_id=ctx.job_id,
+            status=status,
         )
         db.add(log)
         db.commit()
@@ -501,11 +659,16 @@ def _record_assistant_send(
     try:
         log = RawChatLog(
             event_id=send_key,
-            session_id="default",
+            session_id=ctx.snapshot.session_id,
             event_type="llm_decision",
-            llm_raw_output=json.dumps(decision.model_dump(mode="json", exclude_none=True), ensure_ascii=False),
+            llm_raw_output=companion_graph.get_last_llm_raw_output() if companion_graph else None,
+            parsed_payload=_json_dumps(decision.model_dump(mode="json", exclude_none=True)),
             action=decision.action.value,
             final_text=item.content,
+            item_type=item.type.value,
+            send_index=send_index,
+            send_count=send_count,
+            send_key=send_key,
             snapshot_id=ctx.snapshot.snapshot_id,
             buffer_version=ctx.snapshot.buffer_version,
             job_id=ctx.job_id,
@@ -515,7 +678,7 @@ def _record_assistant_send(
 
         event_type = "assistant_react" if item.type in (SendItemType.EMOJI, SendItemType.MEME) else "assistant_text"
         conv = ConversationEvent(
-            session_id="default",
+            session_id=ctx.snapshot.session_id,
             event_type=event_type,
             text=item.content,
             is_visible=True,
@@ -534,6 +697,8 @@ async def run_active_message_once(manual: bool = False) -> dict:
 
     MVP 只做一次轻量开场：有 pending 候选、处于 COLD、无未处理输入、未超每日上限时才发送。
     """
+    global event_gate, companion_graph
+    session_id = DEFAULT_SESSION_ID
     init_gate()
     config = _normalize_active_message_config(load_settings().get("active_message"))
     now = datetime.now()
@@ -542,9 +707,9 @@ async def run_active_message_once(manual: bool = False) -> dict:
         return {"status": "skipped", "reason": "disabled"}
     if not manual and _is_quiet_time(now, config):
         return {"status": "skipped", "reason": "quiet_hours"}
-    if _active_messages_sent_today() >= config["daily_limit"]:
+    if _active_messages_sent_today(session_id) >= config["daily_limit"]:
         return {"status": "skipped", "reason": "daily_limit"}
-    if _has_unanswered_active_message():
+    if _has_unanswered_active_message(session_id):
         return {"status": "skipped", "reason": "unanswered_backoff"}
 
     job_id = await event_gate.reserve_active_message_job()
@@ -590,14 +755,14 @@ async def run_active_message_once(manual: bool = False) -> dict:
                 await event_gate.finish_active_message_job(job_id, "dropped")
                 return {"status": "error", "reason": "failed_to_block_candidate"}
             await event_gate.finish_active_message_job(job_id, "dropped")
-            await _emit_state({"job_id": job_id, "result": "active_wait"})
+            await _emit_state({"session_id": session_id, "job_id": job_id, "result": "active_wait"})
             return {"status": "skipped", "reason": "llm_wait"}
 
         from ..core.router import ActionRouter
         routed = ActionRouter().route(decision)
         if not routed["visible"] or not routed["text"]:
             await event_gate.finish_active_message_job(job_id, "dropped")
-            await _emit_state({"job_id": job_id, "result": "active_dropped"})
+            await _emit_state({"session_id": session_id, "job_id": job_id, "result": "active_dropped"})
             return {"status": "skipped", "reason": "not_visible"}
         active_items = list(routed.get("items") or [])
         active_item = active_items[0] if active_items else None
@@ -608,7 +773,7 @@ async def run_active_message_once(manual: bool = False) -> dict:
             await event_gate.finish_active_message_job(job_id, "dropped")
             return {"status": "error", "reason": "failed_to_mark_used"}
 
-        _record_active_message(job_id, raw_output, decision, routed)
+        _record_active_message(session_id, job_id, raw_output, decision, routed)
         event_gate.record_decision(decision)
         await event_gate.finish_active_message_job(job_id, "sent")
 
@@ -618,6 +783,7 @@ async def run_active_message_once(manual: bool = False) -> dict:
 
         await _emit_message({
             "type": "assistant_message",
+            "session_id": session_id,
             "action": decision.action.value,
             "text": routed["text"],
             "content": routed["text"],
@@ -638,29 +804,33 @@ async def run_active_message_once(manual: bool = False) -> dict:
         return {"status": "error", "reason": str(e)}
 
 
-def _record_active_message(job_id: str, raw_output: str, decision, routed: dict):
+def _record_active_message(session_id: str, job_id: str, raw_output: str, decision, routed: dict):
     db = next(get_db())
     try:
+        first_item = (routed.get("items") or [None])[0]
         raw = RawChatLog(
             event_id=f"evt_{uuid.uuid4().hex[:8]}",
-            session_id="default",
+            session_id=session_id,
             event_type="active_message",
-            llm_raw_output=json.dumps(decision.model_dump(mode="json", exclude_none=True), ensure_ascii=False),
+            llm_raw_output=raw_output,
+            parsed_payload=_json_dumps(decision.model_dump(mode="json", exclude_none=True)),
             action=decision.action.value,
             final_text=routed.get("text"),
+            item_type=first_item.type.value if first_item else None,
+            send_index=0 if first_item else None,
+            send_count=1 if first_item else None,
             job_id=job_id,
             status="sent",
         )
         db.add(raw)
 
-        first_item = (routed.get("items") or [None])[0]
         event_type = (
             "assistant_react"
             if first_item and first_item.type in (SendItemType.EMOJI, SendItemType.MEME)
             else "assistant_text"
         )
         conv = ConversationEvent(
-            session_id="default",
+            session_id=session_id,
             event_type=event_type,
             text=routed.get("text"),
             is_visible=True,
@@ -710,12 +880,13 @@ def _is_quiet_time(now: datetime, config: dict) -> bool:
     return hour >= start or hour < end
 
 
-def _active_messages_sent_today() -> int:
+def _active_messages_sent_today(session_id: str = DEFAULT_SESSION_ID) -> int:
     start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     db = next(get_db())
     try:
         return (
             db.query(ConversationEvent)
+            .filter(ConversationEvent.session_id == session_id)
             .filter(ConversationEvent.created_at >= start)
             .filter(ConversationEvent.action == "active_message")
             .count()
@@ -724,11 +895,12 @@ def _active_messages_sent_today() -> int:
         db.close()
 
 
-def _has_unanswered_active_message() -> bool:
+def _has_unanswered_active_message(session_id: str = DEFAULT_SESSION_ID) -> bool:
     db = next(get_db())
     try:
         last_active = (
             db.query(ConversationEvent)
+            .filter(ConversationEvent.session_id == session_id)
             .filter(ConversationEvent.action == "active_message")
             .order_by(desc(ConversationEvent.created_at))
             .first()
@@ -738,6 +910,7 @@ def _has_unanswered_active_message() -> bool:
 
         last_user = (
             db.query(ConversationEvent)
+            .filter(ConversationEvent.session_id == session_id)
             .filter(ConversationEvent.event_type.in_(["user_text", "user_command"]))
             .order_by(desc(ConversationEvent.created_at))
             .first()
@@ -754,7 +927,9 @@ async def send_nudge():
         event_id=f"evt_{uuid.uuid4().hex[:8]}",
         event_type=EventType.NUDGE,
         timestamp=datetime.now(),
+        raw={"source": "webui"},
     )
+    _record_incoming_event(event)
     result = await event_gate.handle_event(event)
     return result
 
@@ -820,8 +995,8 @@ async def get_active_message_status():
     topics = memory_manager.read_tomorrow_topics()
     return {
         "config": _normalize_active_message_config(load_settings().get("active_message")),
-        "sent_today": _active_messages_sent_today(),
-        "has_unanswered_active_message": _has_unanswered_active_message(),
+        "sent_today": _active_messages_sent_today(DEFAULT_SESSION_ID),
+        "has_unanswered_active_message": _has_unanswered_active_message(DEFAULT_SESSION_ID),
         "candidates": count_candidates_by_status(topics),
         "gate_ready": await event_gate.can_accept_active_message() if hasattr(event_gate, "can_accept_active_message") else None,
     }
@@ -921,6 +1096,7 @@ async def update_hot_duration(config: HotDurationConfig):
 @router.get("/api/status")
 async def get_status():
     init_gate()
+    session_id = DEFAULT_SESSION_ID
     # 检查是否需要从 HOT 退回 COLD
     await event_gate.maybe_exit_hot()
     last_decision = event_gate.get_last_decision()
@@ -938,6 +1114,7 @@ async def get_status():
 
     # 组装 Snapshot 面板数据
     snapshot_panel = {
+        "session_id": session_id,
         "snapshot_id": event_gate.state.current_snapshot_id,
         "buffer_version": event_gate.state.buffer_version,
         "status": event_gate.state.status.value,
@@ -973,6 +1150,7 @@ async def get_status():
         "buffered_events": len(event_gate.buffer._events),
         "stale_jobs_count": len(event_gate._stale_job_ids),
         "sent_jobs_count": len(event_gate._sent_job_ids),
+        "user_composing": event_gate.get_user_composing_meta(),
     }
 
     # Meme / 命令链路
@@ -998,6 +1176,7 @@ async def get_status():
 
     return {
         # 兼容旧字段
+        "session_id": session_id,
         "status": event_gate.state.status.value,
         "buffer_version": event_gate.state.buffer_version,
         "msg_index_today": event_gate.state.msg_index_today,
@@ -1018,10 +1197,15 @@ async def get_status():
 async def get_conversation():
     db = next(get_db())
     try:
-        events = db.query(ConversationEvent).order_by(ConversationEvent.created_at).all()
+        events = (
+            db.query(ConversationEvent)
+            .order_by(ConversationEvent.created_at)
+            .all()
+        )
         return [
             {
                 "id": e.id,
+                "session_id": e.session_id,
                 "event_type": e.event_type,
                 "text": e.text,
                 "action": e.action,
@@ -1049,6 +1233,7 @@ async def clear_conversation():
         event_gate._sent_job_ids.clear()
         event_gate._sent_send_keys.clear()
         event_gate._last_send_meta = None
+        event_gate.clear_user_composing()
     if companion_graph:
         companion_graph._conversation_history.clear()
 

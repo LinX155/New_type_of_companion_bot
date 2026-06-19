@@ -158,9 +158,24 @@ const MemorySchedule: React.FC = () => {
     textAlign: 'center' as const,
   };
 
+  const pageStyle: React.CSSProperties = {
+    width: '100%',
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))',
+    gap: '20px',
+    alignItems: 'start',
+  };
+
+  const cardStyle: React.CSSProperties = {
+    background: '#fff',
+    padding: '24px',
+    borderRadius: '8px',
+    minWidth: 0,
+  };
+
   return (
-    <div style={{ maxWidth: '600px', display: 'flex', flexDirection: 'column', gap: '20px' }}>
-      <div style={{ background: '#fff', padding: '24px', borderRadius: '8px' }}>
+    <div style={pageStyle}>
+      <div style={cardStyle}>
         <h2 style={{ marginBottom: '16px' }}>记忆线程时间配置</h2>
         <p style={{ color: '#7f8c8d', fontSize: '13px', marginBottom: '20px' }}>
           设置定时记忆分析任务和凌晨整理线程的运行时间。
@@ -214,7 +229,7 @@ const MemorySchedule: React.FC = () => {
         </div>
       </div>
 
-      <div style={{ background: '#fff', padding: '24px', borderRadius: '8px' }}>
+      <div style={cardStyle}>
         <h2 style={{ marginBottom: '16px' }}>主动消息配置</h2>
         <p style={{ color: '#7f8c8d', fontSize: '13px', marginBottom: '20px' }}>
           主动消息每天按固定时间检查一次，只在空闲、未超上限且有 pending 候选时发送。
@@ -321,7 +336,7 @@ const MemorySchedule: React.FC = () => {
         </div>
       </div>
 
-      <div style={{ background: '#fff', padding: '24px', borderRadius: '8px' }}>
+      <div style={cardStyle}>
         <h2 style={{ marginBottom: '16px' }}>状态机配置</h2>
         <p style={{ color: '#7f8c8d', fontSize: '13px', marginBottom: '16px' }}>
           设置热聊在场态（HOT）持续多久后自动退回离线生活态（COLD）。
