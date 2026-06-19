@@ -122,8 +122,8 @@ class ActionDecision(BaseModel):
         if self.action == Action.REACT:
             if not all_items:
                 raise ValueError("REACT action requires at least one react item")
-            if any(item.type == SendItemType.TEXT for item in all_items):
-                raise ValueError("REACT action cannot contain text items")
+            if not any(item.type != SendItemType.TEXT for item in all_items):
+                self.action = Action.REPLY
 
         return self
 

@@ -443,12 +443,14 @@ class CompanionGraph:
 
         if Action.ENTER_CHAT in item_actions:
             action = Action.ENTER_CHAT
-        elif any(item.type == SendItemType.TEXT for item in merged_items):
-            action = Action.LIGHT_ACK if item_actions and all(item_action == Action.LIGHT_ACK for item_action in item_actions) else Action.REPLY
+        elif any(item.type != SendItemType.TEXT for item in merged_items):
+            action = Action.REACT
+        elif item_actions and all(item_action == Action.LIGHT_ACK for item_action in item_actions):
+            action = Action.LIGHT_ACK
         elif Action.REPLY in item_actions:
             action = Action.REPLY
         else:
-            action = Action.REACT
+            action = Action.REPLY
 
         return ActionDecision(action=action, items=merged_items)
 
@@ -465,6 +467,7 @@ class CompanionGraph:
             text_value = [self._normalize_react_text(item) for item in text_value]
         if action_str == Action.REACT.value and isinstance(text_value, str):
             text_value = self._normalize_react_text(text_value)
+
         return ActionDecision(action=action_str, text=text_value, items=items_value)
 
     def _normalize_react_text(self, action_text: str) -> str:
