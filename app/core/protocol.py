@@ -243,6 +243,8 @@ def build_repair_messages(
             "主协议只有 action 和 items；text 只作为旧格式兼容，不要主动输出。",
             "action 只能是 WAIT、REPLY、LIGHT_ACK、REACT、ENTER_CHAT、END_CHAT。",
             "items 是同一轮连续发送单元；混合文字和表情时使用 REACT.items。",
+            "如果错误指出当前是 COLD：LIGHT_ACK 和纯 REACT 可以低负担回应并保持 COLD；REPLY 或带 text item 的 REACT 不能直接发送。",
+            "如果当前是 COLD 且需要展开文字回复、连续文本回复或文字+表情混合回复，必须改用 ENTER_CHAT.items；如果不进入热聊，改用 WAIT、LIGHT_ACK 或纯 REACT。",
             "如果需要表情但不知道精确 file_stem，使用 search_meme:<category>:<keywords>。",
             "如果错误指出 meme 不存在，不要重复该 meme；改用 search_meme 或删除该表情 item。",
             "最终发送前不能残留内部 search_meme；只有第一轮或修复后继续检索时才允许 search_meme。",

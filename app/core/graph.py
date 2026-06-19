@@ -10,6 +10,7 @@ from .protocol import (
     parse_and_validate_raw_decision,
     validate_executable,
 )
+from .state import ChatStatus
 from ..llm.client import LLMClient
 from ..llm.prompts import (
     build_system_prompt,
@@ -200,6 +201,8 @@ class CompanionGraph:
         )
 
     def _fallback_decision(self, ctx: ProcessContext) -> ActionDecision:
+        if self._is_cold_context(ctx):
+            return ActionDecision(action=Action.WAIT, items=None)
         if ctx.snapshot.events:
             return ActionDecision(
                 action=Action.LIGHT_ACK,
@@ -323,6 +326,21 @@ class CompanionGraph:
     async def _validate_decision(self, state: GraphState) -> GraphState:
         decision = state["decision"]
         ctx = state["ctx"]
+        decision, context_status = await self._ensure_contextual_decision(
+            state=state,
+            decision=decision,
+            raw_output=self._last_llm_raw_output or decision.model_dump_json(),
+        )
+        if context_status:
+            self._last_parse_status = context_status
+            state = {**state, "decision": decision}
+
+        if decision.search_meme_items() and not ctx.meme_search_used:
+            searched_state = await self._search_meme(state)
+            return await self._validate_decision({**state, "decision": searched_state["decision"]})
+
+        ctx.selected_memes = []
+        ctx.selected_meme = None
         validated_items: list[SendItem] = []
         selected_memes: list[str] = []
         dropped_internal = False
@@ -456,6 +474,67 @@ class CompanionGraph:
                     items=[SendItem(type=SendItemType.SEARCH_MEME, content="search_meme:amused:funny")],
                 )
         return decision
+
+    async def _ensure_contextual_decision(
+        self,
+        state: GraphState,
+        decision: ActionDecision,
+        raw_output: str,
+    ) -> tuple[ActionDecision, Optional[str]]:
+        errors = self._validate_contextual_decision(state["ctx"], decision)
+        if not errors:
+            return decision, None
+
+        ctx = state["ctx"]
+        if ctx.contextual_repair_used:
+            return self._fallback_decision(ctx), "context_repair_failed"
+
+        ctx.contextual_repair_used = True
+        repair_result = ProtocolResult(
+            status="context_protocol_error",
+            decision=decision,
+            errors=errors,
+        )
+        repaired = await self._repair_protocol_decision(
+            base_messages=state["messages"],
+            raw_output=raw_output,
+            result=repair_result,
+        )
+        if repaired.ok and repaired.decision:
+            fixed = self._apply_protocol_guards(ctx, repaired.decision)
+            if not self._validate_contextual_decision(ctx, fixed):
+                return fixed, "context_repair_ok"
+
+        return self._fallback_decision(ctx), "context_repair_failed"
+
+    def _validate_contextual_decision(self, ctx: ProcessContext, decision: ActionDecision) -> list[str]:
+        if not self._is_cold_context(ctx):
+            return []
+
+        items = decision.all_items()
+        if decision.action in (Action.WAIT, Action.END_CHAT, Action.ENTER_CHAT, Action.LIGHT_ACK):
+            return []
+
+        if decision.action == Action.REACT:
+            if items and all(item.type != SendItemType.TEXT for item in items):
+                return []
+            return [
+                "当前聊天状态是 COLD。包含 text item 的 REACT 属于文字+表情混合回复；"
+                "如果要发送文字+表情并进入热聊，请改用 ENTER_CHAT.items；"
+                "如果只是低负担回应，请删除 text item，保持纯 REACT；如果不回应，请使用 WAIT.items:null。"
+            ]
+
+        if decision.action == Action.REPLY:
+            return [
+                "当前聊天状态是 COLD。普通文本展开回复不能使用 REPLY；"
+                "如果要可见回复并进入热聊，请改用 ENTER_CHAT.items；"
+                "如果只是轻轻接一下，请使用 LIGHT_ACK；如果不回应，请使用 WAIT.items:null。"
+            ]
+
+        return []
+
+    def _is_cold_context(self, ctx: ProcessContext) -> bool:
+        return ctx.snapshot.status == ChatStatus.COLD and not ctx.snapshot.nudge_triggered
 
     def _requires_meme_response(self, text: str) -> bool:
         lowered = text.lower()

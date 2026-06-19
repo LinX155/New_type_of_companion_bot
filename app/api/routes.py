@@ -240,8 +240,6 @@ async def on_decision(ctx: ProcessContext):
         await event_gate._enter_hot()
     elif decision.action == Action.END_CHAT:
         await event_gate._exit_hot()
-    elif result["visible"] and ctx.snapshot.status == ChatStatus.COLD:
-        await event_gate._enter_hot()
 
     if not result["visible"] or not items:
         _record_decision_drop(ctx, decision)
