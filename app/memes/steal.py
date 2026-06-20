@@ -67,7 +67,6 @@ class MemeStealAnalyzer:
         raw_output = await llm_client.chat_completion(
             messages=messages,
             temperature=0.2,
-            max_tokens=512,
         )
         parsed = self._parse_json(raw_output)
         return self._normalize(parsed, raw_output, image_ref.strip())

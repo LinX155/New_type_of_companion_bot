@@ -1,15 +1,23 @@
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 
-from app.core.decisions import SendItem, SendItemType
+from app.core.decisions import Action, ActionDecision, SendItem, SendItemType
 from app.core.graph import CompanionGraph
+from app.core.protocol import build_repair_messages, parse_and_validate_raw_decision
 from app.core.state import ChatStatus, ColdStartMeta, ConversationSnapshot
+from app.llm.prompts import build_meme_search_messages
 
 
 class FakeLLM:
     def get_last_usage(self):
         return None
+
+
+class FakeRepairLLM(FakeLLM):
+    async def chat_completion(self, messages, temperature=0.7, stream=False):
+        return "诶嘿嘿～那我想想做什么好呢…\n\n[表情: meme:affection_anime_girl_hug_chu]\n宝想吃啥？"
 
 
 class FakeMemory:
@@ -29,6 +37,12 @@ class FakeMemory:
 class FakeMemeCatalog:
     def get_images_in_category(self, category):
         return []
+
+    def get_categories(self):
+        return {}
+
+    def get_image_path(self, category_id, file_stem):
+        return ""
 
 
 class FakeMemoryWithTomorrow(FakeMemory):
@@ -252,6 +266,158 @@ class PromptAppendOnlyTest(unittest.TestCase):
             self.assertIn("estimated_prompt_tokens", observability)
 
         asyncio.run(scenario())
+
+    def test_short_harness_items_parse_to_internal_execution_items(self):
+        raw = (
+            '{"action":"REACT","items":['
+            '{"text":"啊这"},'
+            '{"search_meme":"helpless:tired facepalm"},'
+            '{"text":"有点离谱"}'
+            ']}'
+        )
+        result = parse_and_validate_raw_decision(raw)
+
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual(result.decision.action, Action.REACT)
+        self.assertEqual(
+            [item.to_harness_item() for item in result.decision.all_items()],
+            [
+                {"text": "啊这"},
+                {"search_meme": "helpless:tired facepalm"},
+                {"text": "有点离谱"},
+            ],
+        )
+        self.assertEqual(result.decision.search_meme_items()[0].content, "search_meme:helpless:tired facepalm")
+
+    def test_short_meme_item_parses_without_meme_prefix(self):
+        raw = '{"action":"REACT","items":[{"meme":"affection_anime_girl_hug_chu"}]}'
+        result = parse_and_validate_raw_decision(raw)
+
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual(result.decision.all_items()[0].content, "meme:affection_anime_girl_hug_chu")
+        self.assertEqual(result.decision.to_harness_payload(), {
+            "action": "REACT",
+            "items": [{"meme": "affection_anime_girl_hug_chu"}],
+        })
+
+    def test_old_type_content_items_are_rejected_by_main_harness(self):
+        raw = (
+            '{"action":"REACT","items":['
+            '{"type":"search_meme","content":"search_meme:amused:laugh"}'
+            ']}'
+        )
+        result = parse_and_validate_raw_decision(raw)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "protocol_error")
+        self.assertTrue(any("text、meme、search_meme" in error for error in result.errors))
+
+    def test_react_text_only_normalizes_to_reply_without_emoji_item(self):
+        result = parse_and_validate_raw_decision('{"action":"REACT","items":[{"text":"🙂"}]}')
+
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual(result.decision.action, Action.REPLY)
+        self.assertEqual(result.decision.to_harness_payload(), {
+            "action": "REPLY",
+            "items": [{"text": "🙂"}],
+        })
+
+    def test_debug_parsed_items_use_short_harness_shape(self):
+        graph = CompanionGraph(FakeLLM(), FakeMemory(), FakeMemeCatalog())
+        graph._record_parsed_decision(
+            ActionDecision(
+                action=Action.REACT,
+                items=[
+                    SendItem(type=SendItemType.TEXT, content="啊这"),
+                    SendItem(type=SendItemType.SEARCH_MEME, content="amused:laugh"),
+                ],
+            )
+        )
+
+        parsed = graph.get_last_parsed_decision()
+        self.assertEqual(parsed["items"], [{"text": "啊这"}, {"search_meme": "amused:laugh"}])
+
+    def test_meme_second_round_prompt_uses_short_harness_shape(self):
+        messages = build_meme_search_messages(
+            base_messages=[{"role": "system", "content": "base"}],
+            search_results=[
+                {
+                    "request": "amused:laugh",
+                    "category": "amused",
+                    "keywords": "laugh",
+                    "candidates": ["amused_laugh_001"],
+                }
+            ],
+            original_decision={"action": "REACT", "items": [{"search_meme": "amused:laugh"}]},
+        )
+
+        assistant_payload = json.loads(messages[1]["content"])
+        tool_payload = json.loads(messages[2]["content"])
+        final_instruction = messages[3]["content"]
+
+        self.assertEqual(assistant_payload, {"action": "REACT", "items": [{"search_meme": "amused:laugh"}]})
+        self.assertIn('{"meme":"<file_stem>"}', final_instruction)
+        self.assertNotIn('"type":"meme"', final_instruction)
+        self.assertIn('{"meme":"<file_stem>"}', "\n".join(tool_payload["selection_rules"]))
+
+    def test_repair_natural_visible_output_is_released_instead_of_um_fallback(self):
+        async def scenario():
+            graph = CompanionGraph(FakeRepairLLM(), FakeMemory(), FakeMemeCatalog())
+            ctx = SimpleNamespace(
+                gate=self._gate(msg_index=2, age="just now"),
+                snapshot=ConversationSnapshot(
+                    snapshot_id=2,
+                    buffer_version=2,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e2",
+                            "event_type": "message.text",
+                            "text": "还没呢，你吃这么早吗，我一般六点才吃",
+                        }
+                    ],
+                ),
+            )
+
+            decision, status = await graph._parse_decision_with_harness(
+                ctx=ctx,
+                base_messages=[],
+                raw_output="这不是 JSON",
+                repair=True,
+            )
+
+            self.assertEqual(status, "relaxed_visible_output")
+            self.assertEqual(decision.action.value, "REPLY")
+            contents = [item.content for item in decision.all_items()]
+            self.assertIn("诶嘿嘿～那我想想做什么好呢…", contents)
+            self.assertIn("宝想吃啥？", contents)
+            self.assertNotEqual(contents, ["嗯"])
+
+        asyncio.run(scenario())
+
+    def test_repair_prompt_marks_blocked_output_as_system_context_not_assistant_history(self):
+        messages = build_repair_messages(
+            base_messages=[{"role": "system", "content": "base"}],
+            errors=["模型输出不是合法 JSON 对象"],
+            original_raw="在呢宝，怎么啦？",
+        )
+
+        self.assertEqual([item["role"] for item in messages], ["system", "system", "system"])
+        joined = "\n".join(item["content"] for item in messages)
+        self.assertIn("已经被拦截，用户没有看到它", joined)
+        self.assertIn("不要顺着它继续说话", joined)
+        self.assertIn("把 original_raw_output 中适合用户看到的自然内容搬进 items", joined)
+        self.assertIn("不要丢成“嗯”", joined)
+        payload = json.loads(messages[1]["content"])
+        self.assertEqual(payload["schema"]["items"], [
+            {"text": "用户可见文本或 emoji"},
+            {"meme": "<file_stem>"},
+            {"search_meme": "<category>:<keywords>"},
+        ])
+        self.assertEqual(payload["conversion_examples"][0]["good"], {
+            "action": "REPLY",
+            "items": [{"text": "在呢宝，怎么啦？"}],
+        })
 
     def _gate(self, msg_index: int, age: str):
         gate = SimpleNamespace()

@@ -101,7 +101,7 @@ class SchedulerManager:
                 today_memory_md=self.memory.read_today_memory(),
                 tomorrow_topics_md=self.memory.read_tomorrow_topics(),
             )
-            raw_output = await self.llm.chat_completion(messages=messages, temperature=0.2, max_tokens=1600)
+            raw_output = await self.llm.chat_completion(messages=messages, temperature=0.2)
             data = self._parse_json_object(raw_output)
 
             today_memory = data.get("today_memory_md")
@@ -143,7 +143,7 @@ class SchedulerManager:
                 day_memory_md=day_memory,
                 tomorrow_topics_md=self.memory.read_tomorrow_topics(),
             )
-            raw_output = await self.llm.chat_completion(messages=messages, temperature=0.2, max_tokens=2000)
+            raw_output = await self.llm.chat_completion(messages=messages, temperature=0.2)
             data = self._parse_json_object(raw_output)
 
             memory_core = data.get("memory_core_md")

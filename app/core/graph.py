@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 from typing import Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -129,7 +130,6 @@ class CompanionGraph:
         raw_output = await self.llm.chat_completion(
             messages=state["messages"],
             temperature=0.3,
-            max_tokens=512,
         )
         self._record_prompt_usage()
         self._record_llm_raw_output(raw_output)
@@ -164,18 +164,28 @@ class CompanionGraph:
 
         if repair:
             repaired = await self._repair_protocol_decision(
+                ctx=ctx,
                 base_messages=base_messages,
                 raw_output=raw_output,
                 result=result,
             )
             if repaired.ok and repaired.decision:
+                if repaired.status == "relaxed_visible_output":
+                    return repaired.decision, repaired.status
                 return repaired.decision, "repair_ok"
+            relaxed = self._relaxed_visible_decision(raw_output, ctx)
+            if relaxed:
+                return relaxed, "relaxed_visible_output"
             return self._fallback_decision(ctx), "repair_failed"
 
+        relaxed = self._relaxed_visible_decision(raw_output, ctx)
+        if relaxed:
+            return relaxed, "relaxed_visible_output"
         return self._fallback_decision(ctx), result.status
 
     async def _repair_protocol_decision(
         self,
+        ctx: ProcessContext,
         base_messages: list,
         raw_output: str,
         result: ProtocolResult,
@@ -190,7 +200,6 @@ class CompanionGraph:
             repaired_raw = await self.llm.chat_completion(
                 messages=messages,
                 temperature=0.2,
-                max_tokens=512,
             )
             self._record_llm_raw_output(repaired_raw)
         except Exception as exc:
@@ -199,12 +208,91 @@ class CompanionGraph:
         repaired = parse_and_validate_raw_decision(repaired_raw)
         if repaired.ok:
             return repaired
+        relaxed = self._relaxed_visible_decision(repaired_raw, ctx)
+        if relaxed:
+            return ProtocolResult(status="relaxed_visible_output", decision=relaxed)
         return ProtocolResult(
             status="repair_failed",
             decision=repaired.decision,
             errors=repaired.errors,
             raw_data=repaired.raw_data,
         )
+
+    def _relaxed_visible_decision(self, raw_output: str, ctx: ProcessContext) -> Optional[ActionDecision]:
+        items = self._visible_items_from_relaxed_output(raw_output)
+        if not items:
+            return None
+
+        has_rich_item = any(item.type != SendItemType.TEXT for item in items)
+        has_text_item = any(item.type == SendItemType.TEXT for item in items)
+        if self._is_cold_context(ctx):
+            action = Action.ENTER_CHAT if has_text_item else Action.REACT
+        else:
+            action = Action.REACT if has_rich_item else Action.REPLY
+        return ActionDecision(action=action, items=items)
+
+    def _visible_items_from_relaxed_output(self, raw_output: str) -> list[SendItem]:
+        text = (raw_output or "").strip()
+        if not text or self._looks_like_protocol_output(text):
+            return []
+
+        items: list[SendItem] = []
+        for raw_line in text.replace("```", "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            meme_stem = self._extract_relaxed_meme_stem(line)
+            if meme_stem:
+                if self.meme_renderer.render_meme(meme_stem):
+                    items.append(SendItem(type=SendItemType.MEME, content=f"meme:{meme_stem}"))
+                continue
+
+            if self._contains_internal_protocol(line):
+                continue
+            items.append(SendItem(type=SendItemType.TEXT, content=line))
+
+        return items
+
+    def _looks_like_protocol_output(self, text: str) -> bool:
+        stripped = text.strip()
+        if stripped.startswith("{"):
+            return True
+        protocol_markers = (
+            '"action"',
+            '"items"',
+            "ActionDecision",
+            "runtime_context",
+            "FINAL_ACTION_OUTPUT_REMINDER",
+            "cached_tokens",
+            "prefix_rebuild",
+            "search_meme:",
+        )
+        return any(marker in stripped for marker in protocol_markers)
+
+    def _contains_internal_protocol(self, line: str) -> bool:
+        markers = (
+            "ActionDecision",
+            "runtime_context",
+            "FINAL_ACTION_OUTPUT_REMINDER",
+            "cached_tokens",
+            "prefix_rebuild",
+            "search_meme:",
+            '"action"',
+            '"items"',
+        )
+        if any(marker in line for marker in markers):
+            return True
+        return "meme:" in line and not self._extract_relaxed_meme_stem(line)
+
+    def _extract_relaxed_meme_stem(self, line: str) -> Optional[str]:
+        match = re.fullmatch(
+            r"(?:\[)?\s*(?:(?:表情|meme)\s*[:：]\s*)?meme:([A-Za-z0-9_\-]+)\s*(?:\])?",
+            line,
+        )
+        if match:
+            return match.group(1)
+        return None
 
     def _fallback_decision(self, ctx: ProcessContext) -> ActionDecision:
         if self._is_cold_context(ctx):
@@ -221,7 +309,7 @@ class CompanionGraph:
         decision = state["decision"]
         search_items = decision.search_meme_items()
 
-        self._last_search_meme = "\n".join(item.content for item in search_items) or None
+        self._last_search_meme = "\n".join(item.harness_value() for item in search_items) or None
         self._last_render_status = None
 
         if ctx.meme_search_used:
@@ -233,13 +321,14 @@ class CompanionGraph:
         candidate_union: set[str] = set()
 
         for item in search_items:
+            request_text = item.harness_value()
             parsed = self.meme_renderer.parse_react_text(item.content)
             category = parsed.get("category", "")
             keywords = parsed.get("keywords", "")
             candidates = self.meme_search.search(category, keywords, top_k=5)
             search_results.append(
                 {
-                    "request": item.content,
+                    "request": request_text,
                     "category": category,
                     "keywords": keywords,
                     "candidates": candidates,
@@ -256,13 +345,12 @@ class CompanionGraph:
         messages = build_meme_search_messages(
             base_messages=state["messages"],
             search_results=search_results,
-            original_decision=decision.model_dump(mode="json", exclude_none=True),
+            original_decision=decision.to_harness_payload(exclude_none=True),
         )
 
         raw_output = await self.llm.chat_completion(
             messages=messages,
             temperature=0.2,
-            max_tokens=512,
         )
         self._record_llm_raw_output(raw_output)
         second_result = parse_and_validate_raw_decision(raw_output)
@@ -301,7 +389,7 @@ class CompanionGraph:
         return bool(decision.send_items())
 
     def _selected_meme_stems(self, decision: ActionDecision) -> list[str]:
-        return [item.content[5:] for item in decision.all_items() if item.type == SendItemType.MEME]
+        return [item.harness_value() for item in decision.all_items() if item.type == SendItemType.MEME]
 
     def _replace_search_items_with_first_candidates(
         self,
@@ -316,9 +404,9 @@ class CompanionGraph:
                 replaced_items.append(item)
                 continue
 
-            candidates = results_by_request.get(item.content) or []
+            candidates = results_by_request.get(item.harness_value()) or []
             if candidates:
-                replaced_items.append(SendItem(type=SendItemType.MEME, content=f"meme:{candidates[0]}"))
+                replaced_items.append(SendItem(type=SendItemType.MEME, content=candidates[0]))
 
         if replaced_items:
             return decision.with_items(replaced_items)
@@ -336,7 +424,7 @@ class CompanionGraph:
         decision, context_status = await self._ensure_contextual_decision(
             state=state,
             decision=decision,
-            raw_output=self._last_llm_raw_output or decision.model_dump_json(),
+            raw_output=self._last_llm_raw_output or json.dumps(decision.to_harness_payload(), ensure_ascii=False),
         )
         if context_status:
             self._last_parse_status = context_status
@@ -360,7 +448,7 @@ class CompanionGraph:
                 continue
 
             if item.type == SendItemType.MEME:
-                file_stem = item.content[5:]
+                file_stem = item.harness_value()
                 path = self.meme_renderer.render_meme(file_stem)
                 if not path:
                     missed_meme = True
@@ -408,7 +496,7 @@ class CompanionGraph:
         decision: ActionDecision,
         missing_meme_stems: list[str],
     ) -> Optional[ActionDecision]:
-        errors = [f"meme:{stem} 在本地表情库中不存在。" for stem in missing_meme_stems]
+        errors = [f"meme {stem} 在本地表情库中不存在。" for stem in missing_meme_stems]
         messages = build_repair_messages(
             base_messages=state["messages"],
             errors=errors,
@@ -419,7 +507,6 @@ class CompanionGraph:
             raw_output = await self.llm.chat_completion(
                 messages=messages,
                 temperature=0.2,
-                max_tokens=512,
             )
             self._record_llm_raw_output(raw_output)
             result = parse_and_validate_raw_decision(raw_output)
@@ -474,12 +561,12 @@ class CompanionGraph:
             return item.content
         if item.type == SendItemType.EMOJI:
             return item.content[6:]
-        return f"[表情: {item.content}]"
+        return f"[表情: meme:{item.harness_value()}]"
 
     def _record_parsed_decision(self, parsed: ActionDecision):
         self._last_parsed_action = parsed.action.value
         self._last_parsed_text = parsed.text
-        self._last_parsed_items = [item.model_dump(mode="json") for item in parsed.all_items()]
+        self._last_parsed_items = [item.to_harness_item() for item in parsed.all_items()]
 
     def _apply_protocol_guards(self, ctx: ProcessContext, decision: ActionDecision) -> ActionDecision:
         pending_text = "\n".join(
@@ -489,13 +576,13 @@ class CompanionGraph:
         )
         if self._requires_meme_response(pending_text):
             has_react_item = any(
-                item.type in (SendItemType.SEARCH_MEME, SendItemType.MEME, SendItemType.EMOJI)
+                item.type in (SendItemType.SEARCH_MEME, SendItemType.MEME)
                 for item in decision.all_items()
             )
             if not has_react_item:
                 return ActionDecision(
                     action=Action.REACT,
-                    items=[SendItem(type=SendItemType.SEARCH_MEME, content="search_meme:amused:funny")],
+                    items=[SendItem(type=SendItemType.SEARCH_MEME, content="amused:funny")],
                 )
         return decision
 
@@ -520,6 +607,7 @@ class CompanionGraph:
             errors=errors,
         )
         repaired = await self._repair_protocol_decision(
+            ctx=ctx,
             base_messages=state["messages"],
             raw_output=raw_output,
             result=repair_result,

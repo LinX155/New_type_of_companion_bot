@@ -5,6 +5,9 @@ from pydantic import BaseModel, field_validator, model_validator
 
 REACT_PROTOCOL_PREFIXES = ("emoji:", "search_meme:", "meme:")
 DecisionText = Union[str, list[str], None]
+SEARCH_MEME_PREFIX = "search_meme:"
+MEME_PREFIX = "meme:"
+EMOJI_PREFIX = "emoji:"
 
 
 class Action(str, Enum):
@@ -44,16 +47,36 @@ class SendItem(BaseModel):
         if not self.content:
             raise ValueError("send item content cannot be empty")
 
-        if self.type == SendItemType.EMOJI and not self.content.startswith("emoji:"):
-            self.content = f"emoji:{self.content}"
+        if self.type == SendItemType.EMOJI and not self.content.startswith(EMOJI_PREFIX):
+            self.content = f"{EMOJI_PREFIX}{self.content}"
 
-        if self.type == SendItemType.MEME and not self.content.startswith("meme:"):
-            self.content = f"meme:{self.content}"
+        if self.type == SendItemType.MEME and not self.content.startswith(MEME_PREFIX):
+            self.content = f"{MEME_PREFIX}{self.content}"
 
-        if self.type == SendItemType.SEARCH_MEME and not self.content.startswith("search_meme:"):
-            raise ValueError("search_meme item content must start with search_meme:")
+        if self.type == SendItemType.SEARCH_MEME and not self.content.startswith(SEARCH_MEME_PREFIX):
+            self.content = f"{SEARCH_MEME_PREFIX}{self.content}"
 
         return self
+
+    def harness_value(self) -> str:
+        if self.type == SendItemType.EMOJI:
+            return self.content[len(EMOJI_PREFIX):] if self.content.startswith(EMOJI_PREFIX) else self.content
+        if self.type == SendItemType.MEME:
+            return self.content[len(MEME_PREFIX):] if self.content.startswith(MEME_PREFIX) else self.content
+        if self.type == SendItemType.SEARCH_MEME:
+            return (
+                self.content[len(SEARCH_MEME_PREFIX):]
+                if self.content.startswith(SEARCH_MEME_PREFIX)
+                else self.content
+            )
+        return self.content
+
+    def to_harness_item(self) -> dict:
+        if self.type == SendItemType.MEME:
+            return {"meme": self.harness_value()}
+        if self.type == SendItemType.SEARCH_MEME:
+            return {"search_meme": self.harness_value()}
+        return {"text": self.harness_value()}
 
 
 class ActionDecision(BaseModel):
@@ -136,20 +159,27 @@ class ActionDecision(BaseModel):
             return cls._item_from_string(raw)
 
         if isinstance(raw, dict):
-            content = raw.get("content", raw.get("text", raw.get("value", "")))
-            content = str(content or "").strip()
-            if not content:
-                return None
-
-            # Protocol-looking content wins over a loose or mistaken type value.
-            protocol_item = cls._item_from_protocol_string(content)
-            if protocol_item:
-                return protocol_item
-
-            item_type = raw.get("type", SendItemType.TEXT.value)
-            return SendItem(type=item_type, content=content)
+            simple_item = cls._item_from_simple_dict(raw)
+            if simple_item:
+                return simple_item
+            return None
 
         return cls._item_from_string(str(raw))
+
+    @classmethod
+    def _item_from_simple_dict(cls, raw: dict) -> Optional[SendItem]:
+        for key, item_type in (
+            ("text", SendItemType.TEXT),
+            ("meme", SendItemType.MEME),
+            ("search_meme", SendItemType.SEARCH_MEME),
+        ):
+            if key not in raw:
+                continue
+            value = str(raw.get(key) or "").strip()
+            if not value:
+                return None
+            return SendItem(type=item_type, content=value)
+        return None
 
     @classmethod
     def _item_from_string(cls, value: str) -> Optional[SendItem]:
@@ -165,11 +195,11 @@ class ActionDecision(BaseModel):
 
     @classmethod
     def _item_from_protocol_string(cls, value: str) -> Optional[SendItem]:
-        if value.startswith("emoji:"):
+        if value.startswith(EMOJI_PREFIX):
             return SendItem(type=SendItemType.EMOJI, content=value)
-        if value.startswith("meme:"):
+        if value.startswith(MEME_PREFIX):
             return SendItem(type=SendItemType.MEME, content=value)
-        if value.startswith("search_meme:"):
+        if value.startswith(SEARCH_MEME_PREFIX):
             return SendItem(type=SendItemType.SEARCH_MEME, content=value)
         return None
 
@@ -230,3 +260,13 @@ class ActionDecision(BaseModel):
 
     def with_items(self, items: list[SendItem], action: Optional[Action] = None) -> "ActionDecision":
         return ActionDecision(action=action or self.action, items=items)
+
+    def to_harness_payload(self, exclude_none: bool = False) -> dict:
+        items = [item.to_harness_item() for item in self.all_items()]
+        payload = {
+            "action": self.action.value,
+            "items": items or None,
+        }
+        if exclude_none and payload["items"] is None:
+            payload.pop("items")
+        return payload

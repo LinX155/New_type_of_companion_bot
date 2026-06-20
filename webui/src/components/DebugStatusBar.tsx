@@ -45,6 +45,10 @@ const panelStyle: React.CSSProperties = {
   padding: '14px',
   fontSize: '13px',
   lineHeight: 1.5,
+  minWidth: 0,
+  minHeight: 0,
+  display: 'flex',
+  flexDirection: 'column',
 };
 
 const titleStyle: React.CSSProperties = {
@@ -65,7 +69,8 @@ const codeStyle: React.CSSProperties = {
   lineHeight: 1.45,
   whiteSpace: 'pre-wrap',
   wordBreak: 'break-word',
-  maxHeight: '220px',
+  flex: 1,
+  minHeight: 0,
   overflow: 'auto',
 };
 
@@ -80,7 +85,7 @@ const CodeBlock: React.FC<{ children: string }> = ({ children }) => (
 const DebugStatusBar: React.FC<Props> = ({ status }) => {
   if (!status) {
     return (
-      <div style={{ width: '320px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+      <div style={{ width: '100%', display: 'grid', gridTemplateColumns: '1fr 1fr', gridTemplateRows: '1fr 1fr', gap: '12px', minHeight: 0 }}>
         <div style={panelStyle}>加载中...</div>
       </div>
     );
@@ -111,31 +116,45 @@ const DebugStatusBar: React.FC<Props> = ({ status }) => {
     render_status: meme.render_status ?? null,
     last_command: meme.last_command ?? null,
     command_result: meme.command_result ?? null,
-  } : null;
+  } : {
+    search_meme: null,
+    candidates: [],
+    selected_meme: null,
+    render_status: null,
+    last_command: null,
+    command_result: null,
+  };
 
   return (
-    <div style={{ width: '320px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-      <section style={panelStyle}>
-        <h3 style={titleStyle}>会话</h3>
-        <CodeBlock>{formatJson(sessionPayload)}</CodeBlock>
-      </section>
-
-      <section style={panelStyle}>
+    <div style={{
+      width: '100%',
+      height: '100%',
+      minHeight: 0,
+      display: 'grid',
+      gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
+      gridTemplateRows: 'minmax(0, 1.1fr) minmax(0, 0.9fr)',
+      gap: '12px',
+      alignItems: 'stretch',
+    }}>
+      <section style={{ ...panelStyle, gridColumn: 1, gridRow: 1 }}>
         <h3 style={titleStyle}>LLM 原始输出</h3>
         <CodeBlock>{rawText(llm?.last_llm_raw)}</CodeBlock>
       </section>
 
-      <section style={panelStyle}>
+      <section style={{ ...panelStyle, gridColumn: 1, gridRow: 2 }}>
         <h3 style={titleStyle}>执行结果</h3>
         <CodeBlock>{formatJson(execPayload)}</CodeBlock>
       </section>
 
-      {memePayload && (
-        <section style={panelStyle}>
-          <h3 style={titleStyle}>表情日志</h3>
-          <CodeBlock>{formatJson(memePayload)}</CodeBlock>
-        </section>
-      )}
+      <section style={{ ...panelStyle, gridColumn: 2, gridRow: 1 }}>
+        <h3 style={titleStyle}>表情日志</h3>
+        <CodeBlock>{formatJson(memePayload)}</CodeBlock>
+      </section>
+
+      <section style={{ ...panelStyle, gridColumn: 2, gridRow: 2 }}>
+        <h3 style={titleStyle}>会话</h3>
+        <CodeBlock>{formatJson(sessionPayload)}</CodeBlock>
+      </section>
     </div>
   );
 };

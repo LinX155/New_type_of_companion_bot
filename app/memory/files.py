@@ -178,7 +178,7 @@ class MemoryFileManager:
             today_date = datetime.now().strftime("%Y-%m-%d")
             messages = build_mem_command_messages(content, existing, today_date)
             raw = await llm_client.chat_completion(
-                messages=messages, temperature=0.2, max_tokens=1600
+                messages=messages, temperature=0.2
             )
             data = _parse_json_object(raw)
             new_core = (data.get("memory_core_md") or "").strip()
@@ -245,7 +245,7 @@ class MemoryFileManager:
             from ..llm.prompts import build_forget_command_messages
             messages = build_forget_command_messages(query, existing)
             raw = await llm_client.chat_completion(
-                messages=messages, temperature=0.2, max_tokens=1600
+                messages=messages, temperature=0.2
             )
             data = _parse_json_object(raw)
             new_core = (data.get("memory_core_md") or "").strip()

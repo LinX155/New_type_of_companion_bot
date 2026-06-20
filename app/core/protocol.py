@@ -2,7 +2,13 @@ import json
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from .decisions import Action, ActionDecision, SendItemType
+from .decisions import (
+    MEME_PREFIX,
+    SEARCH_MEME_PREFIX,
+    Action,
+    ActionDecision,
+    SendItemType,
+)
 
 
 VALID_MEME_CATEGORIES = {
@@ -27,6 +33,7 @@ VALID_MEME_CATEGORIES = {
 }
 
 PROTOCOL_PREFIXES = ("emoji:", "meme:", "search_meme:")
+HARNESS_ITEM_KEYS = ("text", "meme", "search_meme")
 
 
 @dataclass
@@ -133,7 +140,7 @@ def validate_protocol(decision: ActionDecision) -> list[str]:
         errors.append(f"{decision.action.value} 必须包含至少一个可见 item。")
 
     if decision.action == Action.REPLY and any(item.type != SendItemType.TEXT for item in items):
-        errors.append("REPLY 只能用于普通文本；包含 emoji/meme/search_meme 时必须使用 REACT。")
+        errors.append("REPLY 只能用于普通文本；包含 meme/search_meme 时必须使用 REACT。")
 
     if decision.action == Action.LIGHT_ACK and any(
         item.type in (SendItemType.MEME, SendItemType.SEARCH_MEME) for item in items
@@ -143,8 +150,8 @@ def validate_protocol(decision: ActionDecision) -> list[str]:
     if decision.action == Action.REACT:
         if not items:
             errors.append("REACT 必须包含至少一个 item。")
-        elif not any(item.type != SendItemType.TEXT for item in items):
-            errors.append("REACT 必须至少包含一个 emoji、meme 或 search_meme item。")
+        elif not any(item.type in (SendItemType.MEME, SendItemType.SEARCH_MEME) for item in items):
+            errors.append("REACT 必须至少包含一个 meme 或 search_meme item。")
 
     for index, item in enumerate(items):
         content = item.content.strip()
@@ -153,21 +160,17 @@ def validate_protocol(decision: ActionDecision) -> list[str]:
                 errors.append(f"第 {index + 1} 个 text item 不能包含内部协议串。")
             continue
 
-        if item.type == SendItemType.EMOJI:
-            if not content.startswith("emoji:") or not content[6:].strip():
-                errors.append(f"第 {index + 1} 个 emoji item 必须使用 emoji:<emoji>。")
-            continue
-
         if item.type == SendItemType.MEME:
-            if not content.startswith("meme:") or not content[5:].strip():
-                errors.append(f"第 {index + 1} 个 meme item 必须使用 meme:<file_stem>。")
+            stem = _strip_optional_prefix(content, MEME_PREFIX)
+            if not stem:
+                errors.append(f"第 {index + 1} 个 meme item 必须填写真实 file_stem。")
             continue
 
         if item.type == SendItemType.SEARCH_MEME:
             parsed = _parse_search_meme_content(content)
             if not parsed:
                 errors.append(
-                    f"第 {index + 1} 个 search_meme item 必须使用 search_meme:<category>:<keywords>。"
+                    f"第 {index + 1} 个 search_meme item 必须使用 <category>:<keywords>。"
                 )
                 continue
             category, _ = parsed
@@ -192,23 +195,23 @@ def validate_executable(
 
     for item in decision.all_items():
         if item.type == SendItemType.SEARCH_MEME:
-            search_meme_items.append(item.content)
+            search_meme_items.append(item.harness_value())
             if not allow_search_meme:
-                errors.append(f"最终发送前不能残留内部 search_meme item: {item.content}")
+                errors.append(f"最终发送前不能残留内部 search_meme item: {item.harness_value()}")
             continue
 
         if item.type != SendItemType.MEME:
             continue
 
-        stem = item.content[5:]
+        stem = item.harness_value()
         if allowed_meme_stems is not None and stem not in allowed_meme_stems:
             invalid_meme_stems.append(stem)
-            errors.append(f"meme:{stem} 不在本轮检索候选中。")
+            errors.append(f"meme {stem} 不在本轮检索候选中。")
             continue
 
         if meme_exists is not None and not meme_exists(stem):
             missing_meme_stems.append(stem)
-            errors.append(f"meme:{stem} 在本地表情库中不存在。")
+            errors.append(f"meme {stem} 在本地表情库中不存在。")
 
     return ExecutableValidation(
         errors=errors,
@@ -225,27 +228,34 @@ def build_repair_messages(
     original_decision: Optional[ActionDecision] = None,
 ) -> list:
     original_payload = (
-        original_decision.model_dump(mode="json", exclude_none=True)
+        original_decision.to_harness_payload(exclude_none=True)
         if original_decision
         else None
     )
     repair_payload = {
         "internal_tool": "validate_action_protocol",
         "status": "failed",
+        "blocked_output_was_not_sent": True,
         "errors": errors,
         "original_raw_output": original_raw or "(空输出)",
         "original_decision": original_payload,
-        "required_output": "输出一个修正后的、可执行的单个 JSON decision。",
+        "required_output": "把被拦截输出改写成一个修正后的、可执行的单个 JSON decision。",
         "repair_rules": [
-            "上一轮输出没有通过本地 Action Harness 校验，不能被发送。",
+            "上一轮输出没有通过本地 Action Harness 校验，已经被拦截，用户没有看到它。",
+            "original_raw_output 只是被拦截的草稿，不是已经发出的聊天历史；不要顺着它继续说话。",
+            "你的任务不是再次聊天，而是把 original_raw_output 中适合用户看到的自然内容搬进 items。",
+            "如果 original_raw_output 是自然语言回复，优先保留其语气和主要内容，只改写为 action + items JSON。",
+            "如果 original_raw_output 里有单独的 meme:<file_stem> 或 [表情: meme:<file_stem>] 行，可以改成 {\"meme\":\"<file_stem>\"}。",
             "基于同一轮对话修正，不要开启新话题，不要解释错误。",
             "只输出一个 JSON 对象，不要 Markdown、解释、前后缀或多个 JSON。",
-            "主协议只有 action 和 items；text 只作为旧格式兼容，不要主动输出。",
+            "输出的第一个字符必须是 {，最后一个非空字符必须是 }。",
+            "主协议只有 action 和 items；items 中每个对象只能有一个字段：text、meme 或 search_meme。",
+            "旧格式 {\"type\":\"...\",\"content\":\"...\"} 是非法草稿，必须改成短格式。",
             "action 只能是 WAIT、REPLY、LIGHT_ACK、REACT、ENTER_CHAT、END_CHAT。",
             "items 是同一轮连续发送单元；混合文字和表情时使用 REACT.items。",
             "如果错误指出当前是 COLD：LIGHT_ACK 和纯 REACT 可以低负担回应并保持 COLD；REPLY 或带 text item 的 REACT 不能直接发送。",
             "如果当前是 COLD 且需要展开文字回复、连续文本回复或文字+表情混合回复，必须改用 ENTER_CHAT.items；如果不进入热聊，改用 WAIT、LIGHT_ACK 或纯 REACT。",
-            "如果需要表情但不知道精确 file_stem，使用 search_meme:<category>:<keywords>。",
+            "如果需要表情但不知道精确 file_stem，使用 {\"search_meme\":\"<category>:<keywords>\"}。",
             "如果错误指出 meme 不存在，不要重复该 meme；改用 search_meme 或删除该表情 item。",
             "最终发送前不能残留内部 search_meme；只有第一轮或修复后继续检索时才允许 search_meme。",
             "用户可见 text 里不要提到 JSON、action、items、REACT、WAIT、search_meme、协议、系统、规则、规矩、限制、只能输出、只能发、不允许。",
@@ -254,17 +264,43 @@ def build_repair_messages(
         "schema": {
             "action": "WAIT | REPLY | LIGHT_ACK | REACT | ENTER_CHAT | END_CHAT",
             "items": [
-                {"type": "text", "content": "用户可见文本"},
-                {"type": "emoji", "content": "emoji:<emoji>"},
-                {"type": "meme", "content": "meme:<file_stem>"},
-                {"type": "search_meme", "content": "search_meme:<category>:<keywords>"},
+                {"text": "用户可见文本或 emoji"},
+                {"meme": "<file_stem>"},
+                {"search_meme": "<category>:<keywords>"},
             ],
         },
+        "conversion_examples": [
+            {
+                "bad": "在呢宝，怎么啦？",
+                "good": {"action": "REPLY", "items": [{"text": "在呢宝，怎么啦？"}]},
+            },
+            {
+                "bad": "诶嘿嘿～\n[表情: meme:affection_anime_girl_hug_chu]\n宝想吃啥？",
+                "good": {
+                    "action": "REACT",
+                    "items": [
+                        {"text": "诶嘿嘿～"},
+                        {"meme": "affection_anime_girl_hug_chu"},
+                        {"text": "宝想吃啥？"},
+                    ],
+                },
+            },
+            {
+                "bad": {"action": "REACT", "items": [{"type": "search_meme", "content": "search_meme:amused:laugh"}]},
+                "good": {"action": "REACT", "items": [{"search_meme": "amused:laugh"}]},
+            },
+        ],
     }
     return [
         *base_messages,
-        {"role": "assistant", "content": original_raw or "(空输出)"},
         {"role": "system", "content": json.dumps(repair_payload, ensure_ascii=False)},
+        {
+            "role": "system",
+            "content": (
+                "最终修复输出：只返回一个 JSON 对象。不要继续自然聊天，不要解释，不要 Markdown。"
+                "如果原输出是自然语言，就把它转成 items，不要丢成“嗯”。"
+            ),
+        },
     ]
 
 
@@ -280,7 +316,10 @@ def _validate_raw_shape(data: dict):
         if data.get("items") not in (None, []):
             raise ValueError(f"{action} 的 items 必须是 null 或空数组。")
         if data.get("text") not in (None, ""):
-            raise ValueError(f"{action} 不能包含 text。")
+            raise ValueError(f"{action} 不能包含顶层 text。")
+
+    if "text" in data and data.get("text") not in (None, ""):
+        raise ValueError("主协议不接受顶层 text；用户可见文本必须写在 items 数组里的 {\"text\":\"...\"}。")
 
     if "items" in data and data.get("items") is not None:
         items = data.get("items")
@@ -289,36 +328,42 @@ def _validate_raw_shape(data: dict):
         for index, item in enumerate(items):
             if not isinstance(item, dict):
                 raise ValueError(f"items[{index}] 必须是对象。")
-            item_type = item.get("type")
-            content = item.get("content")
-            if item_type not in {item.value for item in SendItemType}:
-                raise ValueError(f"items[{index}].type 无效: {item_type!r}。")
-            if not isinstance(content, str) or not content.strip():
-                raise ValueError(f"items[{index}].content 必须是非空字符串。")
-            content = content.strip()
-            if item_type == SendItemType.TEXT.value and any(prefix in content for prefix in PROTOCOL_PREFIXES):
-                raise ValueError(f"items[{index}] 是 text 时不能包含内部协议串。")
-            if item_type == SendItemType.EMOJI.value and not content.startswith("emoji:"):
-                raise ValueError(f"items[{index}] 是 emoji 时 content 必须使用 emoji:<emoji>。")
-            if item_type == SendItemType.MEME.value and not content.startswith("meme:"):
-                raise ValueError(f"items[{index}] 是 meme 时 content 必须使用 meme:<file_stem>。")
-            if item_type == SendItemType.SEARCH_MEME.value and not content.startswith("search_meme:"):
+            keys = list(item.keys())
+            item_keys = [key for key in keys if key in HARNESS_ITEM_KEYS]
+            if len(keys) != 1 or len(item_keys) != 1:
                 raise ValueError(
-                    f"items[{index}] 是 search_meme 时 content 必须使用 search_meme:<category>:<keywords>。"
+                    f"items[{index}] 必须且只能包含 text、meme、search_meme 其中一个字段。"
                 )
 
-    if "text" in data:
-        text = data.get("text")
-        if text is not None and not isinstance(text, (str, list)):
-            raise ValueError("text 必须是字符串、字符串数组或 null。")
-        if isinstance(text, list) and not all(isinstance(item, str) for item in text):
-            raise ValueError("text 数组只能包含字符串。")
+            item_key = item_keys[0]
+            value = item.get(item_key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"items[{index}].{item_key} 必须是非空字符串。")
+            value = value.strip()
+
+            if item_key == "text":
+                if any(prefix in value for prefix in PROTOCOL_PREFIXES):
+                    raise ValueError(f"items[{index}].text 不能包含内部协议串。")
+                continue
+
+            if item_key == "meme":
+                if value.startswith(MEME_PREFIX):
+                    raise ValueError(f"items[{index}].meme 只写 file_stem，不要带 meme: 前缀。")
+                if ":" in value or "/" in value or "\\" in value:
+                    raise ValueError(f"items[{index}].meme 必须是真实 file_stem，不要写路径或自然语言标签。")
+                continue
+
+            if item_key == "search_meme":
+                if value.startswith(SEARCH_MEME_PREFIX):
+                    raise ValueError(
+                        f"items[{index}].search_meme 只写 <category>:<keywords>，不要带 search_meme: 前缀。"
+                    )
+                if not _parse_search_meme_content(value):
+                    raise ValueError(f"items[{index}].search_meme 必须使用 <category>:<keywords>。")
 
 
 def _parse_search_meme_content(content: str) -> Optional[tuple[str, str]]:
-    if not content.startswith("search_meme:"):
-        return None
-    body = content[len("search_meme:"):]
+    body = _strip_optional_prefix((content or "").strip(), SEARCH_MEME_PREFIX)
     if ":" not in body:
         return None
     category, keywords = body.split(":", 1)
@@ -326,3 +371,7 @@ def _parse_search_meme_content(content: str) -> Optional[tuple[str, str]]:
     if not category:
         return None
     return category, keywords.strip()
+
+
+def _strip_optional_prefix(content: str, prefix: str) -> str:
+    return content[len(prefix):].strip() if content.startswith(prefix) else content.strip()

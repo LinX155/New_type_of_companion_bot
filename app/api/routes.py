@@ -620,7 +620,7 @@ def _record_decision_drop(ctx: ProcessContext, decision):
             session_id=ctx.snapshot.session_id,
             event_type="llm_decision",
             llm_raw_output=companion_graph.get_last_llm_raw_output() if companion_graph else None,
-            parsed_payload=_json_dumps(decision.model_dump(mode="json", exclude_none=True)),
+            parsed_payload=_json_dumps(decision.to_harness_payload(exclude_none=True)),
             action=decision.action.value,
             final_text=None,
             snapshot_id=ctx.snapshot.snapshot_id,
@@ -696,7 +696,7 @@ def _record_assistant_send(
             session_id=ctx.snapshot.session_id,
             event_type="llm_decision",
             llm_raw_output=companion_graph.get_last_llm_raw_output() if companion_graph else None,
-            parsed_payload=_json_dumps(decision.model_dump(mode="json", exclude_none=True)),
+            parsed_payload=_json_dumps(decision.to_harness_payload(exclude_none=True)),
             action=decision.action.value,
             final_text=item.content,
             item_type=item.type.value,
@@ -774,7 +774,7 @@ async def run_active_message_once(manual: bool = False) -> dict:
             memory_core_md=memory_manager.read_memory_core(),
             current_time=now.strftime("%H:%M"),
         )
-        raw_output = await llm_client.chat_completion(messages=messages, temperature=0.3, max_tokens=256)
+        raw_output = await llm_client.chat_completion(messages=messages, temperature=0.3)
         decision = parse_active_decision(raw_output)
 
         if not await event_gate.is_active_message_job_current(job_id):
@@ -846,7 +846,7 @@ def _record_active_message(session_id: str, job_id: str, raw_output: str, decisi
             session_id=session_id,
             event_type="active_message",
             llm_raw_output=raw_output,
-            parsed_payload=_json_dumps(decision.model_dump(mode="json", exclude_none=True)),
+            parsed_payload=_json_dumps(decision.to_harness_payload(exclude_none=True)),
             action=decision.action.value,
             final_text=routed.get("text"),
             item_type=first_item.type.value if first_item else None,

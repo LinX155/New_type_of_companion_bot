@@ -1,14 +1,12 @@
 import React, { useState } from 'react';
 import ChatWindow from './components/ChatWindow';
 import ApiConfig from './components/ApiConfig';
-import SoulEditor from './components/SoulEditor';
-import MemorySchedule from './components/MemorySchedule';
+import SettingsPanel from './components/SettingsPanel';
 import MemeManager from './components/MemeManager';
 
 const tabs = [
   { id: 'chat', label: '对话' },
   { id: 'memes', label: '表情包' },
-  { id: 'soul', label: 'SOUL' },
   { id: 'schedule', label: '其他配置' },
   { id: 'config', label: 'API配置' },
 ];
@@ -51,8 +49,7 @@ const App: React.FC = () => {
       <main style={{ flex: 1, overflow: 'auto', padding: '16px' }}>
         {activeTab === 'chat' && <ChatWindow />}
         {activeTab === 'memes' && <MemeManager />}
-        {activeTab === 'soul' && <SoulEditor />}
-        {activeTab === 'schedule' && <MemorySchedule />}
+        {activeTab === 'schedule' && <SettingsPanel />}
         {activeTab === 'config' && <ApiConfig />}
       </main>
     </div>

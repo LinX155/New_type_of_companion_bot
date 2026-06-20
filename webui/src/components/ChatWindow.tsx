@@ -237,9 +237,17 @@ const ChatWindow: React.FC = () => {
   };
 
   return (
-    <div style={{ display: 'flex', gap: '16px', height: '100%' }}>
+    <div style={{
+      display: 'grid',
+      gridTemplateColumns: showSystem ? 'minmax(520px, 1fr) 652px' : 'minmax(520px, 760px)',
+      gap: '16px',
+      height: '100%',
+      minHeight: 0,
+      alignItems: 'stretch',
+      overflow: 'auto',
+    }}>
       {/* Chat area */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '12px' }}>
+      <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: '12px', minHeight: 0 }}>
         {/* Messages */}
         <div style={{
           flex: 1,
@@ -402,7 +410,9 @@ const ChatWindow: React.FC = () => {
 
       {/* Debug status panel */}
       {showSystem && (
-        <DebugStatusBar status={status} />
+        <div style={{ minWidth: 0, minHeight: 0 }}>
+          <DebugStatusBar status={status} />
+        </div>
       )}
     </div>
   );

@@ -30,7 +30,7 @@ const SoulEditor: React.FC = () => {
   };
 
   return (
-    <div style={{ maxWidth: '800px', background: '#fff', padding: '24px', borderRadius: '8px' }}>
+    <div style={{ width: '100%', boxSizing: 'border-box', background: '#fff', padding: '24px', borderRadius: '8px' }}>
       <h2 style={{ marginBottom: '16px' }}>SOUL.md 配置</h2>
       <p style={{ color: '#7f8c8d', fontSize: '13px', marginBottom: '16px' }}>
         定义角色的稳定偏好、边界和说话习惯。支持 Markdown 格式。
@@ -41,6 +41,7 @@ const SoulEditor: React.FC = () => {
         style={{
           width: '100%',
           minHeight: '400px',
+          boxSizing: 'border-box',
           padding: '12px',
           border: '1px solid #ddd',
           borderRadius: '6px',

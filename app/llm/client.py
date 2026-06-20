@@ -30,15 +30,16 @@ class LLMClient:
         self,
         messages: List[Dict[str, Any]],
         temperature: float,
-        max_tokens: int,
+        max_tokens: Optional[int],
         stream: bool,
     ) -> dict:
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": max_tokens,
             "stream": stream,
         }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         if self.thinking_enabled:
             # 思考模式：reasoning 模型通常要求省略 temperature，并用 thinking 字段开启
             kwargs["extra_body"] = {
@@ -53,7 +54,7 @@ class LLMClient:
         self,
         messages: List[Dict[str, Any]],
         temperature: float = 0.7,
-        max_tokens: int = 1024,
+        max_tokens: Optional[int] = None,
         stream: bool = False,
     ) -> str:
         client = self._get_client()
@@ -76,7 +77,7 @@ class LLMClient:
         self,
         messages: List[Dict[str, Any]],
         temperature: float = 0.7,
-        max_tokens: int = 1024,
+        max_tokens: Optional[int] = None,
     ) -> AsyncGenerator[str, None]:
         client = self._get_client()
         response = await client.chat.completions.create(
