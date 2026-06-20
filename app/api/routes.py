@@ -198,6 +198,7 @@ async def on_decision(ctx: ProcessContext):
     try:
         await _emit_llm_started()
         decision = await companion_graph.run(ctx)
+        _record_prompt_cache_debug(ctx, companion_graph.get_prompt_observability())
     except Exception as e:
         event_gate.mark_job_dropped(ctx.job_id)
         _record_llm_error(ctx, str(e))
@@ -224,7 +225,7 @@ async def on_decision(ctx: ProcessContext):
     items = list(result.get("items") or [])
 
     if result["visible"] and items:
-        if not await _wait_until_user_not_composing(ctx):
+        if _requires_user_composing_gate(items) and not await _wait_until_user_not_composing(ctx):
             return
         cleared, send_group_version = await event_gate.clear_buffer_after_visible_send(ctx.snapshot.buffer_version)
         if not cleared:
@@ -334,6 +335,10 @@ async def on_decision(ctx: ProcessContext):
 
     companion_graph.commit_sent_items(ctx, sent_items)
     event_gate.mark_job_sent(ctx.job_id)
+
+
+def _requires_user_composing_gate(items: list[SendItem]) -> bool:
+    return any(item.type == SendItemType.TEXT for item in items)
 
 
 async def _emit_message(data: dict):
@@ -652,6 +657,29 @@ def _record_job_state(ctx: ProcessContext, status: str, payload: Optional[dict] 
         db.close()
 
 
+def _record_prompt_cache_debug(ctx: ProcessContext, payload: Optional[dict] = None):
+    if not payload:
+        return
+    db = next(get_db())
+    try:
+        log = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id=ctx.snapshot.session_id,
+            event_type="prompt_cache_debug",
+            raw_payload=_json_dumps(payload),
+            snapshot_id=ctx.snapshot.snapshot_id,
+            buffer_version=ctx.snapshot.buffer_version,
+            job_id=ctx.job_id,
+            status="debug",
+        )
+        db.add(log)
+        db.commit()
+    except Exception as e:
+        print(f"DB error: {e}")
+    finally:
+        db.close()
+
+
 def _record_assistant_send(
     ctx: ProcessContext,
     decision,
@@ -784,8 +812,7 @@ async def run_active_message_once(manual: bool = False) -> dict:
         await event_gate.finish_active_message_job(job_id, "sent")
 
         if companion_graph and routed["text"]:
-            companion_graph._conversation_history.append({"role": "assistant", "text": routed["text"]})
-            companion_graph._conversation_history = companion_graph._conversation_history[-60:]
+            companion_graph.commit_external_assistant_text(routed["text"])
 
         await _emit_message({
             "type": "assistant_message",
@@ -1260,7 +1287,7 @@ async def clear_conversation():
         event_gate._last_send_meta = None
         event_gate.clear_user_composing()
     if companion_graph:
-        companion_graph._conversation_history.clear()
+        companion_graph.clear_prompt_state()
 
     db = next(get_db())
     try:

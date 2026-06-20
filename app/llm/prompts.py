@@ -2,6 +2,9 @@ import json
 from datetime import datetime
 
 
+WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
 MEME_CATEGORIES_TEXT = """amused: 感到有趣、被逗乐、调侃
 distress: 悲伤、委屈、挫败、请求怜悯
 observing: 关注、好奇、围观、暗中观察
@@ -170,12 +173,14 @@ JSON schema:
 
 
 ## 运行上下文
-当前运行上下文:
-- 当前时间: {current_time}
-- 日期: {today_date}
-- 聊天状态: {chat_status}
-- 当天用户消息序号: {msg_index}
-- 距离上一条用户消息: {last_message_age}
+- 每轮主对话都会在靠近本轮用户输入的位置附带一个 runtime_context 对象。
+- runtime_context 记录本轮固化的聊天状态、当天用户消息序号、距离上一条用户消息的时间、当前本地时间。
+- 旧 runtime_context 是历史快照，不要把旧时间当成当前时间；判断“现在”时使用离本轮用户输入最近的 runtime_context。
+
+## 时间戳系统
+- runtime_context.current_timestamp 表示你看到本轮消息时的本地时间。
+- current_timestamp 只用于判断早晚、间隔、语境和说话方式；不要机械复述时间，也不要像播报系统信息。
+- 当用户问时间、提到今天/明天/昨晚/刚才/等会儿，或你的回复需要考虑作息和现实时间时，可以自然使用最新 runtime_context 中的时间。
 
 ## 输出示例
 当前聊天状态: COLD
@@ -243,6 +248,29 @@ JSON schema:
 """
 
 
+FINAL_ACTION_OUTPUT_REMINDER = """## 最终输出前强提醒
+这条系统消息离你的输出最近，优先级高于聊天习惯和自然语言冲动。
+你接下来返回给 API 的内容不是直接发给用户的自然语言，而是给本地 Action Harness 的最终 decision。
+第一个字符必须是 {，最后一个非空字符必须是 }。
+只输出一个 JSON 对象；不要 Markdown，不要解释，不要前后缀，不要连续输出多个 JSON。
+主协议只使用 action 和 items；不要主动输出 text 字段。
+用户可见回复只能写在 items 数组里的 content 中，不能写在 JSON 外面。
+如果本轮适合表情包，优先使用 REACT + search_meme/meme item；不要用纯文字或单个 emoji 逃避表情包。
+"""
+
+
+def build_stable_prompt_hash_source() -> str:
+    return json.dumps(
+        {
+            "system_prompt_template": SYSTEM_PROMPT_TEMPLATE,
+            "meme_categories": MEME_CATEGORIES_TEXT,
+            "final_action_output_reminder": FINAL_ACTION_OUTPUT_REMINDER,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
 def build_system_prompt(
     soul_md: str = "",
     memory_core_md: str = "",
@@ -271,37 +299,89 @@ def build_system_prompt(
         memory_core_md=rendered_memory_core,
         today_memory_md=rendered_today_memory,
         tomorrow_topics_md=rendered_tomorrow_topics,
-        current_time=now.strftime("%H:%M"),
         today_date=now.strftime("%Y-%m-%d"),
-        chat_status=chat_status,
-        msg_index=msg_index,
-        last_message_age=last_message_age,
     )
+
+
+def build_current_timestamp_payload(now: datetime | None = None) -> dict:
+    now = now or datetime.now()
+    return {
+        "current_timestamp": {
+            "local": f"{now.strftime('%Y-%m-%d %H:%M')} {WEEKDAY_NAMES[now.weekday()]}",
+        }
+    }
+
+
+def build_runtime_context_payload(
+    chat_status: str = "COLD",
+    msg_index: int = 0,
+    last_message_age: str | None = "unknown",
+    cold_start_timestamp: str | None = None,
+    now: datetime | None = None,
+) -> dict:
+    payload = {
+        "runtime_context": {
+            **build_current_timestamp_payload(now),
+            "chat_status": chat_status,
+            "msg_index_today": msg_index,
+            "last_user_message_age": last_message_age or "unknown",
+        }
+    }
+    if cold_start_timestamp:
+        payload["runtime_context"]["cold_start_timestamp"] = cold_start_timestamp
+    return payload
+
+
+def build_runtime_context_message(
+    chat_status: str = "COLD",
+    msg_index: int = 0,
+    last_message_age: str | None = "unknown",
+    cold_start_timestamp: str | None = None,
+    now: datetime | None = None,
+) -> dict:
+    return {
+        "role": "system",
+        "content": json.dumps(
+            build_runtime_context_payload(
+                chat_status=chat_status,
+                msg_index=msg_index,
+                last_message_age=last_message_age,
+                cold_start_timestamp=cold_start_timestamp,
+                now=now,
+            ),
+            ensure_ascii=False,
+        ),
+    }
 
 
 def build_messages(
     system_prompt: str,
     history: list,
     cold_start_meta: dict = None,
+    runtime_context: dict | None = None,
 ) -> list:
     messages = [{"role": "system", "content": system_prompt}]
-
-    if cold_start_meta:
-        meta_text = {
-            "cold_start_meta": {
-                "timestamp": cold_start_meta.get("timestamp", ""),
-                "last_user_message_age": cold_start_meta.get("last_user_message_age", "unknown"),
-                "msg_index": cold_start_meta.get("msg_index", 0),
-                "status": cold_start_meta.get("status", "COLD"),
-            }
-        }
-        messages.append({"role": "system", "content": json.dumps(meta_text, ensure_ascii=False)})
 
     for item in history:
         role = item.get("role", "user")
         content = item.get("text", "")
         if content:
             messages.append({"role": role, "content": content})
+
+    if runtime_context:
+        messages.append({"role": "system", "content": json.dumps(runtime_context, ensure_ascii=False)})
+    elif cold_start_meta:
+        messages.append(
+            build_runtime_context_message(
+                chat_status=cold_start_meta.get("status", "COLD"),
+                msg_index=cold_start_meta.get("msg_index", 0),
+                last_message_age=cold_start_meta.get("last_user_message_age", "unknown"),
+                cold_start_timestamp=cold_start_meta.get("timestamp", ""),
+            )
+        )
+    else:
+        messages.append(build_runtime_context_message())
+    messages.append({"role": "system", "content": FINAL_ACTION_OUTPUT_REMINDER})
 
     return messages
 

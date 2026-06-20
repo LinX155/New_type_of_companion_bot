@@ -1,3 +1,5 @@
+import hashlib
+import json
 from typing import Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -11,16 +13,26 @@ from .protocol import (
     validate_executable,
 )
 from .state import ChatStatus
+from ..active.messages import ACTIVE_SECTIONS, expire_stale_candidates, parse_active_candidates
 from ..llm.client import LLMClient
 from ..llm.prompts import (
+    FINAL_ACTION_OUTPUT_REMINDER,
+    build_stable_prompt_hash_source,
     build_system_prompt,
-    build_messages,
+    build_runtime_context_message,
     build_meme_search_messages,
 )
 from ..memory.files import MemoryFileManager
 from ..memes.catalog import MemeCatalog
 from ..memes.search import MemeSearch
 from ..memes.renderer import MemeRenderer
+
+PROMPT_VIEW_LIMITS = {
+    "soul": 12000,
+    "memory_core": 8000,
+    "today_memory": 4000,
+    "tomorrow_topics": 4000,
+}
 
 
 class GraphState(TypedDict, total=False):
@@ -42,6 +54,12 @@ class CompanionGraph:
         self.meme_search = MemeSearch(meme_catalog)
         self.meme_renderer = MemeRenderer(meme_catalog)
         self._conversation_history: list = []
+        self._prompt_transcript: list[dict] = []
+        self._prompt_event_ids: set[str] = set()
+        self._last_prompt_messages: list[dict] = []
+        self._last_prompt_observability: dict = {}
+        self._prompt_block_hashes: dict = {}
+        self._last_runtime_block_hash: Optional[str] = None
         self._workflow = self._build_workflow()
         # Debug / observability fields for the MVP status bar
         self._last_llm_raw_output: Optional[str] = None
@@ -95,36 +113,16 @@ class CompanionGraph:
     async def _build_context(self, state: GraphState) -> GraphState:
         ctx = state["ctx"]
         snapshot = ctx.snapshot
-        include_profile = snapshot.status.value == "COLD"
 
-        system_prompt = build_system_prompt(
-            soul_md=self.memory.read_soul() if include_profile else "",
-            memory_core_md=self.memory.read_memory_core() if include_profile else "",
-            today_memory_md=self.memory.read_today_memory() if include_profile else "",
-            tomorrow_topics_md=self.memory.read_tomorrow_topics() if include_profile else "",
-            chat_status=snapshot.status.value,
-            msg_index=snapshot.cold_start_meta.msg_index if snapshot.cold_start_meta else 0,
-            last_message_age=snapshot.cold_start_meta.last_user_message_age if snapshot.cold_start_meta else "unknown",
-            include_profile=include_profile,
-        )
+        if not self._prompt_transcript:
+            self._initialize_prompt_transcript(snapshot)
 
-        pending_history = []
-        for evt in snapshot.events:
-            text = evt.get("text")
-            event_type = evt.get("event_type", "")
-            if not text and event_type.endswith("image"):
-                text = "[图片]"
-            if not text and event_type.endswith("sticker"):
-                text = "[表情]"
-            if text:
-                pending_history.append({"role": "user", "text": text})
+        self._append_runtime_context(ctx)
+        self._append_snapshot_events(snapshot.events)
+        self._prompt_transcript.append({"role": "system", "content": FINAL_ACTION_OUTPUT_REMINDER})
 
-        history = [*self._conversation_history[-30:], *pending_history]
-        messages = build_messages(
-            system_prompt=system_prompt,
-            history=history,
-            cold_start_meta=snapshot.cold_start_meta.model_dump() if snapshot.cold_start_meta else None,
-        )
+        messages = [dict(item) for item in self._prompt_transcript]
+        self._record_prompt_observability(messages)
         return {**state, "messages": messages}
 
     async def _call_llm_for_decision(self, state: GraphState) -> GraphState:
@@ -133,6 +131,7 @@ class CompanionGraph:
             temperature=0.3,
             max_tokens=512,
         )
+        self._record_prompt_usage()
         self._record_llm_raw_output(raw_output)
         decision, parse_status = await self._parse_decision_with_harness(
             ctx=state["ctx"],
@@ -445,14 +444,30 @@ class CompanionGraph:
             return
 
         for evt in ctx.snapshot.events:
-            text = evt.get("text")
+            text = self._event_get(evt, "text")
             if text:
                 self._conversation_history.append({"role": "user", "text": text})
 
         for item in items:
-            self._conversation_history.append({"role": "assistant", "text": self._history_text_for_item(item)})
+            text = self._history_text_for_item(item)
+            self._conversation_history.append({"role": "assistant", "text": text})
+            self._append_assistant_text_to_prompt(text)
 
-        self._conversation_history = self._conversation_history[-60:]
+    def commit_external_assistant_text(self, text: str):
+        if not text:
+            return
+        self._conversation_history.append({"role": "assistant", "text": text})
+        if self._prompt_transcript:
+            self._append_assistant_text_to_prompt(text)
+
+    def clear_prompt_state(self):
+        self._conversation_history.clear()
+        self._prompt_transcript.clear()
+        self._prompt_event_ids.clear()
+        self._last_prompt_messages.clear()
+        self._last_prompt_observability.clear()
+        self._prompt_block_hashes.clear()
+        self._last_runtime_block_hash = None
 
     def _history_text_for_item(self, item: SendItem) -> str:
         if item.type == SendItemType.TEXT:
@@ -468,9 +483,9 @@ class CompanionGraph:
 
     def _apply_protocol_guards(self, ctx: ProcessContext, decision: ActionDecision) -> ActionDecision:
         pending_text = "\n".join(
-            str(evt.get("text") or "")
+            str(self._event_get(evt, "text") or "")
             for evt in ctx.snapshot.events
-            if evt.get("text")
+            if self._event_get(evt, "text")
         )
         if self._requires_meme_response(pending_text):
             has_react_item = any(
@@ -557,6 +572,9 @@ class CompanionGraph:
     def get_history(self) -> list:
         return list(self._conversation_history)
 
+    def get_prompt_observability(self) -> dict:
+        return dict(self._last_prompt_observability)
+
     # Debug / observability getters for the MVP status bar
     def get_last_llm_raw_output(self) -> Optional[str]:
         return self._last_llm_raw_output
@@ -564,7 +582,7 @@ class CompanionGraph:
     def get_llm_raw_output_history(self) -> Optional[str]:
         if not self._llm_raw_output_history:
             return None
-        return "\n----\n".join(self._llm_raw_output_history)
+        return "\n------------------------------\n".join(self._llm_raw_output_history)
 
     def get_last_parsed_decision(self) -> dict:
         return {
@@ -589,4 +607,214 @@ class CompanionGraph:
             "parse_status": self._last_parse_status,
             "last_search_meme": self._last_search_meme,
             "last_render_status": self._last_render_status,
+            "prompt_cache": self.get_prompt_observability(),
         }
+
+    def _initialize_prompt_transcript(self, snapshot):
+        include_profile = snapshot.status.value == "COLD"
+        profile_views = self._build_profile_prompt_views(include_profile)
+        system_prompt = build_system_prompt(
+            soul_md=profile_views["soul"],
+            memory_core_md=profile_views["memory_core"],
+            today_memory_md=profile_views["today_memory"],
+            tomorrow_topics_md=profile_views["tomorrow_topics"],
+            include_profile=include_profile,
+        )
+        self._prompt_transcript = [{"role": "system", "content": system_prompt}]
+        self._prompt_block_hashes = {
+            "stable_block_hash": self._hash_text(build_stable_prompt_hash_source()),
+            "profile_block_hash": self._hash_text(
+                json.dumps(profile_views, ensure_ascii=False, sort_keys=True)
+            ),
+            "system_prompt_hash": self._hash_text(system_prompt),
+        }
+        for item in self._conversation_history:
+            role = item.get("role", "user")
+            content = item.get("text", "")
+            if content:
+                self._prompt_transcript.append({"role": role, "content": content})
+
+    def _build_profile_prompt_views(self, include_profile: bool) -> dict[str, str]:
+        if not include_profile:
+            return {
+                "soul": "",
+                "memory_core": "",
+                "today_memory": "",
+                "tomorrow_topics": "",
+            }
+
+        return {
+            "soul": self._markdown_prompt_view(
+                self.memory.read_soul(),
+                PROMPT_VIEW_LIMITS["soul"],
+                "SOUL.md",
+            ),
+            "memory_core": self._markdown_prompt_view(
+                self.memory.read_memory_core(),
+                PROMPT_VIEW_LIMITS["memory_core"],
+                "MEMORY_CORE.md",
+            ),
+            "today_memory": self._markdown_prompt_view(
+                self.memory.read_today_memory(),
+                PROMPT_VIEW_LIMITS["today_memory"],
+                "dm/YYYY-MM-DD.md",
+            ),
+            "tomorrow_topics": self._tomorrow_topics_prompt_view(
+                self.memory.read_tomorrow_topics(),
+                PROMPT_VIEW_LIMITS["tomorrow_topics"],
+            ),
+        }
+
+    def _markdown_prompt_view(self, markdown: str, max_chars: int, source_name: str) -> str:
+        text = (markdown or "").strip()
+        if len(text) <= max_chars:
+            return text
+
+        headers = [line.rstrip() for line in text.splitlines() if line.lstrip().startswith("#")]
+        header_text = "\n".join(headers)
+        marker = f"\n\n[系统提示：{source_name} 已裁剪为 prompt 视图，仅保留标题和最近片段。]\n\n"
+        reserved = len(header_text) + len(marker)
+        tail_chars = max(0, max_chars - reserved)
+        if tail_chars <= 0:
+            return (header_text or text[:max_chars]).strip()[:max_chars]
+        return f"{header_text}{marker}{text[-tail_chars:]}".strip()
+
+    def _tomorrow_topics_prompt_view(self, markdown: str, max_chars: int) -> str:
+        markdown, _ = expire_stale_candidates(markdown or "")
+        candidates = parse_active_candidates(markdown or "")
+        pending_by_section = {section: [] for section in ACTIVE_SECTIONS}
+        for candidate in candidates:
+            if candidate.status == "pending":
+                pending_by_section.setdefault(candidate.section, []).append(candidate.text)
+
+        lines = ["# 明日话题"]
+        has_pending = False
+        for section in ACTIVE_SECTIONS:
+            lines.extend(["", f"## {section}"])
+            pending = pending_by_section.get(section) or []
+            if pending:
+                has_pending = True
+                lines.extend(f"- [pending] {text}" for text in pending)
+
+        if not has_pending:
+            lines.extend(["", "（无待处理候选）"])
+
+        return self._markdown_prompt_view(
+            "\n".join(lines),
+            max_chars,
+            "TOMORROW_TOPICS.md",
+        )
+
+    def _append_runtime_context(self, ctx: ProcessContext):
+        snapshot = ctx.snapshot
+        cold_meta = snapshot.cold_start_meta
+        runtime_message = build_runtime_context_message(
+            chat_status=snapshot.status.value,
+            msg_index=ctx.gate.state.msg_index_today,
+            last_message_age=(
+                cold_meta.last_user_message_age
+                if cold_meta
+                else ctx.gate._get_last_message_age() or "unknown"
+            ),
+            cold_start_timestamp=cold_meta.timestamp if cold_meta else None,
+        )
+        self._last_runtime_block_hash = self._hash_text(runtime_message["content"])
+        self._prompt_transcript.append(runtime_message)
+
+    def _append_snapshot_events(self, events: list[dict]):
+        for evt in events:
+            event_id = self._event_get(evt, "event_id") or self._event_get(evt, "id")
+            if event_id and event_id in self._prompt_event_ids:
+                continue
+
+            text = self._prompt_text_for_event(evt)
+            if not text:
+                continue
+
+            self._prompt_transcript.append({"role": "user", "content": text})
+            if event_id:
+                self._prompt_event_ids.add(event_id)
+
+    def _prompt_text_for_event(self, evt: dict) -> str:
+        text = self._event_get(evt, "text")
+        event_type = (
+            self._event_get(evt, "event_type")
+            or self._event_get(evt, "kind")
+            or self._event_get(evt, "type")
+            or ""
+        )
+        if hasattr(event_type, "value"):
+            event_type = event_type.value
+        event_type = str(event_type or "")
+        if not text and event_type.endswith("image"):
+            text = "[图片]"
+        if not text and event_type.endswith("sticker"):
+            text = "[表情]"
+        return text or ""
+
+    def _event_get(self, evt, key: str, default=None):
+        if isinstance(evt, dict):
+            if key in evt:
+                return evt.get(key, default)
+            payload = evt.get("payload")
+            if isinstance(payload, dict) and key in payload:
+                return payload.get(key, default)
+            return default
+        return getattr(evt, key, default)
+
+    def _append_assistant_text_to_prompt(self, text: str):
+        if text:
+            self._prompt_transcript.append({"role": "assistant", "content": text})
+
+    def _record_prompt_observability(self, messages: list[dict]):
+        previous_messages = [dict(item) for item in self._last_prompt_messages]
+        append_only = self._is_messages_prefix(previous_messages, messages) if previous_messages else True
+        previous_hash = self._messages_hash(previous_messages) if previous_messages else None
+        full_hash = self._messages_hash(messages)
+        serialized = self._messages_json(messages)
+        observability = {
+            "message_count": len(messages),
+            "previous_message_count": len(previous_messages),
+            "full_request_hash": full_hash,
+            "previous_request_hash": previous_hash,
+            **self._prompt_block_hashes,
+            "runtime_block_hash": self._last_runtime_block_hash,
+            "append_only_check": append_only,
+            "prefix_rebuild_reason": None if append_only else "previous_request_not_prefix",
+            "char_count": len(serialized),
+            "estimated_tokens": max(1, len(serialized) // 4),
+            "estimated_prompt_tokens": max(1, len(serialized) // 4),
+        }
+        self._last_prompt_messages = [dict(item) for item in messages]
+        self._last_prompt_observability = observability
+        print(f"[prompt_cache_debug] {json.dumps(observability, ensure_ascii=False)}")
+
+    def _record_prompt_usage(self):
+        usage = self.llm.get_last_usage() if hasattr(self.llm, "get_last_usage") else None
+        if not usage:
+            return
+        self._last_prompt_observability["llm_usage"] = usage
+        cached_tokens = self._extract_cached_tokens(usage)
+        if cached_tokens is not None:
+            self._last_prompt_observability["cached_tokens"] = cached_tokens
+
+    def _extract_cached_tokens(self, usage: dict) -> Optional[int]:
+        details = usage.get("prompt_tokens_details") or usage.get("input_token_details") or {}
+        cached = details.get("cached_tokens") or details.get("cache_read_input_tokens")
+        if isinstance(cached, int):
+            return cached
+        return None
+
+    def _messages_hash(self, messages: list[dict]) -> str:
+        return hashlib.sha256(self._messages_json(messages).encode("utf-8")).hexdigest()
+
+    def _messages_json(self, messages: list[dict]) -> str:
+        return json.dumps(messages, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _is_messages_prefix(self, previous: list[dict], current: list[dict]) -> bool:
+        if len(previous) > len(current):
+            return False
+        return current[: len(previous)] == previous
+
+    def _hash_text(self, text: str) -> str:
+        return hashlib.sha256((text or "").encode("utf-8")).hexdigest()

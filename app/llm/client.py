@@ -16,6 +16,7 @@ class LLMClient:
         self.model = model or os.getenv("LLM_MODEL", "gpt-4o-mini")
         self.thinking_enabled = thinking_enabled
         self._client: Optional[AsyncOpenAI] = None
+        self._last_usage: Optional[dict] = None
 
     def _get_client(self) -> AsyncOpenAI:
         if self._client is None:
@@ -61,12 +62,14 @@ class LLMClient:
         )
 
         if stream:
+            self._last_usage = None
             content = ""
             async for chunk in response:
                 if chunk.choices and chunk.choices[0].delta.content:
                     content += chunk.choices[0].delta.content
             return content
 
+        self._last_usage = self._serialize_usage(getattr(response, "usage", None))
         return response.choices[0].message.content or ""
 
     async def chat_completion_stream(
@@ -83,6 +86,35 @@ class LLMClient:
         async for chunk in response:
             if chunk.choices and chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
+        self._last_usage = None
+
+    def get_last_usage(self) -> Optional[dict]:
+        return self._last_usage
+
+    def _serialize_usage(self, usage: Any) -> Optional[dict]:
+        if usage is None:
+            return None
+        if hasattr(usage, "model_dump"):
+            return usage.model_dump()
+        if isinstance(usage, dict):
+            return usage
+        result = {}
+        for key in (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "prompt_tokens_details",
+            "completion_tokens_details",
+            "input_tokens",
+            "output_tokens",
+            "input_token_details",
+        ):
+            if hasattr(usage, key):
+                value = getattr(usage, key)
+                if hasattr(value, "model_dump"):
+                    value = value.model_dump()
+                result[key] = value
+        return result or None
 
     def update_config(
         self,
