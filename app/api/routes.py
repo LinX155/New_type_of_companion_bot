@@ -1163,7 +1163,7 @@ async def get_status():
 
     # LLM 决策结果
     llm_panel = {
-        "last_llm_raw": companion_graph.get_last_llm_raw_output() if companion_graph else None,
+        "last_llm_raw": companion_graph.get_llm_raw_output_history() if companion_graph else None,
         "parse_status": parsed.get("parse_status"),
         "decision_result": last_result,
         "last_send": event_gate.get_last_send_meta(),

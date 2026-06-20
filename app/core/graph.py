@@ -45,12 +45,18 @@ class CompanionGraph:
         self._workflow = self._build_workflow()
         # Debug / observability fields for the MVP status bar
         self._last_llm_raw_output: Optional[str] = None
+        self._llm_raw_output_history: list[str] = []
         self._last_parsed_action: Optional[str] = None
         self._last_parsed_text: Optional[str | list[str]] = None
         self._last_parsed_items: Optional[list[dict]] = None
         self._last_parse_status: str = "ok"
         self._last_search_meme: Optional[str] = None
         self._last_render_status: Optional[str] = None
+
+    def _record_llm_raw_output(self, raw_output: str):
+        self._last_llm_raw_output = raw_output
+        if raw_output is not None:
+            self._llm_raw_output_history.append(raw_output)
 
     def _build_workflow(self):
         graph = StateGraph(GraphState)
@@ -127,7 +133,7 @@ class CompanionGraph:
             temperature=0.3,
             max_tokens=512,
         )
-        self._last_llm_raw_output = raw_output
+        self._record_llm_raw_output(raw_output)
         decision, parse_status = await self._parse_decision_with_harness(
             ctx=state["ctx"],
             base_messages=state["messages"],
@@ -187,6 +193,7 @@ class CompanionGraph:
                 temperature=0.2,
                 max_tokens=512,
             )
+            self._record_llm_raw_output(repaired_raw)
         except Exception as exc:
             return ProtocolResult(status="repair_failed", errors=[str(exc)])
 
@@ -258,6 +265,7 @@ class CompanionGraph:
             temperature=0.2,
             max_tokens=512,
         )
+        self._record_llm_raw_output(raw_output)
         second_result = parse_and_validate_raw_decision(raw_output)
         if not second_result.ok or not second_result.decision:
             fallback_decision = self._replace_search_items_with_first_candidates(decision, search_results)
@@ -414,6 +422,7 @@ class CompanionGraph:
                 temperature=0.2,
                 max_tokens=512,
             )
+            self._record_llm_raw_output(raw_output)
             result = parse_and_validate_raw_decision(raw_output)
             if result.ok and result.decision:
                 self._last_parse_status = "repair_ok"
@@ -552,6 +561,11 @@ class CompanionGraph:
     def get_last_llm_raw_output(self) -> Optional[str]:
         return self._last_llm_raw_output
 
+    def get_llm_raw_output_history(self) -> Optional[str]:
+        if not self._llm_raw_output_history:
+            return None
+        return "\n----\n".join(self._llm_raw_output_history)
+
     def get_last_parsed_decision(self) -> dict:
         return {
             "action": self._last_parsed_action,
@@ -568,7 +582,7 @@ class CompanionGraph:
 
     def get_last_llm_observability(self) -> dict:
         return {
-            "last_llm_raw": self._last_llm_raw_output,
+            "last_llm_raw": self.get_llm_raw_output_history(),
             "last_parsed_action": self._last_parsed_action,
             "last_parsed_text": self._last_parsed_text,
             "last_parsed_items": self._last_parsed_items,
