@@ -7,6 +7,7 @@ from app.core.decisions import Action, ActionDecision, SendItem, SendItemType
 from app.core.graph import CompanionGraph
 from app.core.protocol import build_repair_messages, parse_and_validate_raw_decision
 from app.core.state import ChatStatus, ColdStartMeta, ConversationSnapshot
+from app.llm.client import LLMClient, LLMResponseEnvelope
 from app.llm.prompts import build_meme_search_messages
 
 
@@ -27,6 +28,67 @@ class FakeJsonRepairLLM(FakeLLM):
     async def chat_completion(self, messages, temperature=0.7, stream=False):
         self.calls += 1
         return '{"action":"REACT","items":[{"search_meme":"amused:laugh"}]}'
+
+
+class FakeReasoningEnvelopeLLM(FakeLLM):
+    def __init__(self):
+        self.raw = '{"action":"REPLY","items":[{"text":"我在呢"}]}'
+
+    async def chat_completion_envelope(self, messages, temperature=0.7):
+        return LLMResponseEnvelope(
+            assistant_message={
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": self.raw,
+            },
+            content=None,
+            reasoning_content=self.raw,
+            usage={
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "completion_tokens_details": {"reasoning_tokens": 18},
+                "prompt_tokens_details": {"cached_tokens": 64},
+            },
+            raw_response_meta={"finish_reason": "stop", "model": "fake-reasoning"},
+        )
+
+
+class FakeRepairEnvelopeLLM(FakeLLM):
+    def __init__(self):
+        self.calls = 0
+        self.requests = []
+
+    async def chat_completion_envelope(self, messages, temperature=0.7):
+        self.calls += 1
+        self.requests.append([dict(item) for item in messages])
+        if self.calls == 1:
+            raw = '{"action":"REACT","items":[{"type":"search_meme","content":"search_meme:amused:laugh"}]}'
+        else:
+            raw = '{"action":"REPLY","items":[{"text":"修好了"}]}'
+        return LLMResponseEnvelope(
+            assistant_message={"role": "assistant", "content": raw},
+            content=raw,
+        )
+
+
+class FakeEmptyEnvelopeLLM(FakeLLM):
+    async def chat_completion_envelope(self, messages, temperature=0.7):
+        return LLMResponseEnvelope(
+            assistant_message={"role": "assistant", "content": None},
+            content=None,
+            reasoning_content=None,
+        )
+
+
+class FakeIdentityEnvelopeLLM(FakeLLM):
+    def __init__(self, identity="model-a"):
+        self.identity = identity
+
+    def get_transcript_identity(self):
+        return self.identity
+
+    def get_cache_debug(self):
+        return {"cache_session_id": f"cache-{self.identity}"}
 
 
 class FakeMemory:
@@ -99,6 +161,10 @@ class PromptAppendOnlyTest(unittest.TestCase):
             )
             cold_state = await graph._build_context({"ctx": cold_ctx})
             cold_messages = cold_state["messages"]
+            graph._append_provider_assistant_message({
+                "role": "assistant",
+                "content": '{"action":"ENTER_CHAT","items":[{"text":"在。怎么了？"}]}',
+            })
 
             graph.commit_sent_items(
                 cold_ctx,
@@ -128,10 +194,295 @@ class PromptAppendOnlyTest(unittest.TestCase):
             self.assertEqual(hot_messages[: len(cold_messages)], cold_messages)
             self.assertTrue(graph.get_prompt_observability()["append_only_check"])
             self.assertEqual(self._count_content(hot_messages, "你在吗"), 1)
-            self.assertEqual(self._count_content(hot_messages, "在。怎么了？"), 1)
+            self.assertEqual(self._count_content(hot_messages, "在。怎么了？"), 0)
+            self.assertTrue(any(
+                item.get("role") == "assistant" and "在。怎么了？" in str(item.get("content") or "")
+                for item in hot_messages
+            ))
             self.assertEqual(self._count_content(hot_messages, "想聊聊"), 1)
 
         asyncio.run(scenario())
+
+    def test_hot_turn_system_reminder_is_system_message_near_current_input(self):
+        async def scenario():
+            graph = CompanionGraph(FakeLLM(), FakeMemory(), FakeMemeCatalog())
+            gate = self._gate(msg_index=1, age="just now")
+            hot_ctx = SimpleNamespace(
+                gate=gate,
+                snapshot=ConversationSnapshot(
+                    snapshot_id=1,
+                    buffer_version=1,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e1",
+                            "event_type": "message.text",
+                            "text": "今天有点困",
+                        }
+                    ],
+                ),
+            )
+            hot_state = await graph._build_context({"ctx": hot_ctx})
+            hot_messages = hot_state["messages"]
+
+            reminder_indexes = [
+                index
+                for index, item in enumerate(hot_messages)
+                if "HOT_TURN_REMINDER" in str(item.get("content") or "")
+            ]
+            self.assertEqual(len(reminder_indexes), 1)
+            reminder_index = reminder_indexes[0]
+            self.assertEqual(hot_messages[reminder_index]["role"], "system")
+            reminder_payload = json.loads(hot_messages[reminder_index]["content"])
+            self.assertEqual(reminder_payload["message_type"], "SYSTEM_REMINDER")
+            self.assertEqual(reminder_payload["visibility"], "internal_only_not_visible_to_user")
+            self.assertTrue(any("不要每轮都用问句结尾" in rule for rule in reminder_payload["rules"]))
+            self.assertTrue(any("Action Harness JSON" in rule for rule in reminder_payload["rules"]))
+
+            user_index = next(
+                index for index, item in enumerate(hot_messages)
+                if item.get("role") == "user" and item.get("content") == "今天有点困"
+            )
+            final_index = next(
+                index for index, item in enumerate(hot_messages)
+                if "最终输出前强提醒" in str(item.get("content") or "")
+            )
+            self.assertLess(user_index, reminder_index)
+            self.assertLess(reminder_index, final_index)
+            self.assertIsNotNone(graph.get_prompt_observability()["hot_turn_reminder_hash"])
+
+            cold_graph = CompanionGraph(FakeLLM(), FakeMemory(), FakeMemeCatalog())
+            cold_ctx = SimpleNamespace(
+                gate=gate,
+                snapshot=ConversationSnapshot(
+                    snapshot_id=2,
+                    buffer_version=2,
+                    status=ChatStatus.COLD,
+                    events=[
+                        {
+                            "event_id": "e2",
+                            "event_type": "message.text",
+                            "text": "在吗",
+                        }
+                    ],
+                ),
+            )
+            cold_state = await cold_graph._build_context({"ctx": cold_ctx})
+            self.assertFalse(any(
+                "HOT_TURN_REMINDER" in str(item.get("content") or "")
+                for item in cold_state["messages"]
+            ))
+            self.assertIsNone(cold_graph.get_prompt_observability()["hot_turn_reminder_hash"])
+
+        asyncio.run(scenario())
+
+    def test_reasoning_content_rescue_is_preserved_in_provider_transcript(self):
+        async def scenario():
+            graph = CompanionGraph(FakeReasoningEnvelopeLLM(), FakeMemory(), FakeMemeCatalog())
+            gate = self._gate(msg_index=1, age="unknown")
+            first_ctx = SimpleNamespace(
+                gate=gate,
+                snapshot=ConversationSnapshot(
+                    snapshot_id=1,
+                    buffer_version=1,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e1",
+                            "event_type": "message.text",
+                            "text": "在吗",
+                        }
+                    ],
+                ),
+            )
+            first_state = await graph._build_context({"ctx": first_ctx})
+            decision_state = await graph._call_llm_for_decision(first_state)
+
+            self.assertEqual(decision_state["decision"].action, Action.REPLY)
+            self.assertEqual(graph.get_prompt_observability()["raw_output_source"], "reasoning_content_rescue")
+            self.assertTrue(graph.get_prompt_observability()["content_empty_with_reasoning"])
+            self.assertEqual(graph.get_prompt_observability()["cached_tokens"], 64)
+            self.assertEqual(graph.get_prompt_observability()["llm_response_meta"]["finish_reason"], "stop")
+
+            gate.state.msg_index_today = 2
+            second_ctx = SimpleNamespace(
+                gate=gate,
+                snapshot=ConversationSnapshot(
+                    snapshot_id=2,
+                    buffer_version=2,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e2",
+                            "event_type": "message.text",
+                            "text": "继续说",
+                        }
+                    ],
+                ),
+            )
+            second_state = await graph._build_context({"ctx": second_ctx})
+            assistant_messages = [
+                item for item in second_state["messages"]
+                if item.get("role") == "assistant" and item.get("reasoning_content")
+            ]
+
+            self.assertEqual(len(assistant_messages), 1)
+            self.assertIsNone(assistant_messages[0].get("content"))
+            self.assertIn('"action":"REPLY"', assistant_messages[0]["reasoning_content"])
+            self.assertTrue(graph.get_prompt_observability()["append_only_check"])
+            serialized_messages = json.dumps(second_state["messages"], ensure_ascii=False)
+            self.assertNotIn("prompt_tokens", serialized_messages)
+            self.assertNotIn("cached_tokens", serialized_messages)
+            self.assertNotIn("finish_reason", serialized_messages)
+
+        asyncio.run(scenario())
+
+    def test_repair_uses_same_provider_transcript_without_tool_role(self):
+        async def scenario():
+            llm = FakeRepairEnvelopeLLM()
+            graph = CompanionGraph(llm, FakeMemory(), FakeMemeCatalog())
+            ctx = SimpleNamespace(
+                gate=self._gate(msg_index=1, age="unknown"),
+                snapshot=ConversationSnapshot(
+                    snapshot_id=1,
+                    buffer_version=1,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e1",
+                            "event_type": "message.text",
+                            "text": "讲一句",
+                        }
+                    ],
+                ),
+            )
+
+            state = await graph._build_context({"ctx": ctx})
+            decision_state = await graph._call_llm_for_decision(state)
+
+            self.assertEqual(llm.calls, 2)
+            self.assertEqual(decision_state["decision"].to_harness_payload(), {
+                "action": "REPLY",
+                "items": [{"text": "修好了"}],
+            })
+            repair_request = llm.requests[1]
+            roles = [item.get("role") for item in repair_request]
+            self.assertIn("assistant", roles)
+            self.assertNotIn("tool", roles)
+            self.assertTrue(any(
+                item.get("role") == "assistant" and '"type":"search_meme"' in str(item.get("content") or "")
+                for item in repair_request
+            ))
+            self.assertTrue(graph.get_prompt_observability()["append_only_check"])
+
+        asyncio.run(scenario())
+
+    def test_empty_provider_assistant_message_is_not_replayed(self):
+        async def scenario():
+            graph = CompanionGraph(FakeEmptyEnvelopeLLM(), FakeMemory(), FakeMemeCatalog())
+            graph._prompt_transcript = [{"role": "system", "content": "base"}]
+            raw = await graph._call_llm_for_messages(
+                messages=graph._copy_prompt_transcript(),
+                temperature=0.3,
+                append_assistant_to_transcript=True,
+            )
+
+            self.assertEqual(raw, "")
+            self.assertFalse(any(item.get("role") == "assistant" for item in graph._copy_prompt_transcript()))
+            self.assertEqual(
+                graph.get_prompt_observability()["assistant_message_skipped_reason"],
+                "empty_assistant_message",
+            )
+
+        asyncio.run(scenario())
+
+    def test_llm_identity_change_resets_provider_transcript_but_keeps_visible_history(self):
+        async def scenario():
+            llm = FakeIdentityEnvelopeLLM()
+            graph = CompanionGraph(llm, FakeMemory(), FakeMemeCatalog())
+            gate = self._gate(msg_index=1, age="unknown")
+            first_ctx = SimpleNamespace(
+                gate=gate,
+                snapshot=ConversationSnapshot(
+                    snapshot_id=1,
+                    buffer_version=1,
+                    status=ChatStatus.COLD,
+                    events=[
+                        {
+                            "event_id": "e1",
+                            "event_type": "message.text",
+                            "text": "你在吗",
+                        }
+                    ],
+                    cold_start_meta=ColdStartMeta(
+                        timestamp="10:00",
+                        last_user_message_age="unknown",
+                        msg_index=1,
+                        status=ChatStatus.COLD,
+                    ),
+                ),
+            )
+            await graph._build_context({"ctx": first_ctx})
+            graph._append_provider_assistant_message({
+                "role": "assistant",
+                "content": '{"action":"ENTER_CHAT","items":[{"text":"RAW_JSON_VISIBLE"}]}',
+            })
+            graph.commit_sent_items(first_ctx, [SendItem(type=SendItemType.TEXT, content="在。")])
+
+            llm.identity = "model-b"
+            gate.state.msg_index_today = 2
+            second_ctx = SimpleNamespace(
+                gate=gate,
+                snapshot=ConversationSnapshot(
+                    snapshot_id=2,
+                    buffer_version=2,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e2",
+                            "event_type": "message.text",
+                            "text": "继续",
+                        }
+                    ],
+                ),
+            )
+            state = await graph._build_context({"ctx": second_ctx})
+            messages = state["messages"]
+            serialized = json.dumps(messages, ensure_ascii=False)
+
+            self.assertEqual(graph.get_prompt_observability()["prefix_rebuild_reason"], "llm_identity_changed")
+            self.assertIn("你在吗", serialized)
+            self.assertIn("在。", serialized)
+            self.assertIn("继续", serialized)
+            self.assertNotIn("RAW_JSON_VISIBLE", serialized)
+
+        asyncio.run(scenario())
+
+    def test_llm_client_adds_generic_cache_affinity_without_changing_messages(self):
+        client = LLMClient(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            thinking_enabled=True,
+        )
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = client._build_kwargs(messages, temperature=0.3, max_tokens=None, stream=False)
+        cache_debug = client.get_cache_debug()
+        old_session_id = client.cache_session_id
+
+        self.assertIs(kwargs["messages"], messages)
+        self.assertIn("prompt_cache_key", kwargs)
+        self.assertEqual(kwargs["prompt_cache_key"], cache_debug["prompt_cache_key"])
+        self.assertEqual(kwargs["extra_headers"]["session_id"], old_session_id)
+        self.assertEqual(kwargs["extra_headers"]["x-client-request-id"], old_session_id)
+        self.assertNotIn("temperature", kwargs)
+        self.assertIn("thinking", kwargs["extra_body"])
+        self.assertTrue(client._should_retry_without_prompt_cache_key(Exception("unknown parameter prompt_cache_key")))
+
+        old_identity = client.get_transcript_identity()
+        client.update_config(model="test-model-2")
+        self.assertNotEqual(client.cache_session_id, old_session_id)
+        self.assertNotEqual(client.get_transcript_identity(), old_identity)
 
     def test_repeated_buffer_event_is_not_duplicated(self):
         async def scenario():
@@ -553,11 +904,16 @@ class PromptAppendOnlyTest(unittest.TestCase):
 
         self.assertEqual([item["role"] for item in messages], ["system", "system", "system"])
         joined = "\n".join(item["content"] for item in messages)
-        self.assertIn("已经被拦截，用户没有看到它", joined)
-        self.assertIn("不要顺着它继续说话", joined)
-        self.assertIn("把 original_raw_output 中适合用户看到的自然内容搬进 items", joined)
+        self.assertIn("SYSTEM_REMINDER", joined)
+        self.assertIn("ACTION_HARNESS_PROTOCOL_ERROR", joined)
+        self.assertIn("internal blocked draft", joined)
+        self.assertIn("not user-visible chat history", joined)
+        self.assertIn("Do not produce a follow-up reply to original_raw_output", joined)
         self.assertIn("不要丢成“嗯”", joined)
         payload = json.loads(messages[1]["content"])
+        self.assertEqual(payload["message_type"], "SYSTEM_REMINDER")
+        self.assertEqual(payload["status"], "ACTION_HARNESS_PROTOCOL_ERROR")
+        self.assertEqual(payload["blocked_output_visibility"], "internal_only_not_visible_to_user")
         self.assertEqual(payload["schema"]["items"], [
             {"text": "用户可见文本或 emoji"},
             {"meme": "<file_stem>"},

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import copy
 import re
 from typing import Optional, TypedDict
 
@@ -16,12 +17,13 @@ from .protocol import (
 )
 from .state import ChatStatus
 from ..active.messages import ACTIVE_SECTIONS, expire_stale_candidates, parse_active_candidates
-from ..llm.client import LLMClient
+from ..llm.client import LLMClient, LLMResponseEnvelope
 from ..llm.prompts import (
     FINAL_ACTION_OUTPUT_REMINDER,
     build_stable_prompt_hash_source,
     build_system_prompt,
     build_runtime_context_message,
+    build_hot_turn_system_reminder_message,
     build_meme_search_messages,
 )
 from ..memory.files import MemoryFileManager
@@ -58,10 +60,13 @@ class CompanionGraph:
         self._conversation_history: list = []
         self._prompt_transcript: list[dict] = []
         self._prompt_event_ids: set[str] = set()
+        self._prompt_transcript_identity: Optional[str] = None
+        self._prefix_rebuild_reason: Optional[str] = None
         self._last_prompt_messages: list[dict] = []
         self._last_prompt_observability: dict = {}
         self._prompt_block_hashes: dict = {}
         self._last_runtime_block_hash: Optional[str] = None
+        self._last_hot_turn_reminder_hash: Optional[str] = None
         self._workflow = self._build_workflow()
         # Debug / observability fields for the MVP status bar
         self._last_llm_raw_output: Optional[str] = None
@@ -116,11 +121,14 @@ class CompanionGraph:
         ctx = state["ctx"]
         snapshot = ctx.snapshot
 
+        self._ensure_provider_transcript_identity()
         if not self._prompt_transcript:
             self._initialize_prompt_transcript(snapshot)
 
+        self._last_hot_turn_reminder_hash = None
         self._append_runtime_context(ctx)
         self._append_snapshot_events(snapshot.events)
+        self._append_hot_turn_system_reminder(snapshot)
         self._prompt_transcript.append({"role": "system", "content": FINAL_ACTION_OUTPUT_REMINDER})
 
         messages = [dict(item) for item in self._prompt_transcript]
@@ -128,12 +136,11 @@ class CompanionGraph:
         return {**state, "messages": messages}
 
     async def _call_llm_for_decision(self, state: GraphState) -> GraphState:
-        raw_output = await self.llm.chat_completion(
+        raw_output = await self._call_llm_for_messages(
             messages=state["messages"],
             temperature=0.3,
+            append_assistant_to_transcript=True,
         )
-        self._record_prompt_usage()
-        self._record_llm_raw_output(raw_output)
         decision, parse_status = await self._parse_decision_with_harness(
             ctx=state["ctx"],
             base_messages=state["messages"],
@@ -144,7 +151,7 @@ class CompanionGraph:
         decision = self._apply_protocol_guards(state["ctx"], decision)
         self._record_parsed_decision(decision)
         state["ctx"].decision = decision
-        return {**state, "decision": decision}
+        return {**state, "decision": decision, "messages": self._copy_prompt_transcript()}
 
     def _route_after_first_decision(self, state: GraphState) -> str:
         decision = state.get("decision")
@@ -195,18 +202,29 @@ class CompanionGraph:
         raw_output: str,
         result: ProtocolResult,
     ) -> ProtocolResult:
-        messages = build_repair_messages(
-            base_messages=base_messages,
-            errors=result.errors,
-            original_raw=raw_output,
-            original_decision=result.decision,
-        )
+        if self._prompt_transcript:
+            repair_tail = build_repair_messages(
+                base_messages=[],
+                errors=result.errors,
+                original_raw=raw_output,
+                original_decision=result.decision,
+            )
+            messages = self._append_transcript_messages_for_call(repair_tail)
+            append_assistant = True
+        else:
+            messages = build_repair_messages(
+                base_messages=base_messages,
+                errors=result.errors,
+                original_raw=raw_output,
+                original_decision=result.decision,
+            )
+            append_assistant = False
         try:
-            repaired_raw = await self.llm.chat_completion(
+            repaired_raw = await self._call_llm_for_messages(
                 messages=messages,
                 temperature=0.2,
+                append_assistant_to_transcript=append_assistant,
             )
-            self._record_llm_raw_output(repaired_raw)
         except Exception as exc:
             return ProtocolResult(status="repair_failed", errors=[str(exc)])
 
@@ -370,17 +388,27 @@ class CompanionGraph:
             self._last_render_status = "fallback"
             return {**state, "decision": self._drop_search_items_or_fallback(decision)}
 
-        messages = build_meme_search_messages(
-            base_messages=state["messages"],
-            search_results=search_results,
-            original_decision=decision.to_harness_payload(exclude_none=True),
-        )
+        if self._prompt_transcript:
+            meme_tail = build_meme_search_messages(
+                base_messages=[],
+                search_results=search_results,
+                original_decision=decision.to_harness_payload(exclude_none=True),
+            )[1:]
+            messages = self._append_transcript_messages_for_call(meme_tail)
+            append_assistant = True
+        else:
+            messages = build_meme_search_messages(
+                base_messages=state["messages"],
+                search_results=search_results,
+                original_decision=decision.to_harness_payload(exclude_none=True),
+            )
+            append_assistant = False
 
-        raw_output = await self.llm.chat_completion(
+        raw_output = await self._call_llm_for_messages(
             messages=messages,
             temperature=0.2,
+            append_assistant_to_transcript=append_assistant,
         )
-        self._record_llm_raw_output(raw_output)
         second_result = parse_and_validate_raw_decision(raw_output)
         if not second_result.ok or not second_result.decision:
             fallback_decision = self._replace_search_items_with_first_candidates(decision, search_results)
@@ -388,7 +416,7 @@ class CompanionGraph:
             ctx.selected_memes = selected
             ctx.selected_meme = selected[0] if selected else None
             self._last_render_status = "fallback"
-            return {**state, "decision": fallback_decision}
+            return {**state, "decision": fallback_decision, "messages": self._copy_prompt_transcript()}
 
         second_decision = second_result.decision
 
@@ -397,14 +425,14 @@ class CompanionGraph:
             ctx.selected_memes = selected
             ctx.selected_meme = selected[0] if selected else None
             self._last_render_status = "hit"
-            return {**state, "decision": second_decision}
+            return {**state, "decision": second_decision, "messages": self._copy_prompt_transcript()}
 
         fallback_decision = self._replace_search_items_with_first_candidates(decision, search_results)
         selected = self._selected_meme_stems(fallback_decision)
         ctx.selected_memes = selected
         ctx.selected_meme = selected[0] if selected else None
         self._last_render_status = "fallback"
-        return {**state, "decision": fallback_decision}
+        return {**state, "decision": fallback_decision, "messages": self._copy_prompt_transcript()}
 
     def _meme_selection_is_valid(self, decision: ActionDecision, candidate_union: set[str]) -> bool:
         executable = validate_executable(
@@ -456,11 +484,11 @@ class CompanionGraph:
         )
         if context_status:
             self._last_parse_status = context_status
-            state = {**state, "decision": decision}
+            state = {**state, "decision": decision, "messages": self._copy_prompt_transcript()}
 
         if decision.search_meme_items() and not ctx.meme_search_used:
             searched_state = await self._search_meme(state)
-            return await self._validate_decision({**state, "decision": searched_state["decision"]})
+            return await self._validate_decision({**searched_state, "decision": searched_state["decision"]})
 
         ctx.selected_memes = []
         ctx.selected_meme = None
@@ -493,8 +521,8 @@ class CompanionGraph:
             if repaired:
                 if repaired.search_meme_items():
                     searched_state = await self._search_meme({**state, "decision": repaired})
-                    return await self._validate_decision({**state, "decision": searched_state["decision"]})
-                return await self._validate_decision({**state, "decision": repaired})
+                    return await self._validate_decision({**searched_state, "decision": searched_state["decision"]})
+                return await self._validate_decision({**state, "decision": repaired, "messages": self._copy_prompt_transcript()})
 
         if selected_memes:
             self._last_render_status = "hit"
@@ -516,7 +544,7 @@ class CompanionGraph:
                 decision = ActionDecision(action=Action.LIGHT_ACK, items=[SendItem(type=SendItemType.TEXT, content="嗯")])
 
         ctx.decision = decision
-        return {**state, "decision": decision}
+        return {**state, "decision": decision, "messages": self._copy_prompt_transcript()}
 
     async def _repair_missing_meme_decision(
         self,
@@ -525,18 +553,29 @@ class CompanionGraph:
         missing_meme_stems: list[str],
     ) -> Optional[ActionDecision]:
         errors = [f"meme {stem} 在本地表情库中不存在。" for stem in missing_meme_stems]
-        messages = build_repair_messages(
-            base_messages=state["messages"],
-            errors=errors,
-            original_raw=self._last_llm_raw_output or "",
-            original_decision=decision,
-        )
+        if self._prompt_transcript:
+            repair_tail = build_repair_messages(
+                base_messages=[],
+                errors=errors,
+                original_raw=self._last_llm_raw_output or "",
+                original_decision=decision,
+            )
+            messages = self._append_transcript_messages_for_call(repair_tail)
+            append_assistant = True
+        else:
+            messages = build_repair_messages(
+                base_messages=state["messages"],
+                errors=errors,
+                original_raw=self._last_llm_raw_output or "",
+                original_decision=decision,
+            )
+            append_assistant = False
         try:
-            raw_output = await self.llm.chat_completion(
+            raw_output = await self._call_llm_for_messages(
                 messages=messages,
                 temperature=0.2,
+                append_assistant_to_transcript=append_assistant,
             )
-            self._record_llm_raw_output(raw_output)
             result = parse_and_validate_raw_decision(raw_output)
             if result.ok and result.decision:
                 self._last_parse_status = "json_repair_ok"
@@ -566,7 +605,6 @@ class CompanionGraph:
         for item in items:
             text = self._history_text_for_item(item)
             self._conversation_history.append({"role": "assistant", "text": text})
-            self._append_assistant_text_to_prompt(text)
 
     def commit_external_assistant_text(self, text: str):
         if not text:
@@ -577,12 +615,17 @@ class CompanionGraph:
 
     def clear_prompt_state(self):
         self._conversation_history.clear()
+        self.reset_provider_transcript(reason="conversation_cleared")
+
+    def reset_provider_transcript(self, reason: str = "provider_transcript_reset"):
         self._prompt_transcript.clear()
         self._prompt_event_ids.clear()
         self._last_prompt_messages.clear()
         self._last_prompt_observability.clear()
         self._prompt_block_hashes.clear()
         self._last_runtime_block_hash = None
+        self._prompt_transcript_identity = self._current_llm_identity()
+        self._prefix_rebuild_reason = reason
 
     def _history_text_for_item(self, item: SendItem) -> str:
         if item.type == SendItemType.TEXT:
@@ -726,7 +769,65 @@ class CompanionGraph:
             "prompt_cache": self.get_prompt_observability(),
         }
 
+    async def _call_llm_for_messages(
+        self,
+        messages: list[dict],
+        temperature: float,
+        append_assistant_to_transcript: bool,
+    ) -> str:
+        envelope = await self._request_llm_envelope(messages, temperature)
+        raw_output, raw_source = self._raw_output_from_envelope(envelope)
+        self._record_prompt_usage(envelope=envelope, raw_output_source=raw_source)
+        self._record_llm_raw_output(raw_output)
+        if append_assistant_to_transcript:
+            self._append_provider_assistant_message(envelope.assistant_message)
+        return raw_output
+
+    async def _request_llm_envelope(self, messages: list[dict], temperature: float) -> LLMResponseEnvelope:
+        if hasattr(self.llm, "chat_completion_envelope"):
+            return await self.llm.chat_completion_envelope(
+                messages=self._provider_safe_messages(messages),
+                temperature=temperature,
+            )
+
+        raw_output = await self.llm.chat_completion(
+            messages=self._provider_safe_messages(messages),
+            temperature=temperature,
+        )
+        assistant_message = (
+            self.llm.get_last_assistant_message()
+            if hasattr(self.llm, "get_last_assistant_message")
+            else None
+        ) or {"role": "assistant", "content": raw_output}
+        reasoning_content = (
+            self.llm.get_last_reasoning_content()
+            if hasattr(self.llm, "get_last_reasoning_content")
+            else None
+        )
+        usage = self.llm.get_last_usage() if hasattr(self.llm, "get_last_usage") else None
+        return LLMResponseEnvelope(
+            assistant_message=assistant_message,
+            content=assistant_message.get("content") if isinstance(assistant_message, dict) else raw_output,
+            reasoning_content=reasoning_content,
+            usage=usage,
+            raw_response_meta=None,
+        )
+
+    def _raw_output_from_envelope(self, envelope: LLMResponseEnvelope) -> tuple[str, str]:
+        content = envelope.content or ""
+        if content.strip():
+            return content, "content"
+
+        reasoning_content = envelope.reasoning_content or ""
+        if reasoning_content.strip():
+            result = parse_and_validate_raw_decision(reasoning_content)
+            if result.ok:
+                return reasoning_content, "reasoning_content_rescue"
+
+        return content, "content_empty"
+
     def _initialize_prompt_transcript(self, snapshot):
+        self._prompt_transcript_identity = self._current_llm_identity()
         include_profile = snapshot.status.value == "COLD"
         profile_views = self._build_profile_prompt_views(include_profile)
         system_prompt = build_system_prompt(
@@ -749,6 +850,22 @@ class CompanionGraph:
             content = item.get("text", "")
             if content:
                 self._prompt_transcript.append({"role": role, "content": content})
+
+    def _ensure_provider_transcript_identity(self):
+        identity = self._current_llm_identity()
+        if not self._prompt_transcript:
+            self._prompt_transcript_identity = identity
+            return
+        if identity and self._prompt_transcript_identity and identity != self._prompt_transcript_identity:
+            self.reset_provider_transcript(reason="llm_identity_changed")
+            self._prompt_transcript_identity = identity
+        elif identity and not self._prompt_transcript_identity:
+            self._prompt_transcript_identity = identity
+
+    def _current_llm_identity(self) -> Optional[str]:
+        if hasattr(self.llm, "get_transcript_identity"):
+            return self.llm.get_transcript_identity()
+        return None
 
     def _build_profile_prompt_views(self, include_profile: bool) -> dict[str, str]:
         if not include_profile:
@@ -837,6 +954,13 @@ class CompanionGraph:
         self._last_runtime_block_hash = self._hash_text(runtime_message["content"])
         self._prompt_transcript.append(runtime_message)
 
+    def _append_hot_turn_system_reminder(self, snapshot):
+        if snapshot.status != ChatStatus.HOT:
+            return
+        reminder_message = build_hot_turn_system_reminder_message()
+        self._last_hot_turn_reminder_hash = self._hash_text(reminder_message["content"])
+        self._prompt_transcript.append(reminder_message)
+
     def _append_snapshot_events(self, events: list[dict]):
         for evt in events:
             event_id = self._event_get(evt, "event_id") or self._event_get(evt, "id")
@@ -882,8 +1006,78 @@ class CompanionGraph:
         if text:
             self._prompt_transcript.append({"role": "assistant", "content": text})
 
+    def _append_provider_assistant_message(self, assistant_message: dict):
+        sanitized, skip_reason = self._sanitize_provider_assistant_message(assistant_message)
+        if skip_reason:
+            self._last_prompt_observability["assistant_message_skipped_reason"] = skip_reason
+            return
+        self._prompt_transcript.append(sanitized)
+
+    def _append_transcript_messages_for_call(self, messages: list[dict]) -> list[dict]:
+        self._prompt_transcript.extend(copy.deepcopy(item) for item in messages)
+        current = self._copy_prompt_transcript()
+        self._record_prompt_observability(current)
+        return current
+
+    def _copy_prompt_transcript(self) -> list[dict]:
+        return copy.deepcopy(self._prompt_transcript)
+
+    def _provider_role_sequence(self, messages: list[dict]) -> list[str]:
+        return [str(item.get("role", "")) for item in messages]
+
+    def _sanitize_provider_assistant_message(self, assistant_message: Optional[dict]) -> tuple[dict, Optional[str]]:
+        if not assistant_message:
+            return {}, "empty_assistant_message"
+        allowed = {
+            "role",
+            "content",
+            "reasoning_content",
+            "tool_calls",
+            "function_call",
+            "name",
+            "tool_call_id",
+        }
+        sanitized = {
+            key: copy.deepcopy(value)
+            for key, value in assistant_message.items()
+            if key in allowed
+        }
+        sanitized["role"] = "assistant"
+        if "content" not in sanitized:
+            sanitized["content"] = None
+
+        has_content = bool(str(sanitized.get("content") or "").strip())
+        has_reasoning = bool(str(sanitized.get("reasoning_content") or "").strip())
+        has_tool_calls = bool(sanitized.get("tool_calls") or sanitized.get("function_call"))
+        if not (has_content or has_reasoning or has_tool_calls):
+            return {}, "empty_assistant_message"
+        return sanitized, None
+
+    def _provider_safe_messages(self, messages: list[dict]) -> list[dict]:
+        safe_messages: list[dict] = []
+        skipped = 0
+        for item in messages:
+            role = item.get("role")
+            if role == "assistant":
+                sanitized, skip_reason = self._sanitize_provider_assistant_message(item)
+                if skip_reason:
+                    skipped += 1
+                    continue
+                safe_messages.append(sanitized)
+            elif role in {"system", "user"}:
+                safe_messages.append(copy.deepcopy(item))
+            else:
+                # 当前项目没有 provider-native tool call，不向 provider 伪造其他 role。
+                skipped += 1
+
+        if skipped:
+            self._last_prompt_observability["provider_safe_messages_skipped"] = skipped
+        return safe_messages
+
     def _record_prompt_observability(self, messages: list[dict]):
-        previous_messages = [dict(item) for item in self._last_prompt_messages]
+        safe_messages = self._provider_safe_messages(messages)
+        previous_messages = copy.deepcopy(self._last_prompt_messages)
+        messages = safe_messages
         append_only = self._is_messages_prefix(previous_messages, messages) if previous_messages else True
         previous_hash = self._messages_hash(previous_messages) if previous_messages else None
         full_hash = self._messages_hash(messages)
@@ -891,34 +1085,107 @@ class CompanionGraph:
         observability = {
             "message_count": len(messages),
             "previous_message_count": len(previous_messages),
+            "role_sequence": self._provider_role_sequence(messages),
             "full_request_hash": full_hash,
             "previous_request_hash": previous_hash,
             **self._prompt_block_hashes,
             "runtime_block_hash": self._last_runtime_block_hash,
+            "hot_turn_reminder_hash": self._last_hot_turn_reminder_hash,
             "append_only_check": append_only,
             "prefix_rebuild_reason": None if append_only else "previous_request_not_prefix",
             "char_count": len(serialized),
             "estimated_tokens": max(1, len(serialized) // 4),
             "estimated_prompt_tokens": max(1, len(serialized) // 4),
         }
-        self._last_prompt_messages = [dict(item) for item in messages]
+        cache_debug = self.llm.get_cache_debug() if hasattr(self.llm, "get_cache_debug") else None
+        if cache_debug:
+            observability["cache_affinity"] = cache_debug
+        if append_only and self._prefix_rebuild_reason:
+            observability["prefix_rebuild_reason"] = self._prefix_rebuild_reason
+        self._prefix_rebuild_reason = None
+        self._last_prompt_messages = copy.deepcopy(messages)
         self._last_prompt_observability = observability
         print(f"[prompt_cache_debug] {json.dumps(observability, ensure_ascii=False)}")
 
-    def _record_prompt_usage(self):
-        usage = self.llm.get_last_usage() if hasattr(self.llm, "get_last_usage") else None
-        if not usage:
-            return
-        self._last_prompt_observability["llm_usage"] = usage
-        cached_tokens = self._extract_cached_tokens(usage)
-        if cached_tokens is not None:
-            self._last_prompt_observability["cached_tokens"] = cached_tokens
+    def _record_prompt_usage(
+        self,
+        envelope: Optional[LLMResponseEnvelope] = None,
+        raw_output_source: Optional[str] = None,
+    ):
+        usage = envelope.usage if envelope else (
+            self.llm.get_last_usage() if hasattr(self.llm, "get_last_usage") else None
+        )
+        if usage:
+            self._last_prompt_observability["llm_usage"] = usage
+            cached_tokens = self._extract_cached_tokens(usage)
+            if cached_tokens is not None:
+                self._last_prompt_observability["cached_tokens"] = cached_tokens
+            prompt_tokens = self._extract_prompt_tokens(usage)
+            if prompt_tokens is not None:
+                self._last_prompt_observability["prompt_tokens"] = prompt_tokens
+            cache_miss_tokens = self._extract_cache_miss_tokens(usage)
+            if cache_miss_tokens is not None:
+                self._last_prompt_observability["cache_miss_tokens"] = cache_miss_tokens
+            reasoning_tokens = self._extract_reasoning_tokens(usage)
+            if reasoning_tokens is not None:
+                self._last_prompt_observability["reasoning_tokens"] = reasoning_tokens
+            if cached_tokens is not None and prompt_tokens:
+                self._last_prompt_observability["cache_hit_rate"] = cached_tokens / prompt_tokens
+        reasoning_content = envelope.reasoning_content if envelope else (
+            self.llm.get_last_reasoning_content()
+            if hasattr(self.llm, "get_last_reasoning_content")
+            else None
+        )
+        if reasoning_content:
+            self._last_prompt_observability["llm_reasoning_content"] = reasoning_content
+        assistant_message = envelope.assistant_message if envelope else (
+            self.llm.get_last_assistant_message()
+            if hasattr(self.llm, "get_last_assistant_message")
+            else None
+        )
+        if assistant_message:
+            self._last_prompt_observability["llm_assistant_message"] = assistant_message
+            self._last_prompt_observability["assistant_has_reasoning_content"] = bool(
+                assistant_message.get("reasoning_content")
+            )
+            self._last_prompt_observability["content_empty_with_reasoning"] = not bool(
+                str(assistant_message.get("content") or "").strip()
+            ) and bool(assistant_message.get("reasoning_content"))
+        if envelope and envelope.raw_response_meta:
+            self._last_prompt_observability["llm_response_meta"] = envelope.raw_response_meta
+        if raw_output_source:
+            self._last_prompt_observability["raw_output_source"] = raw_output_source
 
     def _extract_cached_tokens(self, usage: dict) -> Optional[int]:
         details = usage.get("prompt_tokens_details") or usage.get("input_token_details") or {}
-        cached = details.get("cached_tokens") or details.get("cache_read_input_tokens")
+        cached = (
+            details.get("cached_tokens")
+            or details.get("cache_read_input_tokens")
+            or usage.get("prompt_cache_hit_tokens")
+            or usage.get("cache_read_input_tokens")
+        )
         if isinstance(cached, int):
             return cached
+        return None
+
+    def _extract_cache_miss_tokens(self, usage: dict) -> Optional[int]:
+        details = usage.get("prompt_tokens_details") or usage.get("input_token_details") or {}
+        missed = details.get("cache_miss_tokens") or usage.get("prompt_cache_miss_tokens")
+        if isinstance(missed, int):
+            return missed
+        return None
+
+    def _extract_prompt_tokens(self, usage: dict) -> Optional[int]:
+        prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens")
+        if isinstance(prompt_tokens, int):
+            return prompt_tokens
+        return None
+
+    def _extract_reasoning_tokens(self, usage: dict) -> Optional[int]:
+        details = usage.get("completion_tokens_details") or usage.get("output_token_details") or {}
+        reasoning_tokens = details.get("reasoning_tokens")
+        if isinstance(reasoning_tokens, int):
+            return reasoning_tokens
         return None
 
     def _messages_hash(self, messages: list[dict]) -> str:

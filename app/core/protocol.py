@@ -233,17 +233,22 @@ def build_repair_messages(
         else None
     )
     repair_payload = {
+        "message_type": "SYSTEM_REMINDER",
         "internal_tool": "validate_action_protocol",
-        "status": "failed",
+        "status": "ACTION_HARNESS_PROTOCOL_ERROR",
         "blocked_output_was_not_sent": True,
+        "blocked_output_visibility": "internal_only_not_visible_to_user",
         "errors": errors,
         "original_raw_output": original_raw or "(空输出)",
         "original_decision": original_payload,
-        "required_output": "把被拦截输出改写成一个修正后的、可执行的单个 JSON decision。",
+        "required_output": "Return one corrected executable JSON decision.",
+        "repair_task": "Rewrite the blocked assistant draft into the required action/items protocol.",
         "repair_rules": [
-            "上一轮输出没有通过本地 Action Harness 校验，已经被拦截，用户没有看到它。",
-            "original_raw_output 只是被拦截的草稿，不是已经发出的聊天历史；不要顺着它继续说话。",
-            "你的任务不是再次聊天，而是把 original_raw_output 中适合用户看到的自然内容搬进 items。",
+            "This is a system protocol repair event, not a user message.",
+            "The previous assistant output failed local Action Harness validation and was blocked before delivery.",
+            "The user did not see original_raw_output.",
+            "Treat original_raw_output only as an invalid assistant draft for this same turn, not as sent chat history.",
+            "Do not produce a follow-up reply to original_raw_output; only rewrite its user-visible content into items.",
             "如果 original_raw_output 是自然语言回复，优先保留其语气和主要内容，只改写为 action + items JSON。",
             "如果 original_raw_output 里有单独的 meme:<file_stem> 或 [表情: meme:<file_stem>] 行，可以改成 {\"meme\":\"<file_stem>\"}。",
             "基于同一轮对话修正，不要开启新话题，不要解释错误。",
@@ -297,7 +302,10 @@ def build_repair_messages(
         {
             "role": "system",
             "content": (
-                "最终修复输出：只返回一个 JSON 对象。不要继续自然聊天，不要解释，不要 Markdown。"
+                "SYSTEM REMINDER: ACTION_HARNESS_PROTOCOL_ERROR. "
+                "The prior assistant message is an internal blocked draft, not user-visible chat history. "
+                "Rewrite that draft into one valid action/items JSON object for the same turn. "
+                "Return JSON only; no explanation, no Markdown, no extra text. "
                 "如果原输出是自然语言，就把它转成 items，不要丢成“嗯”。"
             ),
         },

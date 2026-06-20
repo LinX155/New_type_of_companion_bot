@@ -416,6 +416,8 @@ async def update_config(config: ApiConfig):
         model=config.model,
         thinking_enabled=config.thinking_enabled,
     )
+    if companion_graph:
+        companion_graph.reset_provider_transcript(reason="llm_config_changed")
     save_settings({
         "api_key": config.api_key,
         "base_url": config.base_url,
