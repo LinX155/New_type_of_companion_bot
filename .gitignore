@@ -8,6 +8,7 @@ data/*.db-wal
 dm/*.md
 test_*.py
 *_output.json
+autotest/
 harness_real_endpoint_test_report.md
 # 用户配置持久化（含明文 API key）
 data/user_settings.json

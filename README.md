@@ -69,8 +69,7 @@
 ```
 
 - `action`：给系统看，决定这一轮的行为（WAIT / REPLY / LIGHT_ACK / REACT / ENTER_CHAT / END_CHAT）
-- `items`：给转发层看，表示一组有序发送单元。为 `null` 或空时用户无感；非空时可混合文本、emoji 和表情包。
-- `text`：旧协议兼容入口，不是主输出协议。
+- `items`：给转发层看，表示一组有序发送单元。为 `null` 或空时用户无感；非空时可混合文本、表情包和内部表情检索项。每个 item 只使用一个字段：`text`、`meme` 或 `search_meme`。
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌──────────────┐
@@ -86,7 +85,7 @@
 - `WAIT`：用户还没说完，等。`items:null`，buffer 不清空。
 - `LIGHT_ACK`：短回应，"嗯，你说。"——不展开，不抢话。
 - `REPLY`：正常文字回复，可连续发送一条或多条文本。
-- `REACT`：表情参与型回应，可以是纯表情，也可以混合“文字 + 表情包 + 文字”，但必须至少包含一个 emoji / meme / search_meme。
+- `REACT`：表情参与型回应，可以是纯表情，也可以混合“文字 + 表情包 + 文字”，但必须至少包含一个 `meme` 或 `search_meme`；emoji 作为普通 `text`。
 - COLD 下 `LIGHT_ACK` 和纯 `REACT` 是低负担回应，不代表进入热聊；展开文字回复或文字+表情混合回复需要 `ENTER_CHAT`。
 
 ---
@@ -282,13 +281,13 @@ Action Harness 是发送前的协议边界：只接受可解析、可校验、�
 
 ```
 LLM 第一轮：判断语境 → 输出 search_meme item
-  例如：search_meme:helpless:cry tired
+  例如：{"search_meme":"helpless:cry tired"}
               │
               ▼ 系统拦截（不发给用户），在分类目录按语义文件名匹配
               │ 返回候选：["helpless_miku_cry_floor", "helpless_cat_facepalm", ...]
               ▼
-LLM 第二轮：从候选中选择 → 输出 meme:<file_stem>
-  例如：meme:helpless_cat_facepalm
+LLM 第二轮：从候选中选择 → 输出 meme item
+  例如：{"meme":"helpless_cat_facepalm"}
               │
               ▼ 转发层精确匹配文件，转发图片
 ```

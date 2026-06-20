@@ -9,6 +9,7 @@ from .event_gate import ProcessContext
 from .decisions import ActionDecision, Action, SendItem, SendItemType
 from .protocol import (
     ProtocolResult,
+    VALID_MEME_CATEGORIES,
     build_repair_messages,
     parse_and_validate_raw_decision,
     validate_executable,
@@ -162,25 +163,29 @@ class CompanionGraph:
         if result.ok and result.decision:
             return result.decision, result.status
 
-        if repair:
-            repaired = await self._repair_protocol_decision(
-                ctx=ctx,
-                base_messages=base_messages,
-                raw_output=raw_output,
-                result=result,
-            )
-            if repaired.ok and repaired.decision:
-                if repaired.status == "relaxed_visible_output":
-                    return repaired.decision, repaired.status
-                return repaired.decision, "repair_ok"
+        should_repair = self._should_attempt_json_repair(raw_output, result)
+        if not should_repair:
             relaxed = self._relaxed_visible_decision(raw_output, ctx)
             if relaxed:
-                return relaxed, "relaxed_visible_output"
+                return relaxed, "natural_text_coerced"
+
+        if repair:
+            if should_repair:
+                repaired = await self._repair_protocol_decision(
+                    ctx=ctx,
+                    base_messages=base_messages,
+                    raw_output=raw_output,
+                    result=result,
+                )
+                if repaired.ok and repaired.decision:
+                    if repaired.status == "natural_text_coerced":
+                        return repaired.decision, repaired.status
+                    return repaired.decision, "json_repair_ok"
             return self._fallback_decision(ctx), "repair_failed"
 
         relaxed = self._relaxed_visible_decision(raw_output, ctx)
         if relaxed:
-            return relaxed, "relaxed_visible_output"
+            return relaxed, "natural_text_coerced"
         return self._fallback_decision(ctx), result.status
 
     async def _repair_protocol_decision(
@@ -210,13 +215,18 @@ class CompanionGraph:
             return repaired
         relaxed = self._relaxed_visible_decision(repaired_raw, ctx)
         if relaxed:
-            return ProtocolResult(status="relaxed_visible_output", decision=relaxed)
+            return ProtocolResult(status="natural_text_coerced", decision=relaxed)
         return ProtocolResult(
             status="repair_failed",
             decision=repaired.decision,
             errors=repaired.errors,
             raw_data=repaired.raw_data,
         )
+
+    def _should_attempt_json_repair(self, raw_output: str, result: ProtocolResult) -> bool:
+        if result.status == "protocol_error":
+            return True
+        return self._looks_like_protocol_output(raw_output)
 
     def _relaxed_visible_decision(self, raw_output: str, ctx: ProcessContext) -> Optional[ActionDecision]:
         items = self._visible_items_from_relaxed_output(raw_output)
@@ -246,6 +256,8 @@ class CompanionGraph:
             if meme_stem:
                 if self.meme_renderer.render_meme(meme_stem):
                     items.append(SendItem(type=SendItemType.MEME, content=f"meme:{meme_stem}"))
+                else:
+                    items.append(self._search_meme_item_for_missing_stem(meme_stem))
                 continue
 
             if self._contains_internal_protocol(line):
@@ -254,10 +266,26 @@ class CompanionGraph:
 
         return items
 
+    def _search_meme_item_for_missing_stem(self, stem: str) -> SendItem:
+        tokens = [token for token in re.split(r"[_\-\s]+", (stem or "").strip().lower()) if token]
+        category = tokens[0] if tokens and tokens[0] in VALID_MEME_CATEGORIES else "miscellaneous"
+        keyword_tokens = tokens[1:] if category != "miscellaneous" else tokens
+        keywords = " ".join(keyword_tokens).strip()
+        if not keywords:
+            keywords = "comfort" if category == "affection" else (category or "comfort")
+        return SendItem(type=SendItemType.SEARCH_MEME, content=f"{category}:{keywords}")
+
     def _looks_like_protocol_output(self, text: str) -> bool:
         stripped = text.strip()
         if stripped.startswith("{"):
             return True
+        if stripped.startswith("["):
+            try:
+                data, _ = json.JSONDecoder().raw_decode(stripped)
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, list):
+                return True
         protocol_markers = (
             '"action"',
             '"items"',
@@ -511,7 +539,7 @@ class CompanionGraph:
             self._record_llm_raw_output(raw_output)
             result = parse_and_validate_raw_decision(raw_output)
             if result.ok and result.decision:
-                self._last_parse_status = "repair_ok"
+                self._last_parse_status = "json_repair_ok"
                 return result.decision
             self._last_parse_status = "repair_failed"
             return None

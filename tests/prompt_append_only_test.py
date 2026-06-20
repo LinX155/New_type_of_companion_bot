@@ -15,9 +15,18 @@ class FakeLLM:
         return None
 
 
-class FakeRepairLLM(FakeLLM):
+class FailIfCalledLLM(FakeLLM):
     async def chat_completion(self, messages, temperature=0.7, stream=False):
-        return "诶嘿嘿～那我想想做什么好呢…\n\n[表情: meme:affection_anime_girl_hug_chu]\n宝想吃啥？"
+        raise AssertionError("repair LLM should not be called for natural visible text")
+
+
+class FakeJsonRepairLLM(FakeLLM):
+    def __init__(self):
+        self.calls = 0
+
+    async def chat_completion(self, messages, temperature=0.7, stream=False):
+        self.calls += 1
+        return '{"action":"REACT","items":[{"search_meme":"amused:laugh"}]}'
 
 
 class FakeMemory:
@@ -360,9 +369,9 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertNotIn('"type":"meme"', final_instruction)
         self.assertIn('{"meme":"<file_stem>"}', "\n".join(tool_payload["selection_rules"]))
 
-    def test_repair_natural_visible_output_is_released_instead_of_um_fallback(self):
+    def test_natural_visible_output_is_coerced_before_repair(self):
         async def scenario():
-            graph = CompanionGraph(FakeRepairLLM(), FakeMemory(), FakeMemeCatalog())
+            graph = CompanionGraph(FailIfCalledLLM(), FakeMemory(), FakeMemeCatalog())
             ctx = SimpleNamespace(
                 gate=self._gate(msg_index=2, age="just now"),
                 snapshot=ConversationSnapshot(
@@ -382,18 +391,158 @@ class PromptAppendOnlyTest(unittest.TestCase):
             decision, status = await graph._parse_decision_with_harness(
                 ctx=ctx,
                 base_messages=[],
-                raw_output="这不是 JSON",
+                raw_output="我在呢，刚准备找你。",
                 repair=True,
             )
 
-            self.assertEqual(status, "relaxed_visible_output")
+            self.assertEqual(status, "natural_text_coerced")
             self.assertEqual(decision.action.value, "REPLY")
             contents = [item.content for item in decision.all_items()]
-            self.assertIn("诶嘿嘿～那我想想做什么好呢…", contents)
-            self.assertIn("宝想吃啥？", contents)
+            self.assertEqual(contents, ["我在呢，刚准备找你。"])
             self.assertNotEqual(contents, ["嗯"])
 
         asyncio.run(scenario())
+
+    def test_json_like_protocol_error_still_uses_repair(self):
+        async def scenario():
+            llm = FakeJsonRepairLLM()
+            graph = CompanionGraph(llm, FakeMemory(), FakeMemeCatalog())
+            ctx = SimpleNamespace(
+                gate=self._gate(msg_index=2, age="just now"),
+                snapshot=ConversationSnapshot(
+                    snapshot_id=2,
+                    buffer_version=2,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e2",
+                            "event_type": "message.text",
+                            "text": "给我个好笑的表情包",
+                        }
+                    ],
+                ),
+            )
+
+            decision, status = await graph._parse_decision_with_harness(
+                ctx=ctx,
+                base_messages=[],
+                raw_output='{"action":"REACT","items":[{"type":"search_meme","content":"search_meme:amused:laugh"}]}',
+                repair=True,
+            )
+
+            self.assertEqual(status, "json_repair_ok")
+            self.assertEqual(llm.calls, 1)
+            self.assertEqual(decision.to_harness_payload(), {
+                "action": "REACT",
+                "items": [{"search_meme": "amused:laugh"}],
+            })
+
+        asyncio.run(scenario())
+
+    def test_json_array_draft_uses_repair_instead_of_visible_text(self):
+        async def scenario():
+            llm = FakeJsonRepairLLM()
+            graph = CompanionGraph(llm, FakeMemory(), FakeMemeCatalog())
+            ctx = SimpleNamespace(
+                gate=self._gate(msg_index=16, age="just now"),
+                snapshot=ConversationSnapshot(
+                    snapshot_id=16,
+                    buffer_version=16,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e16",
+                            "event_type": "message.text",
+                            "text": "终于交了，感觉自己活下来了",
+                        }
+                    ],
+                ),
+            )
+
+            decision, status = await graph._parse_decision_with_harness(
+                ctx=ctx,
+                base_messages=[],
+                raw_output='[{"text":"终于！！！"},{"search_meme":"praise:finally done celebrate"}]',
+                repair=True,
+            )
+
+            self.assertEqual(status, "json_repair_ok")
+            self.assertEqual(llm.calls, 1)
+            self.assertEqual(decision.to_harness_payload(), {
+                "action": "REACT",
+                "items": [{"search_meme": "amused:laugh"}],
+            })
+
+        asyncio.run(scenario())
+
+    def test_relaxed_invalid_meme_stem_becomes_search_meme(self):
+        async def scenario():
+            graph = CompanionGraph(FailIfCalledLLM(), FakeMemory(), FakeMemeCatalog())
+            ctx = SimpleNamespace(
+                gate=self._gate(msg_index=2, age="just now"),
+                snapshot=ConversationSnapshot(
+                    snapshot_id=2,
+                    buffer_version=2,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e2",
+                            "event_type": "message.text",
+                            "text": "给我个表情包安慰一下",
+                        }
+                    ],
+                ),
+            )
+
+            decision, status = await graph._parse_decision_with_harness(
+                ctx=ctx,
+                base_messages=[],
+                raw_output="先抱一下\n[表情: meme:affection_fake_hug]\n撑住撑住",
+                repair=True,
+            )
+
+            self.assertEqual(status, "natural_text_coerced")
+            self.assertEqual(decision.action.value, "REACT")
+            self.assertEqual(decision.to_harness_payload(), {
+                "action": "REACT",
+                "items": [
+                    {"text": "先抱一下"},
+                    {"search_meme": "affection:fake hug"},
+                    {"text": "撑住撑住"},
+                ],
+            })
+
+        asyncio.run(scenario())
+
+    def test_meme_request_without_rich_item_is_forced_to_search_meme(self):
+        graph = CompanionGraph(FakeLLM(), FakeMemory(), FakeMemeCatalog())
+        ctx = SimpleNamespace(
+            gate=self._gate(msg_index=13, age="just now"),
+            snapshot=ConversationSnapshot(
+                snapshot_id=13,
+                buffer_version=13,
+                status=ChatStatus.HOT,
+                events=[
+                    {
+                        "event_id": "e13",
+                        "event_type": "message.text",
+                        "text": "给我个表情包安慰一下",
+                    }
+                ],
+            ),
+        )
+
+        decision = ActionDecision(
+            action=Action.REPLY,
+            items=[SendItem(type=SendItemType.TEXT, content="抱抱你，先缓一口气。")],
+        )
+
+        fixed = graph._apply_protocol_guards(ctx, decision)
+
+        self.assertEqual(fixed.to_harness_payload(), {
+            "action": "REACT",
+            "items": [{"search_meme": "amused:funny"}],
+        })
 
     def test_repair_prompt_marks_blocked_output_as_system_context_not_assistant_history(self):
         messages = build_repair_messages(
