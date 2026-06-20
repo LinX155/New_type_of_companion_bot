@@ -8,7 +8,7 @@ from app.core.graph import CompanionGraph
 from app.core.protocol import build_repair_messages, parse_and_validate_raw_decision
 from app.core.state import ChatStatus, ColdStartMeta, ConversationSnapshot
 from app.llm.client import LLMClient, LLMResponseEnvelope
-from app.llm.prompts import build_meme_search_messages
+from app.llm.prompts import build_meme_search_messages, build_midnight_cleanup_messages, build_system_prompt
 
 
 class FakeLLM:
@@ -275,6 +275,21 @@ class PromptAppendOnlyTest(unittest.TestCase):
             self.assertIsNone(cold_graph.get_prompt_observability()["hot_turn_reminder_hash"])
 
         asyncio.run(scenario())
+
+    def test_internal_system_reminder_appends_to_provider_transcript_only(self):
+        graph = CompanionGraph(FakeLLM(), FakeMemory(), FakeMemeCatalog())
+        graph._prompt_transcript = [{"role": "system", "content": "base"}]
+
+        graph.append_internal_system_reminder({"role": "assistant", "content": "bad"})
+        graph.append_internal_system_reminder({"role": "system", "content": ""})
+        graph.append_internal_system_reminder({"role": "system", "content": "remind"})
+
+        transcript = graph._copy_prompt_transcript()
+        self.assertEqual(transcript, [
+            {"role": "system", "content": "base"},
+            {"role": "system", "content": "remind"},
+        ])
+        self.assertEqual(graph._conversation_history, [])
 
     def test_reasoning_content_rescue_is_preserved_in_provider_transcript(self):
         async def scenario():
@@ -895,6 +910,44 @@ class PromptAppendOnlyTest(unittest.TestCase):
             "items": [{"search_meme": "amused:funny"}],
         })
 
+    def test_system_prompt_guides_cold_hot_entry_judgment(self):
+        prompt = build_system_prompt(
+            soul_md="",
+            memory_core_md="",
+            today_memory_md="",
+            tomorrow_topics_md="",
+            include_profile=False,
+        )
+
+        self.assertIn("COLD 下每轮先做入热判断", prompt)
+        self.assertIn("进入 HOT 代表接下来一段时间你会更在场", prompt)
+        self.assertIn("不是为了绕过 COLD 限制发一句普通回复", prompt)
+        self.assertIn("COLD 下 REACT 必须保持纯表情包", prompt)
+        self.assertIn("COLD 下如果文字+表情值得进入热聊，用 ENTER_CHAT.items", prompt)
+        self.assertIn("用户: 早，醒了吗", prompt)
+        self.assertIn('"action":"ENTER_CHAT"', prompt)
+
+    def test_midnight_cleanup_prompt_handles_shared_context_and_expired_memory(self):
+        messages = build_midnight_cleanup_messages(
+            date_str="2026-06-20",
+            memory_core_md="# 永久核心记忆",
+            day_memory_md="# 每日记忆",
+            tomorrow_topics_md="# 明日话题",
+        )
+        system_prompt = messages[0]["content"]
+
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("共同梗", system_prompt)
+        self.assertIn("暗号", system_prompt)
+        self.assertIn("昵称", system_prompt)
+        self.assertIn("专属表情含义", system_prompt)
+        self.assertIn("用户明确要求记住、多次自然出现", system_prompt)
+        self.assertIn("生命周期", system_prompt)
+        self.assertIn("expired", system_prompt)
+        self.assertIn("临时近期状态", system_prompt)
+        self.assertIn("TOMORROW_TOPICS.md 中移除或降权", system_prompt)
+        self.assertNotIn("删除 dm", system_prompt)
+
     def test_repair_prompt_marks_blocked_output_as_system_context_not_assistant_history(self):
         messages = build_repair_messages(
             base_messages=[{"role": "system", "content": "base"}],
@@ -910,6 +963,9 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertIn("not user-visible chat history", joined)
         self.assertIn("Do not produce a follow-up reply to original_raw_output", joined)
         self.assertIn("不要丢成“嗯”", joined)
+        self.assertIn("修复 COLD 错误时先判断入热价值", joined)
+        self.assertIn("COLD 下混合文字和表情必须先判断是否值得进入 HOT", joined)
+        self.assertIn("不要为了保留长句机械使用 ENTER_CHAT", joined)
         payload = json.loads(messages[1]["content"])
         self.assertEqual(payload["message_type"], "SYSTEM_REMINDER")
         self.assertEqual(payload["status"], "ACTION_HARNESS_PROTOCOL_ERROR")

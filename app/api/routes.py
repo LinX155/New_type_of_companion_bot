@@ -20,8 +20,14 @@ from ..active.messages import (
 )
 from ..core.event_gate import EventGate, ProcessContext
 from ..core.events import ChatEvent, EventType
-from ..core.decisions import Action, SendItem, SendItemType
+from ..core.decisions import Action, ActionDecision, SendItem, SendItemType
 from ..core.graph import CompanionGraph
+from ..core.repetition_guard import (
+    RECENT_REPETITION_WINDOW,
+    RepetitionRemoval,
+    build_repetition_guard_system_reminder,
+    filter_recent_repeated_reactions,
+)
 from ..core.state import ChatStatus
 from ..core.settings import load_settings, save_settings
 from ..llm.client import LLMClient
@@ -216,6 +222,14 @@ async def on_decision(ctx: ProcessContext):
         await _emit_state({"session_id": ctx.snapshot.session_id, "job_id": ctx.job_id, "result": "stale_dropped"})
         return
 
+    decision, repetition_removed = _apply_recent_repetition_guard(ctx, decision)
+    if repetition_removed:
+        _record_repetition_guard_filter(ctx, decision, repetition_removed)
+        if companion_graph:
+            companion_graph.append_internal_system_reminder(
+                build_repetition_guard_system_reminder(repetition_removed)
+            )
+
     event_gate.record_decision(decision)
 
     # 路由决策
@@ -335,6 +349,75 @@ async def on_decision(ctx: ProcessContext):
 
     companion_graph.commit_sent_items(ctx, sent_items)
     event_gate.mark_job_sent(ctx.job_id)
+
+
+def _apply_recent_repetition_guard(
+    ctx: ProcessContext,
+    decision: ActionDecision,
+) -> tuple[ActionDecision, list[RepetitionRemoval]]:
+    if decision.action in (Action.WAIT, Action.END_CHAT):
+        return decision, []
+
+    recent_texts = _recent_assistant_visible_texts(ctx.snapshot.session_id, RECENT_REPETITION_WINDOW)
+    result = filter_recent_repeated_reactions(decision, recent_texts)
+    return result.decision, result.removed
+
+
+def _recent_assistant_visible_texts(session_id: str, limit: int) -> list[str]:
+    db = next(get_db())
+    try:
+        rows = (
+            db.query(ConversationEvent)
+            .filter(ConversationEvent.session_id == session_id)
+            .filter(ConversationEvent.is_visible == True)  # noqa: E712
+            .filter(ConversationEvent.event_type.in_(["assistant_text", "assistant_react"]))
+            .order_by(desc(ConversationEvent.id))
+            .limit(limit)
+            .all()
+        )
+        return [row.text for row in rows if row.text]
+    finally:
+        db.close()
+
+
+def _record_repetition_guard_filter(
+    ctx: ProcessContext,
+    decision: ActionDecision,
+    removed: list[RepetitionRemoval],
+):
+    db = next(get_db())
+    try:
+        payload = {
+            "window": RECENT_REPETITION_WINDOW,
+            "removed": [
+                {
+                    "kind": item.kind,
+                    "value": item.value,
+                    "item_index": item.item_index,
+                }
+                for item in removed
+            ],
+            "visibility": "internal_debug_only",
+            "history_mutation": "none",
+        }
+        log = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id=ctx.snapshot.session_id,
+            event_type="repetition_guard",
+            raw_payload=_json_dumps(payload),
+            parsed_payload=_json_dumps(decision.to_harness_payload(exclude_none=True)),
+            action=decision.action.value,
+            snapshot_id=ctx.snapshot.snapshot_id,
+            buffer_version=ctx.snapshot.buffer_version,
+            job_id=ctx.job_id,
+            status="filtered",
+        )
+        db.add(log)
+        db.commit()
+    except Exception as e:
+        print(f"DB error: {e}")
+    finally:
+        db.close()
 
 
 def _requires_user_composing_gate(items: list[SendItem]) -> bool:

@@ -613,6 +613,16 @@ class CompanionGraph:
         if self._prompt_transcript:
             self._append_assistant_text_to_prompt(text)
 
+    def append_internal_system_reminder(self, message: dict):
+        if not self._prompt_transcript:
+            return
+        if message.get("role") != "system":
+            return
+        content = str(message.get("content") or "").strip()
+        if not content:
+            return
+        self._prompt_transcript.append({"role": "system", "content": content})
+
     def clear_prompt_state(self):
         self._conversation_history.clear()
         self.reset_provider_transcript(reason="conversation_cleared")
@@ -703,14 +713,16 @@ class CompanionGraph:
                 return []
             return [
                 "当前聊天状态是 COLD。包含 text item 的 REACT 属于文字+表情混合回复；"
-                "如果要发送文字+表情并进入热聊，请改用 ENTER_CHAT.items；"
+                "先判断这条用户输入是否值得进入 HOT；"
+                "如果用户明确开启对话、求陪、提问、倾诉或继续追问，需要发送文字+表情并进入热聊，请改用 ENTER_CHAT.items；"
                 "如果只是低负担回应，请删除 text item，保持纯 REACT；如果不回应，请使用 WAIT.items:null。"
             ]
 
         if decision.action == Action.REPLY:
             return [
                 "当前聊天状态是 COLD。普通文本展开回复不能使用 REPLY；"
-                "如果要可见回复并进入热聊，请改用 ENTER_CHAT.items；"
+                "先判断这条用户输入是否值得进入 HOT；"
+                "如果用户明确开启对话、求陪、提问、倾诉或继续追问，需要展开接话并进入热聊，请改用 ENTER_CHAT.items；"
                 "如果只是轻轻接一下，请使用 LIGHT_ACK；如果不回应，请使用 WAIT.items:null。"
             ]
 
