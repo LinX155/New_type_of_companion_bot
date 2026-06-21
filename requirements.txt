@@ -5,7 +5,8 @@ sqlalchemy==2.0.31
 alembic==1.13.2
 langgraph==0.1.13
 langchain-core>=0.2.22
-openai==1.35.0
+openai==2.41.1
+httpx==0.28.1
 apscheduler==3.10.4
 python-multipart==0.0.9
 aiofiles==23.2.1

@@ -1,4 +1,6 @@
 .research/
+.venv/
+venv/
 api_key*
 __pycache__/
 *.pyc
