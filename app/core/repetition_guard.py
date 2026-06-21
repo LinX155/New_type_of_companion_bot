@@ -1,3 +1,4 @@
+from collections import Counter
 from dataclasses import dataclass
 import json
 from typing import Iterable
@@ -6,6 +7,7 @@ from .decisions import Action, ActionDecision, SendItem, SendItemType
 
 
 RECENT_REPETITION_WINDOW = 5
+RECENT_REPETITION_DELETE_THRESHOLD = 2
 
 
 @dataclass(frozen=True)
@@ -25,7 +27,7 @@ def filter_recent_repeated_reactions(
     decision: ActionDecision,
     recent_visible_texts: Iterable[str],
 ) -> RepetitionFilterResult:
-    recent_emojis, recent_memes = _recent_reaction_sets(recent_visible_texts)
+    recent_emojis, recent_memes = _recent_reaction_counts(recent_visible_texts)
     if not recent_emojis and not recent_memes:
         return RepetitionFilterResult(decision=decision, removed=[])
 
@@ -36,20 +38,25 @@ def filter_recent_repeated_reactions(
     for index, item in enumerate(decision.all_items()):
         if item.type == SendItemType.MEME:
             stem = item.harness_value()
-            if stem in recent_memes:
+            if recent_memes[stem] >= RECENT_REPETITION_DELETE_THRESHOLD:
                 removed.append(RepetitionRemoval(kind="meme", value=stem, item_index=index))
                 changed = True
                 continue
 
         if item.type == SendItemType.EMOJI:
             emoji = _normalize_emoji_token(item.harness_value())
-            if emoji in recent_emojis:
+            if recent_emojis[emoji] >= RECENT_REPETITION_DELETE_THRESHOLD:
                 removed.append(RepetitionRemoval(kind="emoji", value=emoji, item_index=index))
                 changed = True
                 continue
 
         if item.type == SendItemType.TEXT:
-            stripped_text, stripped_emojis = _strip_blocked_emojis(item.content, recent_emojis)
+            blocked_emojis = {
+                emoji
+                for emoji, count in recent_emojis.items()
+                if count >= RECENT_REPETITION_DELETE_THRESHOLD
+            }
+            stripped_text, stripped_emojis = _strip_blocked_emojis(item.content, blocked_emojis)
             if stripped_emojis:
                 changed = True
                 removed.extend(
@@ -88,8 +95,8 @@ def build_repetition_guard_system_reminder(removed: list[RepetitionRemoval]) -> 
         "reason": "recent_visible_reaction_repetition",
         "filtered_items": filtered_items,
         "rules": [
-            "刚才你的输出中重复使用了最近 5 条助手可见消息里已经出现过的 emoji 或 meme，系统已在发送前删除这些重复项。",
-            "接下来不要继续使用 filtered_items 中相同的 emoji 或 meme file_stem；如需表达同类情绪，换成自然文字或不同表情。",
+            "刚才你的输出中重复使用了最近 5 条助手可见消息里已经出现至少 2 次的 emoji 或 meme，系统已在发送前删除这些会成为第 3 次的重复项。",
+            "接下来仅在最近 5 条助手可见消息中已经出现至少 2 次时，避免继续使用 filtered_items 中相同的 emoji 或 meme file_stem；如需表达同类情绪，换成自然文字或不同表情。",
             "不要向用户解释系统删除、过滤、规则、提醒或内部判断。",
         ],
     }
@@ -117,12 +124,13 @@ def reaction_signals_from_visible_text(text: str) -> tuple[set[str], set[str]]:
     return emojis, memes
 
 
-def _recent_reaction_sets(recent_visible_texts: Iterable[str]) -> tuple[set[str], set[str]]:
-    emojis: set[str] = set()
-    memes: set[str] = set()
+def _recent_reaction_counts(recent_visible_texts: Iterable[str]) -> tuple[Counter[str], Counter[str]]:
+    emojis: Counter[str] = Counter()
+    memes: Counter[str] = Counter()
     for text in recent_visible_texts:
-        text_emojis, text_memes = reaction_signals_from_visible_text(text)
-        emojis.update(text_emojis)
+        text = str(text or "")
+        text_memes = reaction_signals_from_visible_text(text)[1]
+        emojis.update(_iter_normalized_emojis(text))
         memes.update(text_memes)
     return emojis, memes
 
