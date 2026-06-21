@@ -529,7 +529,7 @@ def _split_text_for_display(text: str) -> list[str]:
             chinese_count_after_comma += 1
 
         if char in ("，", ","):
-            if chinese_count_after_comma > 6:
+            if chinese_count_after_comma > 5:
                 parts.append("".join(current))
                 current = []
             chinese_count_after_comma = 0

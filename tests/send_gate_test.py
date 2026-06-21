@@ -96,6 +96,10 @@ class SendGateTest(unittest.TestCase):
             ["晚霞好漂亮，想叫你来看"],
         )
         self.assertEqual(
+            routes._split_text_for_display("今天真的好烦，想睡觉"),
+            ["今天真的好烦，", "想睡觉"],
+        )
+        self.assertEqual(
             routes._split_text_for_display("刚在阳台给花浇水呢，晚霞好漂亮，今天风也很温柔，想叫你来看"),
             ["刚在阳台给花浇水呢，", "晚霞好漂亮，今天风也很温柔，", "想叫你来看"],
         )

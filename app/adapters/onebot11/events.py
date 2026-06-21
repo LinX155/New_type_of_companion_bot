@@ -10,6 +10,9 @@ def parse_onebot_event(payload: dict, default_input_ttl_ms: int = 8000) -> Optio
     if not isinstance(payload, dict):
         return None
 
+    if _is_poke_notice(payload):
+        return _parse_poke_notice(payload)
+
     if _is_input_status_notice(payload):
         user_id = _string_id(payload.get("user_id") or "unknown")
         event_type = _onebot_input_status_event_type(payload.get("event_type"))
@@ -41,6 +44,53 @@ def _is_input_status_notice(payload: dict) -> bool:
         payload.get("post_type") == "notice"
         and payload.get("notice_type") == "notify"
         and payload.get("sub_type") == "input_status"
+    )
+
+
+def _is_poke_notice(payload: dict) -> bool:
+    return (
+        payload.get("post_type") == "notice"
+        and payload.get("notice_type") == "notify"
+        and payload.get("sub_type") == "poke"
+    )
+
+
+def _parse_poke_notice(payload: dict) -> Optional[ChatEvent]:
+    self_id = _string_id(payload.get("self_id") or "")
+    actor_id = _string_id(
+        payload.get("user_id")
+        or payload.get("sender_id")
+        or payload.get("operator_id")
+        or payload.get("from_id")
+        or "unknown"
+    )
+    target_id = _string_id(payload.get("target_id") or payload.get("target_user_id") or "")
+
+    # If NapCat reports an action initiated by the bot itself, do not feed it
+    # back into the chat state as a user nudge.
+    if self_id and actor_id == self_id:
+        return None
+
+    timestamp = _onebot_timestamp(payload.get("time"))
+    event_id = (
+        f"onebot_poke_{actor_id}_{target_id or 'unknown'}_"
+        f"{int(timestamp.timestamp() * 1000)}_{uuid.uuid4().hex[:6]}"
+    )
+    return ChatEvent(
+        event_id=event_id,
+        platform="qq",
+        user_id=actor_id,
+        event_type=EventType.NUDGE,
+        text="拍了拍你",
+        timestamp=timestamp,
+        raw={
+            "source": "onebot11",
+            "nudge_type": "poke",
+            "qq_user_id": actor_id,
+            "qq_target_id": target_id,
+            "qq_group_id": _string_id(payload.get("group_id") or ""),
+            "onebot": payload,
+        },
     )
 
 

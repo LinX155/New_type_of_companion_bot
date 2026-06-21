@@ -129,6 +129,39 @@ class OneBotAdapterTest(unittest.TestCase):
         self.assertEqual(event.event_type, EventType.USER_COMPOSING)
         self.assertFalse(event.raw["composing"])
 
+    def test_poke_notice_parses_to_nudge_event(self):
+        event = parse_onebot_event({
+            "self_id": 3665612616,
+            "post_type": "notice",
+            "notice_type": "notify",
+            "sub_type": "poke",
+            "user_id": 550808201,
+            "target_id": 3665612616,
+            "time": 1782031609,
+        })
+
+        self.assertIsNotNone(event)
+        self.assertEqual(event.platform, "qq")
+        self.assertEqual(event.user_id, "550808201")
+        self.assertEqual(event.event_type, EventType.NUDGE)
+        self.assertEqual(event.text, "拍了拍你")
+        self.assertEqual(event.raw["nudge_type"], "poke")
+        self.assertEqual(event.raw["qq_user_id"], "550808201")
+        self.assertEqual(event.raw["qq_target_id"], "3665612616")
+
+    def test_self_initiated_poke_notice_is_ignored(self):
+        event = parse_onebot_event({
+            "self_id": 3665612616,
+            "post_type": "notice",
+            "notice_type": "notify",
+            "sub_type": "poke",
+            "user_id": 3665612616,
+            "target_id": 550808201,
+            "time": 1782031609,
+        })
+
+        self.assertIsNone(event)
+
     def test_message_received_clears_visible_composing_meta(self):
         async def scenario():
             async def noop_decision(_ctx):

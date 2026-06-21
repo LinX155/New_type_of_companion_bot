@@ -441,41 +441,36 @@ def build_meme_search_messages(
             }
         ]
 
-    candidates_text = json.dumps(search_results, ensure_ascii=False, indent=2)
     assistant_decision = original_decision or {
         "action": "REACT",
         "items": [{"search_meme": requested_text}],
     }
+    compact_results = []
+    for item in search_results:
+        request = str(item.get("request") or "").strip()
+        if not request:
+            category_part = str(item.get("category") or "").strip()
+            keywords_part = str(item.get("keywords") or "").strip()
+            request = f"{category_part}:{keywords_part}".strip(":")
+        compact_results.append({
+            "request": request,
+            "candidates": item.get("candidates") or [],
+        })
+
     tool_result = {
         "internal_tool": "search_meme_result",
         "status": "completed",
-        "requests": search_results,
-        "required_output": "继续同一轮对话，输出最终 JSON decision。",
-        "selection_rules": [
-            "这些 search_meme 是内部检索结果，不会直接发给用户。",
-            "二轮输出就是最终 decision，不能再出现 search_meme item。",
-            "保留仍合适的 text item，用 {\"meme\":\"<file_stem>\"} 替换 search_meme item。",
-            "每个 meme 的 file_stem 必须来自对应 request 的 candidates。",
-            "如果某个 request 没有合适候选，可删除该表情 item 或改成轻短 text。",
-            "不要编造本地路径，不要输出候选之外的 meme stem。",
-            "不要输出顶层 text 字段，只使用 action + items。",
-        ],
+        "results": compact_results,
+        "instruction": (
+            "继续同一轮对话，输出最终 action+items JSON；保留合适 text，"
+            "用对应 candidates 中的 {\"meme\":\"<file_stem>\"} 替换 search_meme；"
+            "不能再出现 search_meme 或顶层 text；不合适可删除该表情 item。"
+        ),
     }
     return [
         *base_messages,
         {"role": "assistant", "content": json.dumps(assistant_decision, ensure_ascii=False)},
         {"role": "system", "content": json.dumps(tool_result, ensure_ascii=False)},
-        {
-            "role": "system",
-            "content": (
-                "现在继续同一轮对话。只输出一个 JSON 对象，使用 action + items。"
-                "不要输出顶层 text 字段。"
-                "这是最终 decision，输出中不能再出现 search_meme item。"
-                "如果选择表情，item 格式必须是 {\"meme\":\"<file_stem>\"}。"
-                "meme 的 file_stem 只能从候选 candidates 中选择。"
-            ),
-        },
-        {"role": "user", "content": f"候选表情 JSON:\n{candidates_text}"},
     ]
 
 

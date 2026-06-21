@@ -717,7 +717,7 @@ class PromptAppendOnlyTest(unittest.TestCase):
         parsed = graph.get_last_parsed_decision()
         self.assertEqual(parsed["items"], [{"text": "啊这"}, {"search_meme": "amused:laugh"}])
 
-    def test_meme_second_round_prompt_uses_short_harness_shape(self):
+    def test_meme_second_round_prompt_uses_compact_short_harness_shape(self):
         messages = build_meme_search_messages(
             base_messages=[{"role": "system", "content": "base"}],
             search_results=[
@@ -733,12 +733,17 @@ class PromptAppendOnlyTest(unittest.TestCase):
 
         assistant_payload = json.loads(messages[1]["content"])
         tool_payload = json.loads(messages[2]["content"])
-        final_instruction = messages[3]["content"]
+        serialized_messages = json.dumps(messages, ensure_ascii=False)
 
+        self.assertEqual(len(messages), 3)
         self.assertEqual(assistant_payload, {"action": "REACT", "items": [{"search_meme": "amused:laugh"}]})
-        self.assertIn('{"meme":"<file_stem>"}', final_instruction)
-        self.assertNotIn('"type":"meme"', final_instruction)
-        self.assertIn('{"meme":"<file_stem>"}', "\n".join(tool_payload["selection_rules"]))
+        self.assertEqual(tool_payload["results"], [
+            {"request": "amused:laugh", "candidates": ["amused_laugh_001"]}
+        ])
+        self.assertIn('{"meme":"<file_stem>"}', tool_payload["instruction"])
+        self.assertNotIn('"type":"meme"', tool_payload["instruction"])
+        self.assertNotIn("候选表情 JSON", serialized_messages)
+        self.assertEqual(serialized_messages.count("amused_laugh_001"), 1)
 
     def test_natural_visible_output_is_coerced_before_repair(self):
         async def scenario():
