@@ -602,6 +602,8 @@ class PromptAppendOnlyTest(unittest.TestCase):
 
             self.assertEqual(messages[0]["role"], "system")
             self.assertIn("Action Harness", messages[0]["content"])
+            self.assertIn("不常见的陌生的名词", messages[0]["content"])
+            self.assertIn("根据知识库分析一下用户为什么会提到这个陌生名词", messages[0]["content"])
             self.assertEqual(self._count_content(messages, "早。"), 1)
             self.assertEqual(self._count_content(messages, "早"), 1)
 
