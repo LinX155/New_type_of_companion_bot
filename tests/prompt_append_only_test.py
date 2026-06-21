@@ -9,6 +9,7 @@ from app.core.protocol import build_repair_messages, parse_and_validate_raw_deci
 from app.core.state import ChatStatus, ColdStartMeta, ConversationSnapshot
 from app.llm.client import LLMClient, LLMResponseEnvelope
 from app.llm.prompts import (
+    build_memory_analysis_messages,
     build_mem_command_messages,
     build_meme_search_messages,
     build_midnight_cleanup_messages,
@@ -956,7 +957,34 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertIn("expired", system_prompt)
         self.assertIn("临时近期状态", system_prompt)
         self.assertIn("TOMORROW_TOPICS.md 中移除或降权", system_prompt)
+        self.assertIn("图片理解结果不是用户事实", system_prompt)
+        self.assertIn("单独普通图片分析结果不能直接进入 MEMORY_CORE.md", system_prompt)
+        self.assertIn("用户原话 > 用户文字 + 图片理解 > 单独图片理解", system_prompt)
+        self.assertIn("表情包理解结果不要进入 MEMORY_CORE.md", system_prompt)
         self.assertNotIn("删除 dm", system_prompt)
+
+    def test_memory_analysis_prompt_limits_image_understanding_memory(self):
+        messages = build_memory_analysis_messages(
+            date_str="2026-06-21",
+            transcript=[
+                {
+                    "created_at": "2026-06-21T12:00:00",
+                    "role": "user",
+                    "text": "今天下班路上看到这个晚霞 [图片]",
+                }
+            ],
+            today_memory_md="# 每日记忆",
+            tomorrow_topics_md="# 明日话题",
+        )
+        system_prompt = messages[0]["content"]
+        payload = json.loads(messages[1]["content"])
+
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("图片理解结果只是一种低优先级辅助证据", system_prompt)
+        self.assertIn("用户原话 > 用户文字 + 图片理解 > 单独图片理解", system_prompt)
+        self.assertIn("用户只发图片、没有文字确认时", system_prompt)
+        self.assertIn("表情包理解结果通常只代表当下心情、语气或接梗信号", system_prompt)
+        self.assertIn("今天下班路上看到这个晚霞", payload["user_visible_events"])
 
     def test_mem_command_prompt_disambiguates_user_first_person(self):
         messages = build_mem_command_messages(
