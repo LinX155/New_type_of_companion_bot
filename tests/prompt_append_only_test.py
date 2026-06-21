@@ -8,7 +8,12 @@ from app.core.graph import CompanionGraph
 from app.core.protocol import build_repair_messages, parse_and_validate_raw_decision
 from app.core.state import ChatStatus, ColdStartMeta, ConversationSnapshot
 from app.llm.client import LLMClient, LLMResponseEnvelope
-from app.llm.prompts import build_meme_search_messages, build_midnight_cleanup_messages, build_system_prompt
+from app.llm.prompts import (
+    build_mem_command_messages,
+    build_meme_search_messages,
+    build_midnight_cleanup_messages,
+    build_system_prompt,
+)
 
 
 class FakeLLM:
@@ -947,6 +952,26 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertIn("临时近期状态", system_prompt)
         self.assertIn("TOMORROW_TOPICS.md 中移除或降权", system_prompt)
         self.assertNotIn("删除 dm", system_prompt)
+
+    def test_mem_command_prompt_disambiguates_user_first_person(self):
+        messages = build_mem_command_messages(
+            content="我不喜欢初音未来了",
+            memory_core_md="# 永久核心记忆",
+            today_date="2026-06-21",
+        )
+        system_prompt = messages[0]["content"]
+        payload = json.loads(messages[1]["content"])
+
+        self.assertIn("其中“我/我的/本人/俺”都指用户", system_prompt)
+        self.assertIn("写入 MEMORY_CORE.md 时必须消除说话人歧义", system_prompt)
+        self.assertIn("用户现在不喜欢初音未来", system_prompt)
+        self.assertIn("不要写成“我不喜欢初音未来了”", system_prompt)
+        self.assertIn("我应该多主动找用户聊天", system_prompt)
+        self.assertIn("不要写成“你应该多主动找我聊天”", system_prompt)
+        self.assertIn("我以后不要频繁追问用户", system_prompt)
+        self.assertEqual(payload["content_speaker"], "用户")
+        self.assertIn("用户说的“我”必须落成“用户”", payload["memory_perspective"])
+        self.assertIn("你应该", payload["memory_perspective"])
 
     def test_repair_prompt_marks_blocked_output_as_system_context_not_assistant_history(self):
         messages = build_repair_messages(

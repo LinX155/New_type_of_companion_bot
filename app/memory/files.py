@@ -153,6 +153,7 @@ class MemoryFileManager:
     def _sync_append_mem(self, content: str) -> tuple[bool, str]:
         if not content:
             return False, "没有可写入的记忆内容。"
+        content = _normalize_mem_content_for_storage(content)
         existing = self.read_memory_core()
         today = datetime.now().strftime("%Y-%m-%d")
         line = f"- [/mem指令 {today}]: {content}"
@@ -340,6 +341,83 @@ def _guess_core_section(content: str) -> str:
     if any(word in text for word in ["不要", "别", "不喜欢", "喜欢", "希望", "称呼", "边界", "先陪", "建议"]):
         return "用户明确相处偏好"
     return "重要事实"
+
+
+def _normalize_mem_content_for_storage(content: str) -> str:
+    """Convert explicit /mem text into a user-centric memory sentence.
+
+    The LLM memory thread does richer semantic rewriting. This lightweight
+    fallback only prevents the most common identity ambiguity when the sync
+    append path is used.
+    """
+    text = (content or "").strip()
+    if not text:
+        return ""
+
+    self_prefix_replacements = (
+        ("你应该", "我应该"),
+        ("你要", "我要"),
+        ("你以后", "我以后"),
+        ("你不要", "我不要"),
+        ("你别", "我别"),
+        ("你的", "我的"),
+        ("你", "我"),
+    )
+    for prefix, replacement in self_prefix_replacements:
+        if text.startswith(prefix):
+            text = replacement + text[len(prefix):]
+            return _normalize_user_pronouns_inside_instruction(text)
+
+    prefix_replacements = (
+        ("我的", "用户的"),
+        ("我", "用户"),
+        ("俺的", "用户的"),
+        ("俺", "用户"),
+        ("本人", "用户"),
+    )
+    for prefix, replacement in prefix_replacements:
+        if text.startswith(prefix):
+            text = replacement + text[len(prefix):]
+            break
+
+    user_to_self_replacements = (
+        ("用户不希望你的", "用户不希望我的"),
+        ("用户不希望你", "用户不希望我"),
+        ("用户希望你的", "用户希望我的"),
+        ("用户希望你", "用户希望我"),
+        ("用户想让你的", "用户想让我的"),
+        ("用户想让你", "用户想让我"),
+        ("用户要求你的", "用户要求我的"),
+        ("用户要求你", "用户要求我"),
+        ("用户需要你的", "用户需要我的"),
+        ("用户需要你", "用户需要我"),
+    )
+    for target, replacement in user_to_self_replacements:
+        if target in text:
+            text = text.replace(target, replacement)
+
+    return text
+
+
+def _normalize_user_pronouns_inside_instruction(text: str) -> str:
+    self_prefix = ""
+    body = text
+    for prefix in ("我的", "我"):
+        if text.startswith(prefix):
+            self_prefix = prefix
+            body = text[len(prefix):]
+            break
+
+    replacements = (
+        ("我的", "用户的"),
+        ("我", "用户"),
+        ("俺的", "用户的"),
+        ("俺", "用户"),
+        ("本人", "用户"),
+    )
+    for target, replacement in replacements:
+        body = body.replace(target, replacement)
+    return self_prefix + body
 
 
 def _append_entry_to_core(core: str, section: str, line: str) -> str:

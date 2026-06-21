@@ -28,6 +28,9 @@ interface StatusInfo extends DebugStatus {
   last_action?: string;
   last_text?: string;
   last_snapshot_result?: string;
+  onebot?: {
+    connected?: boolean;
+  };
   gate?: {
     pending_job_id: string | null;
     stale_jobs_count: number;
@@ -54,6 +57,8 @@ const ChatWindow: React.FC = () => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const inputStatusTimerRef = useRef<number | null>(null);
+  const wsReconnectTimerRef = useRef<number | null>(null);
+  const conversationLoadSeqRef = useRef(0);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -67,6 +72,29 @@ const ChatWindow: React.FC = () => {
     fetch(`${API_BASE}/api/status`)
       .then(r => r.json())
       .then(data => setStatus(data))
+      .catch(() => {});
+  }, []);
+
+  const loadConversation = useCallback(() => {
+    const loadSeq = conversationLoadSeqRef.current + 1;
+    conversationLoadSeqRef.current = loadSeq;
+    return fetch(`${API_BASE}/api/conversation`)
+      .then(r => r.json())
+      .then(data => {
+        if (loadSeq !== conversationLoadSeqRef.current) {
+          return;
+        }
+        const loaded = data.map((e: any, idx: number) => ({
+          id: e.id ? `hist_${e.id}` : `hist_${idx}`,
+          role: e.event_type === 'nudge' ? 'system' : e.event_type?.startsWith('user') ? 'user' : 'assistant',
+          text: e.event_type === 'nudge' ? '已拍一拍' : e.text || '',
+          itemType: inferItemType(e.text, e.event_type),
+          action: e.action,
+          isMeme: e.event_type === 'assistant_react' || e.text?.startsWith('meme:') || e.text?.startsWith('emoji:'),
+          timestamp: e.created_at,
+        }));
+        setMessages(loaded);
+      })
       .catch(() => {});
   }, []);
 
@@ -93,76 +121,86 @@ const ChatWindow: React.FC = () => {
     }
   }, [fetchStatus]);
 
-  // Load conversation history
   useEffect(() => {
-    fetch(`${API_BASE}/api/conversation`)
-      .then(r => r.json())
-      .then(data => {
-        const loaded = data.map((e: any, idx: number) => ({
-          id: `hist_${idx}`,
-          role: e.event_type === 'nudge' ? 'system' : e.event_type?.startsWith('user') ? 'user' : 'assistant',
-          text: e.event_type === 'nudge' ? '已拍一拍' : e.text || '',
-          itemType: inferItemType(e.text, e.event_type),
-          action: e.action,
-          isMeme: e.event_type === 'assistant_react' || e.text?.startsWith('meme:') || e.text?.startsWith('emoji:'),
-          timestamp: e.created_at,
-        }));
-        setMessages(loaded);
-      })
-      .catch(() => {});
-  }, []);
+    loadConversation();
+  }, [loadConversation]);
 
   // WebSocket
   useEffect(() => {
-    const ws = new WebSocket(`ws://${window.location.host}/ws`);
-    wsRef.current = ws;
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === 'assistant_message') {
-          const content = data.content ?? data.text ?? '';
-          const itemType = data.item_type ?? inferItemType(content);
-          setMessages(prev => {
-            if (data.send_key && prev.some(msg => msg.sendKey === data.send_key || msg.id === data.send_key)) {
-              return prev;
-            }
-            return [...prev, {
-              id: data.send_key || `msg_${Date.now()}_${prev.length}`,
-              role: 'assistant',
-              text: content,
-              itemType,
-              action: data.action,
-              visible: data.visible,
-              isMeme: data.is_meme || itemType === 'meme' || itemType === 'emoji',
-              memePath: data.meme_path,
-              jobId: data.job_id,
-              snapshotId: data.snapshot_id,
-              sendIndex: data.send_index,
-              sendCount: data.send_count,
-              sendKey: data.send_key,
-              timestamp: new Date().toISOString(),
-            }];
-          });
-          setIsLoading(false);
-          fetchStatus();
-        } else if (data.type === 'assistant_state') {
-          if (data.result === 'llm_started') {
-            // LLM 真正开始思考/生成，才显示“对方正在输入”
-            setIsLoading(true);
-          } else {
+    let disposed = false;
+
+    const connect = () => {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+      wsRef.current = ws;
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'conversation_changed') {
+            loadConversation();
+            fetchStatus();
+          } else if (data.type === 'assistant_message') {
+            const content = data.content ?? data.text ?? '';
+            const itemType = data.item_type ?? inferItemType(content);
+            setMessages(prev => {
+              if (data.send_key && prev.some(msg => msg.sendKey === data.send_key || msg.id === data.send_key)) {
+                return prev;
+              }
+              return [...prev, {
+                id: data.send_key || `msg_${Date.now()}_${prev.length}`,
+                role: 'assistant',
+                text: content,
+                itemType,
+                action: data.action,
+                visible: data.visible,
+                isMeme: data.is_meme || itemType === 'meme' || itemType === 'emoji',
+                memePath: data.meme_path,
+                jobId: data.job_id,
+                snapshotId: data.snapshot_id,
+                sendIndex: data.send_index,
+                sendCount: data.send_count,
+                sendKey: data.send_key,
+                timestamp: new Date().toISOString(),
+              }];
+            });
             setIsLoading(false);
+            fetchStatus();
+          } else if (data.type === 'assistant_state') {
+            if (data.result === 'llm_started') {
+              // LLM 真正开始思考/生成，才显示“对方正在输入”
+              setIsLoading(true);
+            } else {
+              setIsLoading(false);
+            }
+            fetchStatus();
           }
-          fetchStatus();
+        } catch {}
+      };
+      ws.onclose = () => {
+        if (wsRef.current === ws) {
+          wsRef.current = null;
         }
-      } catch {}
+        if (!disposed) {
+          wsReconnectTimerRef.current = window.setTimeout(connect, 1500);
+        }
+      };
+      ws.onerror = () => {
+        ws.close();
+      };
     };
-    ws.onclose = () => {
-      setTimeout(() => {
-        // reconnect
-      }, 3000);
+
+    connect();
+
+    return () => {
+      disposed = true;
+      if (wsReconnectTimerRef.current !== null) {
+        window.clearTimeout(wsReconnectTimerRef.current);
+        wsReconnectTimerRef.current = null;
+      }
+      wsRef.current?.close();
+      wsRef.current = null;
     };
-    return () => ws.close();
-  }, []);
+  }, [fetchStatus, loadConversation]);
 
   useEffect(() => {
     const interval = setInterval(fetchStatus, 3000);
@@ -236,6 +274,8 @@ const ChatWindow: React.FC = () => {
     setStatus(null);
   };
 
+  const napcatConnected = status?.onebot?.connected === true;
+
   return (
     <div style={{
       display: 'grid',
@@ -259,6 +299,32 @@ const ChatWindow: React.FC = () => {
           flexDirection: 'column',
           gap: '12px',
         }}>
+          <div style={{
+            alignSelf: 'flex-start',
+            position: 'sticky',
+            top: 0,
+            zIndex: 1,
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '7px',
+            padding: '5px 9px',
+            borderRadius: '999px',
+            background: 'rgba(255, 255, 255, 0.94)',
+            border: '1px solid #e6ebef',
+            color: '#5d6d7e',
+            fontSize: '12px',
+            lineHeight: 1.2,
+            boxShadow: '0 1px 4px rgba(44, 62, 80, 0.08)',
+          }}>
+            <span style={{
+              width: '8px',
+              height: '8px',
+              borderRadius: '50%',
+              background: napcatConnected ? '#2ecc71' : '#bdc3c7',
+              boxShadow: napcatConnected ? '0 0 0 3px rgba(46, 204, 113, 0.16)' : 'none',
+            }} />
+            <span>Napcat连接状态</span>
+          </div>
           {messages.map(msg => (
             <div key={msg.id} style={{
               alignSelf: msg.role === 'system' ? 'center' : msg.role === 'user' ? 'flex-end' : 'flex-start',

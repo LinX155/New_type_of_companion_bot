@@ -53,12 +53,44 @@ if /I "%COMPANION_BOT_SETUP_ONLY%"=="1" (
     echo Setup-only mode enabled. Backend start skipped.
     exit /b 0
 )
+call :release_backend_port
+if errorlevel 1 goto :port_in_use
 "%VENV_PY%" -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 set "EXIT_CODE=%ERRORLEVEL%"
 echo.
 echo Backend exited with code %EXIT_CODE%.
 pause
 exit /b %EXIT_CODE%
+
+:release_backend_port
+set "BACKEND_PORT=8000"
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$ErrorActionPreference = 'Stop';" ^
+  "$port = [int]$env:BACKEND_PORT;" ^
+  "$root = [System.IO.Path]::GetFullPath($env:ROOT).TrimEnd('\');" ^
+  "$listeners = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique);" ^
+  "foreach ($processId in $listeners) {" ^
+  "  if (-not $processId) { continue }" ^
+  "  $proc = Get-CimInstance Win32_Process -Filter \"ProcessId=$processId\" -ErrorAction SilentlyContinue;" ^
+  "  $cmd = if ($proc) { [string]$proc.CommandLine } else { '' };" ^
+  "  $name = if ($proc) { [string]$proc.Name } else { '' };" ^
+  "  $belongsToProject = $cmd.Contains($root) -or ($cmd.Contains('uvicorn') -and $cmd.Contains('app.main:app'));" ^
+  "  $isPythonBackend = ($name -match '^(python|pythonw|py)\.exe$') -and $belongsToProject;" ^
+  "  if (-not $isPythonBackend) {" ^
+  "    Write-Host ('ERROR: Port {0} is already used by PID {1}: {2}' -f $port, $processId, $cmd);" ^
+  "    exit 2;" ^
+  "  }" ^
+  "  Write-Host ('Port {0} is still held by previous backend PID {1}. Stopping it...' -f $port, $processId);" ^
+  "  Stop-Process -Id $processId -Force -ErrorAction Stop;" ^
+  "}" ^
+  "for ($i = 0; $i -lt 30; $i++) {" ^
+  "  $stillListening = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue);" ^
+  "  if ($stillListening.Count -eq 0) { exit 0 }" ^
+  "  Start-Sleep -Milliseconds 200;" ^
+  "}" ^
+  "Write-Host ('ERROR: Port {0} is still not released after waiting.' -f $port);" ^
+  "exit 3;"
+exit /b %ERRORLEVEL%
 
 :find_venv
 set "VENV_DIR="
@@ -134,5 +166,11 @@ exit /b 1
 
 :pip_install_failed
 echo ERROR: Failed to install Python dependencies.
+pause
+exit /b 1
+
+:port_in_use
+echo ERROR: Port 8000 is already in use and could not be released safely.
+echo Close the program using port 8000, then run start.bat again.
 pause
 exit /b 1

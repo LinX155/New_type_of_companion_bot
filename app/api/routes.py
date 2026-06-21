@@ -4,13 +4,15 @@ import json
 import re
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import desc
 
+from ..adapters.onebot11 import OneBotConnectionManager, parse_onebot_event
 from ..active.messages import (
     count_candidates_by_status,
     expire_stale_candidates,
@@ -92,6 +94,7 @@ memory_manager = MemoryFileManager()
 meme_catalog = MemeCatalog()
 meme_steal_analyzer = MemeStealAnalyzer(meme_catalog, ROOT_DIR)
 scheduler_manager = SchedulerManager(memory_manager, llm_client)
+onebot_manager = OneBotConnectionManager()
 
 companion_graph: Optional[CompanionGraph] = None
 event_gate: Optional[EventGate] = None
@@ -117,6 +120,11 @@ class ApiConfig(BaseModel):
 
 
 class ChatMessage(BaseModel):
+    text: str
+
+
+class OneBotDebugSendRequest(BaseModel):
+    user_id: str
     text: str
 
 
@@ -334,6 +342,7 @@ async def on_decision(ctx: ProcessContext):
             "send_index": send_index,
             "send_count": send_count,
             "send_key": send_key,
+            **_message_target_from_snapshot(ctx.snapshot),
         })
         event_gate.mark_send_key_sent(send_key)
         _record_assistant_send(
@@ -345,6 +354,7 @@ async def on_decision(ctx: ProcessContext):
             send_count=send_count,
             send_key=send_key,
         )
+        await _emit_conversation_changed("assistant_send")
         sent_items.append(item)
 
     companion_graph.commit_sent_items(ctx, sent_items)
@@ -424,12 +434,54 @@ def _requires_user_composing_gate(items: list[SendItem]) -> bool:
     return any(item.type == SendItemType.TEXT for item in items)
 
 
+def _onebot_expected_token() -> str:
+    return (
+        os.getenv("ONEBOT_ACCESS_TOKEN")
+        or str(load_settings().get("onebot_access_token") or "")
+    ).strip()
+
+
+def _message_target_from_snapshot(snapshot) -> dict:
+    events = list(snapshot.events or [])
+    if not events:
+        return {}
+
+    # Only the latest pending input owns the outgoing channel. This prevents a
+    # WebUI turn from being sent to QQ just because an older QQ event is still
+    # present in the same buffered snapshot.
+    event = events[-1]
+    if event.get("platform") != "qq":
+        return {}
+
+    user_id = event.get("user_id")
+    raw = event.get("raw") or {}
+    if isinstance(raw, dict):
+        user_id = raw.get("qq_user_id") or user_id
+    if user_id:
+        return {
+            "target_platform": "qq",
+            "target_user_id": str(user_id),
+        }
+    return {}
+
+
+def _message_target_from_event(event: ChatEvent) -> dict:
+    if event.platform != "qq":
+        return {}
+    return {
+        "target_platform": "qq",
+        "target_user_id": event.user_id,
+    }
+
+
 async def _emit_message(data: dict):
     for cb in message_callbacks:
         try:
             await cb(data)
         except Exception:
             pass
+    if data.get("type") == "assistant_message" and data.get("target_platform") == "qq":
+        await _send_onebot_assistant_message(data)
 
 
 async def _emit_state(data: dict):
@@ -439,6 +491,88 @@ async def _emit_state(data: dict):
 async def _emit_llm_started():
     """LLM 真正开始思考/生成时通知前端显示“对方正在输入”。"""
     await _emit_state({"result": "llm_started"})
+
+
+async def _emit_conversation_changed(reason: str, event: Optional[ChatEvent] = None):
+    if event and event.event_type == EventType.USER_COMPOSING:
+        return
+    await _emit_message({
+        "type": "conversation_changed",
+        "session_id": DEFAULT_SESSION_ID,
+        "reason": reason,
+        "event_type": event.event_type.value if event else None,
+        "platform": event.platform if event else None,
+        "user_id": event.user_id if event else None,
+    })
+
+
+async def _send_onebot_assistant_message(data: dict) -> None:
+    target_user_id = str(data.get("target_user_id") or "")
+    if not target_user_id:
+        return
+
+    send_key = data.get("send_key") or f"onebot_command_{uuid.uuid4().hex[:8]}"
+    item_type = str(data.get("item_type") or "text")
+    content = str(data.get("content") or data.get("text") or "")
+    try:
+        if item_type == SendItemType.MEME.value or content.startswith("meme:"):
+            stem = content[5:] if content.startswith("meme:") else content
+            image_path = _meme_path_for_stem(stem)
+            if not image_path:
+                _record_onebot_send(send_key, target_user_id, item_type, content, None, "skipped:meme_not_found")
+                return
+            response = await onebot_manager.send_private_image(target_user_id, Path(image_path).resolve().as_uri())
+        else:
+            response = await onebot_manager.send_private_text(target_user_id, content)
+        _record_onebot_send(send_key, target_user_id, item_type, content, response, "sent")
+    except Exception as exc:
+        _record_onebot_send(send_key, target_user_id, item_type, content, None, "error", str(exc))
+
+
+def _meme_path_for_stem(stem: str) -> str:
+    normalized = (stem or "").strip()
+    if not normalized:
+        return ""
+    for category_id, stems in meme_catalog.get_all_images().items():
+        if normalized in stems:
+            return meme_catalog.get_image_path(category_id, normalized)
+    return ""
+
+
+def _record_onebot_send(
+    send_key: str,
+    target_user_id: str,
+    item_type: str,
+    content: str,
+    response: Optional[dict],
+    status: str,
+    error_message: Optional[str] = None,
+):
+    db = next(get_db())
+    try:
+        log = RawChatLog(
+            event_id=f"{send_key}:onebot",
+            session_id=DEFAULT_SESSION_ID,
+            event_type="onebot_send",
+            platform="qq",
+            user_id=target_user_id,
+            raw_payload=_json_dumps({
+                "target_user_id": target_user_id,
+                "item_type": item_type,
+                "response": response,
+            }),
+            final_text=content,
+            item_type=item_type,
+            send_key=send_key,
+            status=status,
+            error_message=error_message,
+        )
+        db.add(log)
+        db.commit()
+    except Exception as exc:
+        print(f"DB error: {exc}")
+    finally:
+        db.close()
 
 
 async def _wait_until_user_not_composing(ctx: ProcessContext) -> bool:
@@ -535,44 +669,15 @@ async def send_message(msg: ChatMessage):
     )
 
     _record_incoming_event(event)
+    await _emit_conversation_changed("incoming_event", event)
 
     result = await event_gate.handle_event(event)
 
     if event_type == EventType.COMMAND_MEM:
-        await _emit_llm_started()
-        success, response_text = await memory_manager.apply_mem_via_llm(text, llm_client)
-        event_gate.record_command("/mem", "success" if success else "error")
-        await _record_command_response(DEFAULT_SESSION_ID, "command.mem", response_text, success)
-        await _emit_message({
-            "type": "assistant_message",
-            "session_id": DEFAULT_SESSION_ID,
-            "action": "COMMAND_MEM",
-            "text": response_text,
-            "content": response_text,
-            "item_type": "text",
-            "visible": True,
-            "is_meme": False,
-            "meme_path": None,
-        })
-        return {**result, "memory_updated": success, "response": response_text}
+        return await _handle_command_event(event, result)
 
     if event_type == EventType.COMMAND_FORGET:
-        await _emit_llm_started()
-        success, response_text = await memory_manager.apply_forget_via_llm(text, llm_client)
-        event_gate.record_command("/forget", "success" if success else "error")
-        await _record_command_response(DEFAULT_SESSION_ID, "command.forget", response_text, success)
-        await _emit_message({
-            "type": "assistant_message",
-            "session_id": DEFAULT_SESSION_ID,
-            "action": "COMMAND_FORGET",
-            "text": response_text,
-            "content": response_text,
-            "item_type": "text",
-            "visible": True,
-            "is_meme": False,
-            "meme_path": None,
-        })
-        return {**result, "memory_updated": success, "response": response_text}
+        return await _handle_command_event(event, result)
 
     return result
 
@@ -597,6 +702,111 @@ async def update_input_status(config: InputStatusConfig):
         "composing": event_gate.get_user_composing_meta(),
     })
     return result
+
+
+@router.websocket("/onebot/ws")
+async def onebot_ws(websocket: WebSocket):
+    init_gate()
+    await onebot_manager.handle_websocket(
+        websocket=websocket,
+        event_handler=handle_onebot_payload,
+        expected_token=_onebot_expected_token(),
+    )
+
+
+@router.get("/api/onebot/status")
+async def get_onebot_status():
+    return onebot_manager.status()
+
+
+@router.post("/api/onebot/debug/send-private-text")
+async def debug_send_onebot_private_text(request: Request, payload: OneBotDebugSendRequest):
+    client_host = request.client.host if request.client else ""
+    if client_host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(status_code=403, detail="local debug endpoint only")
+
+    user_id = payload.user_id.strip()
+    text = payload.text.strip()
+    if not user_id or not text:
+        raise HTTPException(status_code=400, detail="user_id and text are required")
+
+    try:
+        response = await onebot_manager.send_private_text(user_id, text)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"status": "sent", "response": response}
+
+
+async def handle_onebot_payload(payload: dict) -> None:
+    event = parse_onebot_event(payload)
+    if not event:
+        return
+
+    init_gate()
+    if event.event_type == EventType.TEXT:
+        event_type = _event_type_for_text(event.text or "")
+        if event_type != event.event_type:
+            event = event.model_copy(update={"event_type": event_type})
+
+    _record_incoming_event(event)
+    await _emit_conversation_changed("incoming_event", event)
+    result = await event_gate.handle_event(event)
+
+    if event.event_type in (EventType.COMMAND_MEM, EventType.COMMAND_FORGET):
+        await _handle_command_event(event, result)
+        return
+
+    if event.event_type == EventType.USER_COMPOSING:
+        await _emit_state({
+            "session_id": DEFAULT_SESSION_ID,
+            "result": "user_composing",
+            "composing": event_gate.get_user_composing_meta(),
+            "target_platform": "qq",
+            "target_user_id": event.user_id,
+        })
+
+
+async def _handle_command_event(event: ChatEvent, result: Optional[dict] = None) -> dict:
+    text = event.text or ""
+    if event.event_type == EventType.COMMAND_MEM:
+        action = "COMMAND_MEM"
+        action_key = "command.mem"
+        command = "/mem"
+        success, response_text = await _run_mem_command(text)
+    elif event.event_type == EventType.COMMAND_FORGET:
+        action = "COMMAND_FORGET"
+        action_key = "command.forget"
+        command = "/forget"
+        success, response_text = await _run_forget_command(text)
+    else:
+        return result or {"handled": False, "type": "not_command"}
+
+    event_gate.record_command(command, "success" if success else "error")
+    await _record_command_response(DEFAULT_SESSION_ID, action_key, response_text, success)
+    await _emit_message({
+        "type": "assistant_message",
+        "session_id": DEFAULT_SESSION_ID,
+        "action": action,
+        "text": response_text,
+        "content": response_text,
+        "item_type": "text",
+        "visible": True,
+        "is_meme": False,
+        "meme_path": None,
+        **_message_target_from_event(event),
+    })
+    await _emit_conversation_changed("assistant_command_response")
+    return {**(result or {}), "memory_updated": success, "response": response_text}
+
+
+async def _run_mem_command(text: str) -> tuple[bool, str]:
+    await _emit_llm_started()
+    return await memory_manager.apply_mem_via_llm(text, llm_client)
+
+
+async def _run_forget_command(text: str) -> tuple[bool, str]:
+    await _emit_llm_started()
+    return await memory_manager.apply_forget_via_llm(text, llm_client)
 
 
 def _event_type_for_text(text: str) -> EventType:
@@ -625,6 +835,8 @@ def _record_incoming_event(event: ChatEvent):
             event_type = "user_image"
         elif event.event_type == EventType.STICKER:
             event_type = "user_sticker"
+        elif event.event_type == EventType.USER_COMPOSING:
+            event_type = "user_composing"
 
         conv = ConversationEvent(
             session_id=session_id,
@@ -1049,6 +1261,7 @@ async def send_nudge():
         raw={"source": "webui"},
     )
     _record_incoming_event(event)
+    await _emit_conversation_changed("incoming_event", event)
     result = await event_gate.handle_event(event)
     return result
 
@@ -1327,6 +1540,7 @@ async def get_status():
         "snapshot": snapshot_panel,
         "llm": llm_panel,
         "meme": meme_panel,
+        "onebot": onebot_manager.status(),
     }
 
 
@@ -1336,6 +1550,7 @@ async def get_conversation():
     try:
         events = (
             db.query(ConversationEvent)
+            .filter(ConversationEvent.is_visible == True)  # noqa: E712
             .order_by(ConversationEvent.created_at)
             .all()
         )
@@ -1382,4 +1597,5 @@ async def clear_conversation():
     finally:
         db.close()
 
+    await _emit_conversation_changed("conversation_cleared")
     return {"status": "ok"}

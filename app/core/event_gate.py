@@ -67,7 +67,7 @@ class EventGate:
 
     async def _handle_nudge(self, event: ChatEvent) -> dict:
         """拍一拍强制刷新注意力"""
-        self.clear_user_composing()
+        self.clear_user_composing(event, reason="nudge_received")
         if not event.text:
             event.text = "拍了拍你"
 
@@ -114,7 +114,7 @@ class EventGate:
 
     async def _handle_chat_message(self, event: ChatEvent) -> dict:
         """处理普通聊天消息"""
-        self.clear_user_composing()
+        self.clear_user_composing(event, reason="message_received")
         await self.maybe_exit_hot()
         previous_user_message_at = self.state.last_user_message_at
         self.state.msg_index_today += 1
@@ -167,12 +167,33 @@ class EventGate:
         composing = self._parse_bool(raw.get("composing", True))
         ttl_ms = int(raw.get("ttl_ms") or 6000)
         ttl_ms = max(500, min(ttl_ms, 30000))
+        now = datetime.now()
 
         if composing:
-            self._user_composing_until = event.timestamp + timedelta(milliseconds=ttl_ms)
+            self._user_composing_until = now + timedelta(milliseconds=ttl_ms)
         else:
             self._user_composing_until = None
 
+        self._set_last_composing_event(
+            event=event,
+            composing=composing,
+            ttl_ms=ttl_ms,
+            reason="input_status",
+        )
+        return {
+            "handled": True,
+            "type": "user_composing",
+            "composing": self.is_user_composing(),
+            "until": self._user_composing_until.isoformat() if self._user_composing_until else None,
+        }
+
+    def _set_last_composing_event(
+        self,
+        event: ChatEvent,
+        composing: bool,
+        ttl_ms: int = 0,
+        reason: str = "",
+    ):
         self._last_composing_event = {
             "platform": event.platform,
             "user_id": event.user_id,
@@ -180,12 +201,8 @@ class EventGate:
             "ttl_ms": ttl_ms,
             "until": self._user_composing_until.isoformat() if self._user_composing_until else None,
         }
-        return {
-            "handled": True,
-            "type": "user_composing",
-            "composing": self.is_user_composing(),
-            "until": self._user_composing_until.isoformat() if self._user_composing_until else None,
-        }
+        if reason:
+            self._last_composing_event["reason"] = reason
 
     def _parse_bool(self, value) -> bool:
         if isinstance(value, bool):
@@ -305,10 +322,24 @@ class EventGate:
         if datetime.now() <= self._user_composing_until:
             return True
         self._user_composing_until = None
+        if self._last_composing_event and self._last_composing_event.get("composing"):
+            self._last_composing_event = {
+                **self._last_composing_event,
+                "composing": False,
+                "until": None,
+                "reason": "expired",
+            }
         return False
 
-    def clear_user_composing(self):
+    def clear_user_composing(self, event: Optional[ChatEvent] = None, reason: str = "cleared"):
         self._user_composing_until = None
+        if event:
+            self._set_last_composing_event(
+                event=event,
+                composing=False,
+                ttl_ms=0,
+                reason=reason,
+            )
 
     def get_user_composing_meta(self) -> dict:
         return {
