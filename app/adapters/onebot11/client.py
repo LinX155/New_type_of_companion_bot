@@ -115,6 +115,16 @@ class OneBotConnectionManager:
             },
         )
 
+    async def set_input_status(self, user_id: str, event_type: int) -> dict:
+        return await self.request(
+            action="set_input_status",
+            params={
+                "user_id": _coerce_int(user_id),
+                "event_type": event_type,
+            },
+            timeout=3.0,
+        )
+
     def status(self) -> dict:
         return {
             "connected": self._websocket is not None,

@@ -606,6 +606,14 @@ class CompanionGraph:
             text = self._history_text_for_item(item)
             self._conversation_history.append({"role": "assistant", "text": text})
 
+    def commit_assistant_items(self, items: list[SendItem]):
+        if not items:
+            return
+
+        for item in items:
+            text = self._history_text_for_item(item)
+            self._conversation_history.append({"role": "assistant", "text": text})
+
     def commit_external_assistant_text(self, text: str):
         if not text:
             return

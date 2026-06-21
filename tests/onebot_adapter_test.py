@@ -189,6 +189,34 @@ class OneBotAdapterTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_connection_manager_sets_input_status(self):
+        async def scenario():
+            manager = OneBotConnectionManager()
+            websocket = FakeWebSocket()
+            manager._websocket = websocket
+
+            task = asyncio.create_task(manager.set_input_status("550808201", 1))
+            await asyncio.sleep(0)
+
+            self.assertEqual(len(websocket.sent), 1)
+            action = websocket.sent[0]
+            self.assertEqual(action["action"], "set_input_status")
+            self.assertEqual(action["params"], {
+                "user_id": 550808201,
+                "event_type": 1,
+            })
+
+            manager._resolve_action_response({
+                "status": "ok",
+                "retcode": 0,
+                "data": None,
+                "echo": action["echo"],
+            })
+            response = await task
+            self.assertEqual(response["retcode"], 0)
+
+        asyncio.run(scenario())
+
     def test_snapshot_target_uses_latest_qq_event(self):
         snapshot = SimpleNamespace(events=[
             {"platform": "webui", "user_id": "user", "raw": {"source": "webui"}},

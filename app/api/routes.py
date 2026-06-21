@@ -50,6 +50,35 @@ router = APIRouter()
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DEFAULT_SESSION_ID = "default"
 
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# NapCat exposes set_input_status.event_type as a raw number and its public docs
+# do not list the enum. Keep the observed working code configurable so testing
+# can continue without changing the adapter surface.
+ONEBOT_LLM_INPUT_STATUS_EVENT_TYPE = _env_int("ONEBOT_LLM_INPUT_STATUS_EVENT_TYPE", 1)
+ONEBOT_LLM_INPUT_STATUS_REFRESH_SECONDS = max(
+    1.0,
+    _env_float("ONEBOT_LLM_INPUT_STATUS_REFRESH_SECONDS", 3.0),
+)
+ONEBOT_LLM_INPUT_STATUS_MAX_SECONDS = max(
+    ONEBOT_LLM_INPUT_STATUS_REFRESH_SECONDS,
+    _env_float("ONEBOT_LLM_INPUT_STATUS_MAX_SECONDS", 120.0),
+)
+_onebot_input_status_tasks: dict[str, asyncio.Task] = {}
+
 # 启动时加载持久化的用户配置（API key 等）
 _persisted = load_settings()
 
@@ -201,6 +230,7 @@ def _event_payload(event: ChatEvent) -> dict:
 async def on_decision(ctx: ProcessContext):
     """LLM 决策回调"""
     global companion_graph, event_gate
+    target = _message_target_from_snapshot(ctx.snapshot)
 
     if event_gate.is_job_stale(ctx.job_id):
         event_gate.mark_job_stale_dropped(ctx.job_id)
@@ -210,10 +240,11 @@ async def on_decision(ctx: ProcessContext):
         return
 
     try:
-        await _emit_llm_started()
+        await _emit_llm_started(target)
         decision = await companion_graph.run(ctx)
         _record_prompt_cache_debug(ctx, companion_graph.get_prompt_observability())
     except Exception as e:
+        await _emit_llm_finished(target, "error")
         event_gate.mark_job_dropped(ctx.job_id)
         _record_llm_error(ctx, str(e))
         await _emit_state({
@@ -224,6 +255,7 @@ async def on_decision(ctx: ProcessContext):
         return
 
     if not await event_gate.is_snapshot_current(ctx):
+        await _emit_llm_finished(target, "stale_dropped")
         event_gate.mark_job_stale_dropped(ctx.job_id)
         await event_gate.dispatch_latest_after_stale(ctx.job_id)
         _record_job_state(ctx, "stale_dropped", {"reason": "snapshot_not_current"})
@@ -247,10 +279,9 @@ async def on_decision(ctx: ProcessContext):
     items = list(result.get("items") or [])
 
     if result["visible"] and items:
-        if _requires_user_composing_gate(items) and not await _wait_until_user_not_composing(ctx):
-            return
         cleared, send_group_version = await event_gate.clear_buffer_after_visible_send(ctx.snapshot.buffer_version)
         if not cleared:
+            await _emit_llm_finished(target, "stale_dropped")
             event_gate.mark_job_stale_dropped(ctx.job_id)
             await event_gate.dispatch_latest_after_stale(ctx.job_id)
             _record_job_state(ctx, "stale_dropped", {"reason": "buffer_version_changed_before_send"})
@@ -265,6 +296,7 @@ async def on_decision(ctx: ProcessContext):
         await event_gate._exit_hot()
 
     if not result["visible"] or not items:
+        await _emit_llm_finished(target, "dropped")
         _record_decision_drop(ctx, decision)
         event_gate.mark_job_dropped(ctx.job_id)
         await _emit_state({
@@ -276,12 +308,30 @@ async def on_decision(ctx: ProcessContext):
         })
         return
 
+    display_units = _build_display_send_units(items)
     sent_items: list[SendItem] = []
-    send_count = len(items)
-    for send_index, item in enumerate(items):
+    sent_original_indices: set[int] = set()
+    committed_sent_count = 0
+
+    def commit_sent_progress():
+        nonlocal committed_sent_count
+        if not companion_graph or committed_sent_count >= len(sent_items):
+            return
+        pending_items = sent_items[committed_sent_count:]
+        if committed_sent_count == 0:
+            companion_graph.commit_sent_items(ctx, list(sent_items))
+        else:
+            companion_graph.commit_assistant_items(pending_items)
+        committed_sent_count = len(sent_items)
+
+    send_count = len(display_units)
+    for send_index, unit in enumerate(display_units):
+        original_index = unit["original_index"]
+        original_item = unit["original_item"]
+        item = unit["display_item"]
         if not await event_gate.is_send_group_current(ctx, send_group_version):
-            if sent_items:
-                companion_graph.commit_sent_items(ctx, sent_items)
+            await _emit_llm_finished(target, "stale_dropped")
+            commit_sent_progress()
             event_gate.mark_job_stale_dropped(ctx.job_id)
             await event_gate.dispatch_latest_after_stale(ctx.job_id)
             _record_job_state(ctx, "stale_dropped", {
@@ -306,10 +356,17 @@ async def on_decision(ctx: ProcessContext):
         content = item.content
         item_type = item.type.value
         per_send_result = {**result, "text": content, "texts": [content], "item": item}
+
+        if _requires_user_composing_gate([item]):
+            commit_sent_progress()
+            if not await _wait_until_user_not_composing(ctx):
+                await _emit_llm_finished(target, "stale_dropped")
+                return
+
         event_gate.record_send_meta(ctx, send_index, send_count, item_type)
         if not await event_gate.is_send_group_current(ctx, send_group_version):
-            if sent_items:
-                companion_graph.commit_sent_items(ctx, sent_items)
+            await _emit_llm_finished(target, "stale_dropped")
+            commit_sent_progress()
             event_gate.mark_job_stale_dropped(ctx.job_id)
             await event_gate.dispatch_latest_after_stale(ctx.job_id)
             _record_job_state(ctx, "stale_dropped", {
@@ -355,10 +412,13 @@ async def on_decision(ctx: ProcessContext):
             send_key=send_key,
         )
         await _emit_conversation_changed("assistant_send")
-        sent_items.append(item)
+        if unit["is_last_part"] and original_index not in sent_original_indices:
+            sent_items.append(original_item)
+            sent_original_indices.add(original_index)
 
-    companion_graph.commit_sent_items(ctx, sent_items)
+    commit_sent_progress()
     event_gate.mark_job_sent(ctx.job_id)
+    await _emit_llm_finished(target, "sent")
 
 
 def _apply_recent_repetition_guard(
@@ -434,6 +494,55 @@ def _requires_user_composing_gate(items: list[SendItem]) -> bool:
     return any(item.type == SendItemType.TEXT for item in items)
 
 
+def _build_display_send_units(items: list[SendItem]) -> list[dict]:
+    units: list[dict] = []
+    for original_index, item in enumerate(items):
+        display_parts = (
+            _split_text_for_display(item.content)
+            if item.type == SendItemType.TEXT
+            else [item.content]
+        )
+        for part_index, part in enumerate(display_parts):
+            display_item = item
+            if item.type == SendItemType.TEXT and part != item.content:
+                display_item = SendItem(type=SendItemType.TEXT, content=part)
+            units.append({
+                "original_index": original_index,
+                "original_item": item,
+                "display_item": display_item,
+                "is_last_part": part_index == len(display_parts) - 1,
+            })
+    return units
+
+
+def _split_text_for_display(text: str) -> list[str]:
+    if not text:
+        return [text]
+
+    parts: list[str] = []
+    current: list[str] = []
+    chinese_count_after_comma = 0
+
+    for char in text:
+        current.append(char)
+        if _is_chinese_char(char):
+            chinese_count_after_comma += 1
+
+        if char in ("，", ","):
+            if chinese_count_after_comma > 6:
+                parts.append("".join(current))
+                current = []
+            chinese_count_after_comma = 0
+
+    if current:
+        parts.append("".join(current))
+    return parts or [text]
+
+
+def _is_chinese_char(char: str) -> bool:
+    return "\u4e00" <= char <= "\u9fff"
+
+
 def _onebot_expected_token() -> str:
     return (
         os.getenv("ONEBOT_ACCESS_TOKEN")
@@ -488,9 +597,96 @@ async def _emit_state(data: dict):
     await _emit_message({"type": "assistant_state", **data})
 
 
-async def _emit_llm_started():
+async def _emit_llm_started(target: Optional[dict] = None):
     """LLM 真正开始思考/生成时通知前端显示“对方正在输入”。"""
-    await _emit_state({"result": "llm_started"})
+    payload = {"result": "llm_started"}
+    if target:
+        payload.update(target)
+    await _emit_state(payload)
+    await _start_onebot_input_status_refresh(target)
+
+
+async def _emit_llm_finished(target: Optional[dict] = None, reason: str = "llm_finished"):
+    await _stop_onebot_input_status_refresh(target)
+    payload = {"result": "llm_finished", "reason": reason}
+    if target:
+        payload.update(target)
+    await _emit_state(payload)
+
+
+def _onebot_input_status_user_id(target: Optional[dict]) -> str:
+    if not target or target.get("target_platform") != "qq":
+        return ""
+    user_id = str(target.get("target_user_id") or "")
+    return user_id.strip()
+
+
+async def _start_onebot_input_status_refresh(target: Optional[dict]):
+    user_id = _onebot_input_status_user_id(target)
+    if not user_id:
+        return
+
+    await _stop_onebot_input_status_refresh(target)
+    task_target = dict(target or {})
+    if not await _set_onebot_input_status(
+        task_target,
+        event_type=ONEBOT_LLM_INPUT_STATUS_EVENT_TYPE,
+        reason="llm_started",
+    ):
+        return
+
+    task = asyncio.create_task(_onebot_input_status_refresh_loop(task_target, user_id))
+    _onebot_input_status_tasks[user_id] = task
+
+    def cleanup(done_task: asyncio.Task):
+        if _onebot_input_status_tasks.get(user_id) is done_task:
+            _onebot_input_status_tasks.pop(user_id, None)
+
+    task.add_done_callback(cleanup)
+
+
+async def _stop_onebot_input_status_refresh(target: Optional[dict]):
+    user_id = _onebot_input_status_user_id(target)
+    if not user_id:
+        return
+    task = _onebot_input_status_tasks.pop(user_id, None)
+    if not task or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+async def _onebot_input_status_refresh_loop(target: dict, user_id: str):
+    started_at = asyncio.get_running_loop().time()
+    try:
+        while True:
+            await asyncio.sleep(ONEBOT_LLM_INPUT_STATUS_REFRESH_SECONDS)
+            if asyncio.get_running_loop().time() - started_at > ONEBOT_LLM_INPUT_STATUS_MAX_SECONDS:
+                return
+            await _set_onebot_input_status(
+                target,
+                event_type=ONEBOT_LLM_INPUT_STATUS_EVENT_TYPE,
+                reason="llm_refresh",
+            )
+    except asyncio.CancelledError:
+        raise
+
+
+async def _set_onebot_input_status(target: Optional[dict], event_type: int, reason: str) -> bool:
+    user_id = _onebot_input_status_user_id(target)
+    if not user_id:
+        return False
+
+    try:
+        response = await onebot_manager.set_input_status(user_id, event_type)
+        _record_onebot_input_status(user_id, event_type, response, "sent", reason)
+        return True
+    except Exception as exc:
+        _record_onebot_input_status(user_id, event_type, None, "error", reason, str(exc))
+        return False
 
 
 async def _emit_conversation_changed(reason: str, event: Optional[ChatEvent] = None):
@@ -564,6 +760,40 @@ def _record_onebot_send(
             final_text=content,
             item_type=item_type,
             send_key=send_key,
+            status=status,
+            error_message=error_message,
+        )
+        db.add(log)
+        db.commit()
+    except Exception as exc:
+        print(f"DB error: {exc}")
+    finally:
+        db.close()
+
+
+def _record_onebot_input_status(
+    target_user_id: str,
+    event_type: int,
+    response: Optional[dict],
+    status: str,
+    reason: str,
+    error_message: Optional[str] = None,
+):
+    db = next(get_db())
+    try:
+        log = RawChatLog(
+            event_id=f"onebot_input_status_{uuid.uuid4().hex[:8]}",
+            session_id=DEFAULT_SESSION_ID,
+            event_type="onebot_input_status_send",
+            platform="qq",
+            user_id=target_user_id,
+            raw_payload=_json_dumps({
+                "target_user_id": target_user_id,
+                "event_type": event_type,
+                "reason": reason,
+                "response": response,
+            }),
+            item_type="input_status",
             status=status,
             error_message=error_message,
         )
@@ -768,21 +998,31 @@ async def handle_onebot_payload(payload: dict) -> None:
 
 async def _handle_command_event(event: ChatEvent, result: Optional[dict] = None) -> dict:
     text = event.text or ""
+    target = _message_target_from_event(event)
     if event.event_type == EventType.COMMAND_MEM:
         action = "COMMAND_MEM"
         action_key = "command.mem"
         command = "/mem"
-        success, response_text = await _run_mem_command(text)
+        try:
+            success, response_text = await _run_mem_command(text, target)
+        except Exception:
+            await _emit_llm_finished(target, "command_error")
+            raise
     elif event.event_type == EventType.COMMAND_FORGET:
         action = "COMMAND_FORGET"
         action_key = "command.forget"
         command = "/forget"
-        success, response_text = await _run_forget_command(text)
+        try:
+            success, response_text = await _run_forget_command(text, target)
+        except Exception:
+            await _emit_llm_finished(target, "command_error")
+            raise
     else:
         return result or {"handled": False, "type": "not_command"}
 
     event_gate.record_command(command, "success" if success else "error")
     await _record_command_response(DEFAULT_SESSION_ID, action_key, response_text, success)
+    await _emit_llm_finished(target, "command_response")
     await _emit_message({
         "type": "assistant_message",
         "session_id": DEFAULT_SESSION_ID,
@@ -799,13 +1039,13 @@ async def _handle_command_event(event: ChatEvent, result: Optional[dict] = None)
     return {**(result or {}), "memory_updated": success, "response": response_text}
 
 
-async def _run_mem_command(text: str) -> tuple[bool, str]:
-    await _emit_llm_started()
+async def _run_mem_command(text: str, target: Optional[dict] = None) -> tuple[bool, str]:
+    await _emit_llm_started(target)
     return await memory_manager.apply_mem_via_llm(text, llm_client)
 
 
-async def _run_forget_command(text: str) -> tuple[bool, str]:
-    await _emit_llm_started()
+async def _run_forget_command(text: str, target: Optional[dict] = None) -> tuple[bool, str]:
+    await _emit_llm_started(target)
     return await memory_manager.apply_forget_via_llm(text, llm_client)
 
 
@@ -1047,6 +1287,7 @@ async def run_active_message_once(manual: bool = False) -> dict:
     if not job_id:
         return {"status": "skipped", "reason": "gate_busy"}
 
+    llm_started = False
     try:
         topics = memory_manager.read_tomorrow_topics()
         topics, expired_count = expire_stale_candidates(topics)
@@ -1064,6 +1305,7 @@ async def run_active_message_once(manual: bool = False) -> dict:
             return {"status": "skipped", "reason": "llm_not_configured"}
 
         await _emit_llm_started()
+        llm_started = True
         messages = build_active_message_messages(
             candidate_section=candidate.section,
             candidate_text=candidate.text,
@@ -1132,6 +1374,9 @@ async def run_active_message_once(manual: bool = False) -> dict:
     except Exception as e:
         await event_gate.finish_active_message_job(job_id, "dropped")
         return {"status": "error", "reason": str(e)}
+    finally:
+        if llm_started:
+            await _emit_llm_finished(reason="active_message_finished")
 
 
 def _record_active_message(session_id: str, job_id: str, raw_output: str, decision, routed: dict):
