@@ -532,6 +532,90 @@ def build_meme_steal_analysis_messages(
     ]
 
 
+def build_image_understanding_messages(
+    image_url: str,
+    is_sticker: bool,
+    event_text: str = "",
+    context_text: str = "",
+) -> list:
+    """构建 QQ 图片/表情事件的轻量视觉理解提示词。"""
+    context = context_text.strip() or "(没有额外前文，只根据当前图片和用户输入判断。)"
+    visible_text = event_text.strip() or ("[表情]" if is_sticker else "[图片]")
+    if is_sticker:
+        schema = (
+            "{\n"
+            '  "kind": "sticker",\n'
+            '  "visible_summary": "一句话描述表情包画面",\n'
+            '  "user_mood": "开心 | 无语 | 撒娇 | 委屈 | 接梗 | 催促 | 其他",\n'
+            '  "interaction_intent": "mood_only | echo_context | ask_attention | tease | comfort | unknown",\n'
+            '  "reply_bias": "short_text | send_meme_back | continue_topic | lightly_tease | wait",\n'
+            '  "confidence": "high | medium | low"\n'
+            "}"
+        )
+        instruction = (
+            "你是 QQ 聊天里的表情包理解器。用户发表情包通常只是表达心情、语气或接梗，"
+            "类似 emoji；不要过度分析，不要建议把分析内容讲给用户。\n"
+            "你的任务只是在内部概括这个表情包大概代表什么心情，以及主聊天应该轻轻怎么接。\n"
+            "主聊天更适合短句、回一个相近表情包、接梗或继续原话题；不要建议可见回复变成"
+            "“这个表情包很可爱”“你是不是很开心/发生什么事了”这类分析腔。\n"
+            "只输出 JSON 对象，不要 Markdown、解释、前后缀或额外文本。"
+        )
+        user_text = (
+            "请轻量理解这张用户发来的表情包。不要把它当成需要严肃分析的图片。\n"
+            "如果上下文已经能说明用户为什么发表情包，就只把它当作语气补充，不要制造新的追问。\n"
+            f"当前用户输入: {visible_text}\n"
+            f"聊天上下文: {context}"
+        )
+    else:
+        schema = (
+            "{\n"
+            '  "kind": "photo | screenshot | object | scene | document | meme_like | unknown",\n'
+            '  "visible_summary": "一句话说明图片大概是什么",\n'
+            '  "relation_to_context": "它和前文有什么关系，不知道写 unknown",\n'
+            '  "user_intent": "用户为什么发这张图，优先按分享理解",\n'
+            '  "desired_response": "用户可能希望我如何回应",\n'
+            '  "reply_style": "short | warm | playful | comfort | ask_followup | careful",\n'
+            '  "confidence": "high | medium | low"\n'
+            "}"
+        )
+        instruction = (
+            "你是 QQ 聊天里的图片理解器。用户发普通图片首先是在分享，通常期待对方明确看见了、"
+            "接住了，并围绕图片本身回应。\n"
+            "你的任务是内部理解图片内容、它和前文的关系、用户为什么发，以及主聊天应该怎么回应。\n"
+            "必须主动阅读聊天上下文：如果前文能解释这张图为什么被发来，就把关系和动机写具体；"
+            "只有真的看不出关系时才写 unknown。\n"
+            "只输出 JSON 对象，不要 Markdown、解释、前后缀或额外文本。"
+        )
+        user_text = (
+            "请理解这张用户发来的普通图片。重点判断用户为什么分享它，以及主聊天应该如何明确回应。\n"
+            "把它当成用户在把一件事给我看，而不是发来一个待分析对象。\n"
+            f"当前用户输入: {visible_text}\n"
+            f"聊天上下文: {context}"
+        )
+
+    return [
+        {
+            "role": "system",
+            "content": (
+                f"{instruction}\n\n"
+                "输出 schema:\n"
+                f"{schema}\n\n"
+                "约束:\n"
+                "- 不确定就降低 confidence，不要编造细节。\n"
+                "- 这是内部事件 harness，不是用户可见回复。\n"
+                "- 不要提到 JSON、schema、系统、harness 或内部规则。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        },
+    ]
+
+
 def build_active_message_messages(
     candidate_section: str,
     candidate_text: str,

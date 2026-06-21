@@ -27,6 +27,7 @@ from ..llm.prompts import (
     build_meme_search_messages,
 )
 from ..memory.files import MemoryFileManager
+from .media_jobs import MediaJob, MediaJobQueue
 from ..memes.catalog import MemeCatalog
 from ..memes.search import MemeSearch
 from ..memes.renderer import MemeRenderer
@@ -51,15 +52,19 @@ class CompanionGraph:
         llm_client: LLMClient,
         memory_manager: MemoryFileManager,
         meme_catalog: MemeCatalog,
+        media_job_queue: Optional[MediaJobQueue] = None,
     ):
         self.llm = llm_client
         self.memory = memory_manager
         self.meme_catalog = meme_catalog
         self.meme_search = MemeSearch(meme_catalog)
         self.meme_renderer = MemeRenderer(meme_catalog)
+        self.media_job_queue = media_job_queue
         self._conversation_history: list = []
         self._prompt_transcript: list[dict] = []
         self._prompt_event_ids: set[str] = set()
+        self._media_harness_event_ids: set[str] = set()
+        self._media_completed_result_ids: set[str] = set()
         self._prompt_transcript_identity: Optional[str] = None
         self._prefix_rebuild_reason: Optional[str] = None
         self._last_prompt_messages: list[dict] = []
@@ -77,6 +82,7 @@ class CompanionGraph:
         self._last_parse_status: str = "ok"
         self._last_search_meme: Optional[str] = None
         self._last_render_status: Optional[str] = None
+        self._last_media_debug: list[dict] = []
 
     def _record_llm_raw_output(self, raw_output: str):
         self._last_llm_raw_output = raw_output
@@ -128,6 +134,8 @@ class CompanionGraph:
         self._last_hot_turn_reminder_hash = None
         self._append_runtime_context(ctx)
         self._append_snapshot_events(snapshot.events)
+        self._append_completed_media_results_from_queue()
+        self._append_media_pending_payloads_and_enqueue_jobs(ctx)
         self._append_hot_turn_system_reminder(snapshot)
         self._prompt_transcript.append({"role": "system", "content": FINAL_ACTION_OUTPUT_REMINDER})
 
@@ -638,9 +646,12 @@ class CompanionGraph:
     def reset_provider_transcript(self, reason: str = "provider_transcript_reset"):
         self._prompt_transcript.clear()
         self._prompt_event_ids.clear()
+        self._media_harness_event_ids.clear()
+        self._media_completed_result_ids.clear()
         self._last_prompt_messages.clear()
         self._last_prompt_observability.clear()
         self._prompt_block_hashes.clear()
+        self._last_media_debug.clear()
         self._last_runtime_block_hash = None
         self._prompt_transcript_identity = self._current_llm_identity()
         self._prefix_rebuild_reason = reason
@@ -777,6 +788,9 @@ class CompanionGraph:
     def get_last_render_status(self) -> Optional[str]:
         return self._last_render_status
 
+    def get_last_media_debug(self) -> list[dict]:
+        return copy.deepcopy(self._last_media_debug)
+
     def get_last_llm_observability(self) -> dict:
         return {
             "last_llm_raw": self.get_llm_raw_output_history(),
@@ -786,6 +800,7 @@ class CompanionGraph:
             "parse_status": self._last_parse_status,
             "last_search_meme": self._last_search_meme,
             "last_render_status": self._last_render_status,
+            "last_media_debug": self.get_last_media_debug(),
             "prompt_cache": self.get_prompt_observability(),
         }
 
@@ -980,6 +995,169 @@ class CompanionGraph:
         reminder_message = build_hot_turn_system_reminder_message()
         self._last_hot_turn_reminder_hash = self._hash_text(reminder_message["content"])
         self._prompt_transcript.append(reminder_message)
+
+    def _append_completed_media_results_from_queue(self):
+        if not self.media_job_queue:
+            return
+        for payload in self.media_job_queue.get_completed_payloads_for_prompt():
+            result_id = (
+                f"{payload.get('media_job_id')}:"
+                f"{payload.get('internal_event_harness')}:"
+                f"{payload.get('media_key')}"
+            )
+            if result_id in self._media_completed_result_ids:
+                continue
+            self._prompt_transcript.append({
+                "role": "system",
+                "content": json.dumps(payload, ensure_ascii=False),
+            })
+            self._media_completed_result_ids.add(result_id)
+
+    def _append_media_pending_payloads_and_enqueue_jobs(self, ctx: ProcessContext):
+        self._last_media_debug = []
+        for evt in ctx.snapshot.events:
+            raw = self._event_get(evt, "raw") or {}
+            if not isinstance(raw, dict):
+                continue
+            media_refs = raw.get("media_refs") or []
+            if not isinstance(media_refs, list):
+                continue
+
+            for index, media_ref in enumerate(media_refs):
+                if not isinstance(media_ref, dict):
+                    continue
+                media_key = self._media_harness_key(ctx, evt, media_ref, index)
+                if media_key in self._media_harness_event_ids:
+                    continue
+
+                pending_payload = self._build_media_pending_payload(ctx, evt, media_ref, media_key, index)
+                if self.media_job_queue:
+                    enqueued = self.media_job_queue.enqueue(
+                        MediaJob(
+                            media_key=media_key,
+                            session_id=ctx.snapshot.session_id,
+                            snapshot_id=ctx.snapshot.snapshot_id,
+                            buffer_version=ctx.snapshot.buffer_version,
+                            source_job_id=ctx.job_id,
+                            event=copy.deepcopy(evt),
+                            media_ref=copy.deepcopy(media_ref),
+                            event_text=str(self._event_get(evt, "text") or ""),
+                            context_text=self._media_context_text(evt),
+                        )
+                    )
+                    pending_payload["status"] = "queued" if enqueued else "already_queued"
+                else:
+                    pending_payload["status"] = "queue_not_configured"
+
+                self._prompt_transcript.append({
+                    "role": "system",
+                    "content": json.dumps(pending_payload, ensure_ascii=False),
+                })
+                self._last_media_debug.append(pending_payload)
+                self._media_harness_event_ids.add(media_key)
+
+    def _build_media_pending_payload(
+        self,
+        ctx: ProcessContext,
+        evt: dict,
+        media_ref: dict,
+        media_key: str,
+        index: int,
+    ) -> dict:
+        is_sticker = bool(media_ref.get("is_sticker"))
+        has_user_text = self._media_event_has_user_text(evt)
+        kind = "sticker" if is_sticker else "ordinary_image"
+        return {
+            "internal_event_harness": "sticker_pending" if is_sticker else "media_pending",
+            "status": "pending",
+            "media_key": media_key,
+            "snapshot_id": ctx.snapshot.snapshot_id,
+            "buffer_version": ctx.snapshot.buffer_version,
+            "segment_index": media_ref.get("segment_index", index),
+            "kind": kind,
+            "is_sticker": is_sticker,
+            "has_user_text": has_user_text,
+            "visibility": "internal_only",
+            "background_processing": "queued_for_download_vision_and_intake",
+            "media_ref": self._safe_media_ref_for_prompt(media_ref),
+            "instruction": self._media_pending_instruction(is_sticker, has_user_text),
+        }
+
+    def _media_pending_instruction(self, is_sticker: bool, has_user_text: bool) -> str:
+        if is_sticker:
+            if has_user_text:
+                return (
+                    "用户混合发送了文字和表情包/贴纸。主聊天可以结合文字内容和“表情包=语气/心情/接梗信号”"
+                    "轻轻回应；不要等待后台偷表情入库，不要分析表情包画面给用户听。"
+                )
+            return (
+                "用户发的是表情包/贴纸，通常只是表达心情、语气或接梗。主聊天轻轻接住即可，"
+                "可短句、WAIT、继续原话题或回表情包；不要等待后台入库，也不要输出“这个表情包说明你……”这类分析腔。"
+            )
+
+        if has_user_text:
+            return (
+                "用户混合发送了文字和普通图片。主聊天优先回复文字内容；图片是分享，后台正在理解，"
+                "当前不要编造图片内容，也不要装作已经看清图片细节。"
+            )
+        return (
+            "用户只发来普通图片，第一语义是分享。图片内容正在后台理解；当前可以先轻轻接住，"
+            "例如表示看到了/正在看，但不要编造图片里有什么。"
+        )
+
+    def _media_event_has_user_text(self, evt: dict) -> bool:
+        text = str(self._event_get(evt, "text") or "").strip()
+        if not text:
+            return False
+        clean = re.sub(r"\[(?:图片|表情|QQ表情(?::[^\]]*)?)\]", "", text)
+        return bool(clean.strip())
+
+    def _media_harness_key(self, ctx: ProcessContext, evt: dict, media_ref: dict, index: int) -> str:
+        event_id = self._event_get(evt, "event_id") or self._event_get(evt, "id") or f"snapshot_{ctx.snapshot.snapshot_id}"
+        segment_index = media_ref.get("segment_index")
+        if segment_index is None:
+            segment_index = index
+        identity = (
+            media_ref.get("file_unique")
+            or media_ref.get("file_id")
+            or media_ref.get("file")
+            or media_ref.get("url")
+            or segment_index
+        )
+        return f"{event_id}:{segment_index}:{identity}"
+
+    def _safe_media_ref_for_prompt(self, media_ref: dict) -> dict:
+        allowed_keys = (
+            "source",
+            "qq_user_id",
+            "onebot_message_id",
+            "segment_index",
+            "segment_type",
+            "sub_type",
+            "summary",
+            "file",
+            "file_id",
+            "file_unique",
+            "file_size",
+            "is_sticker",
+            "sha256",
+            "download_status",
+            "download_error",
+        )
+        return {key: media_ref.get(key) for key in allowed_keys if media_ref.get(key) is not None}
+
+    def _media_context_text(self, evt: dict) -> str:
+        history_tail = self._conversation_history[-8:]
+        lines = []
+        for item in history_tail:
+            role = item.get("role") or "unknown"
+            text = str(item.get("text") or "").strip()
+            if text:
+                lines.append(f"{role}: {text}")
+        current = str(self._event_get(evt, "text") or "").strip()
+        if current:
+            lines.append(f"user: {current}")
+        return "\n".join(lines)
 
     def _append_snapshot_events(self, events: list[dict]):
         for evt in events:

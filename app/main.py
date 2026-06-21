@@ -5,7 +5,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .api.routes import router, message_callbacks
+from .api.routes import router, message_callbacks, shutdown_background_workers
 
 
 @asynccontextmanager
@@ -14,7 +14,7 @@ async def lifespan(app: FastAPI):
     os.makedirs("./data", exist_ok=True)
     yield
     # Shutdown
-    pass
+    await shutdown_background_workers()
 
 
 app = FastAPI(title="Companion Bot", lifespan=lifespan)

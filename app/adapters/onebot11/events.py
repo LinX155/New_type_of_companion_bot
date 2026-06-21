@@ -114,7 +114,7 @@ def _parse_private_message(payload: dict) -> ChatEvent:
     reply_to_message_id = None
     media_refs: list[dict] = []
 
-    for segment in segments:
+    for segment_index, segment in enumerate(segments):
         if not isinstance(segment, dict):
             continue
         seg_type = str(segment.get("type") or "").strip().lower()
@@ -145,13 +145,24 @@ def _parse_private_message(payload: dict) -> ChatEvent:
             has_image = has_image or not is_sticker
             text_parts.append("[表情]" if is_sticker else "[图片]")
             media_refs.append({
+                "source": "qq",
+                "qq_user_id": user_id,
+                "onebot_message_id": message_id,
+                "segment_index": segment_index,
                 "segment_type": seg_type,
                 "sub_type": data.get("sub_type"),
                 "summary": data.get("summary"),
                 "file": data.get("file"),
+                "file_id": data.get("file_id"),
+                "file_unique": data.get("file_unique") or data.get("file_unique_id"),
                 "url": data.get("url"),
+                "path": data.get("path"),
                 "file_size": data.get("file_size"),
                 "is_sticker": is_sticker,
+                "local_path": None,
+                "sha256": None,
+                "download_status": None,
+                "download_error": None,
             })
             continue
 
@@ -205,7 +216,8 @@ def _is_sticker_image(seg_type: str, data: dict) -> bool:
         return True
     summary = str(data.get("summary") or "")
     sub_type = str(data.get("sub_type") or "")
-    return sub_type == "1" or "表情" in summary
+    file_name = str(data.get("file") or "").strip().lower()
+    return sub_type == "1" or "表情" in summary or file_name == "marketface"
 
 
 def _string_id(value) -> str:

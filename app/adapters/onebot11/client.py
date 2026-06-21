@@ -125,6 +125,30 @@ class OneBotConnectionManager:
             timeout=3.0,
         )
 
+    async def get_msg(self, message_id: str) -> dict:
+        return await self.request(
+            action="get_msg",
+            params={"message_id": _coerce_int(message_id)},
+        )
+
+    async def get_image(self, file: str) -> dict:
+        return await self.request(
+            action="get_image",
+            params={"file": file},
+        )
+
+    async def get_file(self, file_id: str) -> dict:
+        return await self.request(
+            action="get_file",
+            params={"file_id": file_id},
+        )
+
+    async def download_file_stream(self, file_id: str) -> dict:
+        return await self.request(
+            action="download_file_stream",
+            params={"file_id": file_id},
+        )
+
     def status(self) -> dict:
         return {
             "connected": self._websocket is not None,

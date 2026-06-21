@@ -60,7 +60,13 @@ class OneBotAdapterTest(unittest.TestCase):
 
         self.assertEqual(event.event_type, EventType.IMAGE)
         self.assertEqual(event.text, "[图片]")
-        self.assertEqual(event.raw["media_refs"][0]["is_sticker"], False)
+        media_ref = event.raw["media_refs"][0]
+        self.assertEqual(media_ref["is_sticker"], False)
+        self.assertEqual(media_ref["source"], "qq")
+        self.assertEqual(media_ref["qq_user_id"], "550808201")
+        self.assertEqual(media_ref["onebot_message_id"], "1411302046")
+        self.assertEqual(media_ref["segment_index"], 0)
+        self.assertIn("local_path", media_ref)
 
     def test_subtype_one_image_parses_as_sticker(self):
         event = parse_onebot_event({
@@ -85,6 +91,32 @@ class OneBotAdapterTest(unittest.TestCase):
         self.assertEqual(event.event_type, EventType.STICKER)
         self.assertEqual(event.text, "[表情]")
         self.assertEqual(event.raw["media_refs"][0]["is_sticker"], True)
+
+    def test_face_segment_is_builtin_qq_expression_not_downloadable_media(self):
+        event = parse_onebot_event({
+            "post_type": "message",
+            "message_type": "private",
+            "message_id": 222333444,
+            "user_id": 550808201,
+            "message": [
+                {
+                    "type": "face",
+                    "data": {
+                        "id": "343",
+                        "raw": {
+                            "faceType": 3,
+                            "faceText": "/我方了",
+                            "packId": "1",
+                            "stickerId": "27",
+                        },
+                    },
+                }
+            ],
+        })
+
+        self.assertEqual(event.event_type, EventType.STICKER)
+        self.assertEqual(event.text, "[QQ表情: face:343]")
+        self.assertEqual(event.raw["media_refs"], [])
 
     def test_reply_segment_keeps_reply_id_and_text(self):
         event = parse_onebot_event({
@@ -243,6 +275,31 @@ class OneBotAdapterTest(unittest.TestCase):
                 "status": "ok",
                 "retcode": 0,
                 "data": None,
+                "echo": action["echo"],
+            })
+            response = await task
+            self.assertEqual(response["retcode"], 0)
+
+        asyncio.run(scenario())
+
+    def test_connection_manager_exposes_download_file_stream_action(self):
+        async def scenario():
+            manager = OneBotConnectionManager()
+            websocket = FakeWebSocket()
+            manager._websocket = websocket
+
+            task = asyncio.create_task(manager.download_file_stream("abc-file-id"))
+            await asyncio.sleep(0)
+
+            self.assertEqual(len(websocket.sent), 1)
+            action = websocket.sent[0]
+            self.assertEqual(action["action"], "download_file_stream")
+            self.assertEqual(action["params"], {"file_id": "abc-file-id"})
+
+            manager._resolve_action_response({
+                "status": "ok",
+                "retcode": 0,
+                "data": {"path": "x"},
                 "echo": action["echo"],
             })
             response = await task

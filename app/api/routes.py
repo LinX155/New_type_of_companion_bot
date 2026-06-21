@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import desc
 
-from ..adapters.onebot11 import OneBotConnectionManager, parse_onebot_event
+from ..adapters.onebot11 import OneBotConnectionManager, OneBotMediaDownloader, parse_onebot_event
 from ..active.messages import (
     count_candidates_by_status,
     expire_stale_candidates,
@@ -24,6 +24,7 @@ from ..core.event_gate import EventGate, ProcessContext
 from ..core.events import ChatEvent, EventType
 from ..core.decisions import Action, ActionDecision, SendItem, SendItemType
 from ..core.graph import CompanionGraph
+from ..core.media_jobs import MediaJob, MediaJobQueue
 from ..core.repetition_guard import (
     RECENT_REPETITION_WINDOW,
     RepetitionRemoval,
@@ -36,7 +37,7 @@ from ..llm.client import LLMClient
 from ..llm.prompts import build_active_message_messages
 from ..memory.files import MemoryFileManager
 from ..memes.catalog import MemeCatalog
-from ..memes.steal import MemeStealAnalyzer
+from ..memes.steal import MemeStealAnalyzer, MemeStealSaver
 from ..scheduler.jobs import SchedulerManager
 from ..storage.db import get_db, engine
 from ..storage.models import Base, RawChatLog, ConversationEvent, ensure_storage_schema
@@ -122,11 +123,14 @@ llm_client = LLMClient(**_load_default_llm_config())
 memory_manager = MemoryFileManager()
 meme_catalog = MemeCatalog()
 meme_steal_analyzer = MemeStealAnalyzer(meme_catalog, ROOT_DIR)
+meme_steal_saver = MemeStealSaver(meme_catalog, ROOT_DIR)
 scheduler_manager = SchedulerManager(memory_manager, llm_client)
 onebot_manager = OneBotConnectionManager()
+onebot_media_downloader = OneBotMediaDownloader(ROOT_DIR, onebot_manager)
 
 companion_graph: Optional[CompanionGraph] = None
 event_gate: Optional[EventGate] = None
+media_job_queue: Optional[MediaJobQueue] = None
 
 # Store for WebUI callbacks
 message_callbacks = []
@@ -194,8 +198,17 @@ class MemeStealAnalyzeRequest(BaseModel):
 
 
 def init_gate():
-    global event_gate, companion_graph
+    global event_gate, companion_graph, media_job_queue
     if event_gate is None:
+        media_job_queue = MediaJobQueue(
+            llm_client=llm_client,
+            media_downloader=onebot_media_downloader,
+            meme_steal_analyzer=meme_steal_analyzer,
+            meme_steal_saver=meme_steal_saver,
+            on_payloads=_record_background_media_payloads,
+            max_workers=1,
+        )
+        media_job_queue.start()
         event_gate = EventGate(
             on_decision=on_decision,
             hot_duration_minutes=_persisted.get("hot_duration_minutes", 30),
@@ -204,6 +217,7 @@ def init_gate():
             llm_client=llm_client,
             memory_manager=memory_manager,
             meme_catalog=meme_catalog,
+            media_job_queue=media_job_queue,
         )
         # 启动时把持久化的调度时间应用到调度器
         for job_id in ("memory_analysis_day", "memory_analysis_night", "midnight_cleanup"):
@@ -214,6 +228,13 @@ def init_gate():
         scheduler_manager.update_schedule("active_message", active_cfg["hour"], active_cfg["minute"])
         scheduler_manager.set_active_message_callback(run_active_message_once)
         scheduler_manager.start()
+    elif media_job_queue:
+        media_job_queue.start()
+
+
+async def shutdown_background_workers():
+    if media_job_queue:
+        await media_job_queue.shutdown()
 
 
 def _json_dumps(value) -> str:
@@ -243,6 +264,12 @@ async def on_decision(ctx: ProcessContext):
         await _emit_llm_started(target)
         decision = await companion_graph.run(ctx)
         _record_prompt_cache_debug(ctx, companion_graph.get_prompt_observability())
+        media_debug = (
+            companion_graph.get_last_media_debug()
+            if hasattr(companion_graph, "get_last_media_debug")
+            else None
+        )
+        _record_media_harness_debug(ctx, media_debug)
     except Exception as e:
         await _emit_llm_finished(target, "error")
         event_gate.mark_job_dropped(ctx.job_id)
@@ -1217,6 +1244,65 @@ def _record_prompt_cache_debug(ctx: ProcessContext, payload: Optional[dict] = No
         db.close()
 
 
+def _record_media_harness_debug(ctx: ProcessContext, payloads: Optional[list[dict]] = None):
+    if not payloads:
+        return
+    db = next(get_db())
+    try:
+        for payload in payloads:
+            log = RawChatLog(
+                event_id=f"evt_{uuid.uuid4().hex[:8]}",
+                session_id=ctx.snapshot.session_id,
+                event_type=str(payload.get("internal_event_harness") or "media_harness"),
+                raw_payload=_json_dumps(payload),
+                snapshot_id=ctx.snapshot.snapshot_id,
+                buffer_version=ctx.snapshot.buffer_version,
+                job_id=ctx.job_id,
+                status=str(payload.get("status") or "debug"),
+            )
+            db.add(log)
+        db.commit()
+    except Exception as e:
+        print(f"DB error: {e}")
+    finally:
+        db.close()
+
+
+async def _record_background_media_payloads(payloads: list[dict], job: MediaJob):
+    _record_media_job_payloads(payloads, job)
+    await _emit_state({
+        "session_id": job.session_id,
+        "result": "media_job_finished",
+        "media_job_id": job.job_id,
+        "media_key": job.media_key,
+        "payloads": payloads,
+    })
+
+
+def _record_media_job_payloads(payloads: Optional[list[dict]], job: MediaJob):
+    if not payloads:
+        return
+    db = next(get_db())
+    try:
+        for payload in payloads:
+            log = RawChatLog(
+                event_id=f"{job.job_id}:{uuid.uuid4().hex[:8]}",
+                session_id=job.session_id,
+                event_type=str(payload.get("internal_event_harness") or "media_job"),
+                raw_payload=_json_dumps(payload),
+                snapshot_id=job.snapshot_id,
+                buffer_version=job.buffer_version,
+                job_id=job.source_job_id,
+                status=str(payload.get("status") or "debug"),
+            )
+            db.add(log)
+        db.commit()
+    except Exception as e:
+        print(f"DB error: {e}")
+    finally:
+        db.close()
+
+
 def _record_assistant_send(
     ctx: ProcessContext,
     decision,
@@ -1706,6 +1792,7 @@ async def get_status():
 
     # 从 LLM 主图获取最近一次解析状态
     parsed = companion_graph.get_last_parsed_decision() if companion_graph else {}
+    media_jobs_panel = media_job_queue.status() if media_job_queue else {"enabled": False}
 
     # 组装 Snapshot 面板数据
     snapshot_panel = {
@@ -1738,6 +1825,7 @@ async def get_status():
         "decision_result": last_result,
         "last_send": event_gate.get_last_send_meta(),
     }
+    media_panel = companion_graph.get_last_media_debug() if companion_graph else []
 
     # 事件门实时状态
     gate_panel = {
@@ -1784,6 +1872,8 @@ async def get_status():
         # 新 MVP 调试面板字段
         "snapshot": snapshot_panel,
         "llm": llm_panel,
+        "media": media_panel,
+        "media_jobs": media_jobs_panel,
         "meme": meme_panel,
         "onebot": onebot_manager.status(),
     }
@@ -1817,7 +1907,7 @@ async def get_conversation():
 @router.post("/api/conversation/clear")
 async def clear_conversation():
     """清空对话记录和状态"""
-    global event_gate, companion_graph
+    global event_gate, companion_graph, media_job_queue
     if event_gate:
         new_version = await event_gate.buffer.clear()
         event_gate.state.status = ChatStatus.COLD
@@ -1833,6 +1923,8 @@ async def clear_conversation():
         event_gate.clear_user_composing()
     if companion_graph:
         companion_graph.clear_prompt_state()
+    if media_job_queue:
+        media_job_queue.clear()
 
     db = next(get_db())
     try:
