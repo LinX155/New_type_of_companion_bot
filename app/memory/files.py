@@ -2,6 +2,8 @@ import json
 import os
 from datetime import datetime
 
+from ..core.sessions import SESSION_ROOT_DIR, normalize_session_id
+
 
 MEMORY_CORE_TEMPLATE = """# 永久核心记忆
 
@@ -42,14 +44,25 @@ TODAY_MEMORY_TEMPLATE = """# 每日记忆
 
 
 class MemoryFileManager:
-    def __init__(self, base_dir: str = None):
+    def __init__(self, base_dir: str = None, session_id: str = None):
         self.base_dir = base_dir or os.path.join(os.path.dirname(__file__), "..", "..")
+        self.session_id = normalize_session_id(session_id) if session_id else None
         self.soul_path = os.path.join(self.base_dir, "SOUL.md")
-        self.memory_core_path = os.path.join(self.base_dir, "MEMORY_CORE.md")
-        self.tomorrow_topics_path = os.path.join(self.base_dir, "TOMORROW_TOPICS.md")
-        self.dm_dir = os.path.join(self.base_dir, "dm")
+        if self.session_id:
+            self.session_dir = os.path.join(self.base_dir, SESSION_ROOT_DIR, self.session_id)
+            self.memory_core_path = os.path.join(self.session_dir, "MEMORY_CORE.md")
+            self.tomorrow_topics_path = os.path.join(self.session_dir, "TOMORROW_TOPICS.md")
+            self.dm_dir = os.path.join(self.session_dir, "dm")
+        else:
+            self.session_dir = None
+            self.memory_core_path = os.path.join(self.base_dir, "MEMORY_CORE.md")
+            self.tomorrow_topics_path = os.path.join(self.base_dir, "TOMORROW_TOPICS.md")
+            self.dm_dir = os.path.join(self.base_dir, "dm")
         os.makedirs(self.dm_dir, exist_ok=True)
         self.ensure_base_files()
+
+    def for_session(self, session_id: str) -> "MemoryFileManager":
+        return MemoryFileManager(self.base_dir, session_id=session_id)
 
     def ensure_base_files(self):
         if not os.path.exists(self.memory_core_path):
@@ -60,6 +73,7 @@ class MemoryFileManager:
                 self._write_file(self.memory_core_path, _migrate_core_schema(existing))
         if not os.path.exists(self.tomorrow_topics_path):
             self._write_file(self.tomorrow_topics_path, TOMORROW_TOPICS_TEMPLATE)
+        os.makedirs(self.dm_dir, exist_ok=True)
 
     def _read_file(self, path: str) -> str:
         if not os.path.exists(path):

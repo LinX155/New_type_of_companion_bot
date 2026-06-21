@@ -65,7 +65,7 @@ class MediaJobQueue:
         self._seen_keys: set[str] = set()
         self._running_keys: set[str] = set()
         self._last_payloads: list[dict] = []
-        self._completed_payloads_for_prompt: list[dict] = []
+        self._completed_payloads_for_prompt_by_session: dict[str, list[dict]] = {}
         self._generation = 0
         self._stats = {
             "queued": 0,
@@ -95,12 +95,18 @@ class MediaJobQueue:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    def clear(self):
+    def clear(self, session_id: Optional[str] = None):
         self._generation += 1
-        self._seen_keys.clear()
-        self._running_keys.clear()
+        if session_id:
+            prefix = f"{session_id}:"
+            self._seen_keys = {key for key in self._seen_keys if not key.startswith(prefix)}
+            self._running_keys = {key for key in self._running_keys if not key.startswith(prefix)}
+            self._completed_payloads_for_prompt_by_session.pop(session_id, None)
+        else:
+            self._seen_keys.clear()
+            self._running_keys.clear()
+            self._completed_payloads_for_prompt_by_session.clear()
         self._last_payloads.clear()
-        self._completed_payloads_for_prompt.clear()
         self._stats = {key: 0 for key in self._stats}
         while not self._queue.empty():
             try:
@@ -123,19 +129,38 @@ class MediaJobQueue:
     def get_last_payloads(self) -> list[dict]:
         return copy.deepcopy(self._last_payloads)
 
-    def get_completed_payloads_for_prompt(self) -> list[dict]:
-        return copy.deepcopy(self._completed_payloads_for_prompt)
+    def get_completed_payloads_for_prompt(self, session_id: Optional[str] = None) -> list[dict]:
+        if session_id:
+            return copy.deepcopy(self._completed_payloads_for_prompt_by_session.get(session_id, []))
+        merged: list[dict] = []
+        for payloads in self._completed_payloads_for_prompt_by_session.values():
+            merged.extend(payloads)
+        return copy.deepcopy(merged)
 
-    def status(self) -> dict:
+    def status(self, session_id: Optional[str] = None) -> dict:
+        if session_id:
+            prefix = f"{session_id}:"
+            running = sorted(key for key in self._running_keys if key.startswith(prefix))
+            seen_count = sum(1 for key in self._seen_keys if key.startswith(prefix))
+            last_payloads = [
+                payload
+                for payload in self.get_last_payloads()
+                if payload.get("session_id") == session_id
+            ]
+        else:
+            running = sorted(self._running_keys)
+            seen_count = len(self._seen_keys)
+            last_payloads = self.get_last_payloads()
         return {
             "enabled": True,
+            "session_id": session_id,
             "queue_size": self._queue.qsize(),
             "workers": len(self._workers),
-            "running": sorted(self._running_keys),
-            "seen_count": len(self._seen_keys),
+            "running": running,
+            "seen_count": seen_count,
             "generation": self._generation,
             "stats": dict(self._stats),
-            "last_payloads": self.get_last_payloads(),
+            "last_payloads": last_payloads,
         }
 
     async def _worker_loop(self, worker_index: int):
@@ -324,6 +349,7 @@ class MediaJobQueue:
             "internal_event_harness": harness,
             "media_key": job.media_key,
             "media_job_id": job.job_id,
+            "session_id": job.session_id,
             "source_job_id": job.source_job_id,
             "snapshot_id": job.snapshot_id,
             "buffer_version": job.buffer_version,
@@ -394,7 +420,9 @@ class MediaJobQueue:
                 continue
             prompt_payload = self._payload_for_prompt(payload)
             if prompt_payload:
-                self._completed_payloads_for_prompt.append(prompt_payload)
+                session_id = str(prompt_payload.get("session_id") or "")
+                if session_id:
+                    self._completed_payloads_for_prompt_by_session.setdefault(session_id, []).append(prompt_payload)
 
     def _payload_for_prompt(self, payload: dict) -> dict:
         def sanitize(value):

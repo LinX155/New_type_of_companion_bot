@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Optional
 
 from ...core.events import ChatEvent, EventType
+from ...core.sessions import qq_private_session_id
 
 
 def parse_onebot_event(payload: dict, default_input_ttl_ms: int = 8000) -> Optional[ChatEvent]:
@@ -20,6 +21,7 @@ def parse_onebot_event(payload: dict, default_input_ttl_ms: int = 8000) -> Optio
         composing = event_type != 0
         return ChatEvent(
             event_id=f"onebot_input_status_{user_id}_{int(timestamp.timestamp() * 1000)}_{uuid.uuid4().hex[:6]}",
+            session_id=qq_private_session_id(user_id),
             platform="qq",
             user_id=user_id,
             event_type=EventType.USER_COMPOSING,
@@ -78,6 +80,7 @@ def _parse_poke_notice(payload: dict) -> Optional[ChatEvent]:
     )
     return ChatEvent(
         event_id=event_id,
+        session_id=qq_private_session_id(actor_id),
         platform="qq",
         user_id=actor_id,
         event_type=EventType.NUDGE,
@@ -182,6 +185,7 @@ def _parse_private_message(payload: dict) -> ChatEvent:
 
     return ChatEvent(
         event_id=f"onebot_msg_{message_id}",
+        session_id=qq_private_session_id(user_id),
         platform="qq",
         user_id=user_id,
         event_type=event_type,

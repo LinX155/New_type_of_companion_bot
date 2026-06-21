@@ -5,7 +5,8 @@ from .events import ChatEvent
 
 
 class SnapshotManager:
-    def __init__(self):
+    def __init__(self, session_id: str = "default"):
+        self.session_id = session_id
         self._current_id = 0
         self._last_snapshot: Optional[ConversationSnapshot] = None
 
@@ -31,7 +32,7 @@ class SnapshotManager:
             )
 
         snapshot = ConversationSnapshot(
-            session_id="default",
+            session_id=self.session_id,
             snapshot_id=snapshot_id,
             buffer_version=buffer_version,
             status=status,

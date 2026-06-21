@@ -134,7 +134,7 @@ class CompanionGraph:
         self._last_hot_turn_reminder_hash = None
         self._append_runtime_context(ctx)
         self._append_snapshot_events(snapshot.events)
-        self._append_completed_media_results_from_queue()
+        self._append_completed_media_results_from_queue(snapshot.session_id)
         self._append_media_pending_payloads_and_enqueue_jobs(ctx)
         self._append_hot_turn_system_reminder(snapshot)
         self._prompt_transcript.append({"role": "system", "content": FINAL_ACTION_OUTPUT_REMINDER})
@@ -996,10 +996,10 @@ class CompanionGraph:
         self._last_hot_turn_reminder_hash = self._hash_text(reminder_message["content"])
         self._prompt_transcript.append(reminder_message)
 
-    def _append_completed_media_results_from_queue(self):
+    def _append_completed_media_results_from_queue(self, session_id: str):
         if not self.media_job_queue:
             return
-        for payload in self.media_job_queue.get_completed_payloads_for_prompt():
+        for payload in self.media_job_queue.get_completed_payloads_for_prompt(session_id):
             result_id = (
                 f"{payload.get('media_job_id')}:"
                 f"{payload.get('internal_event_harness')}:"
@@ -1124,7 +1124,7 @@ class CompanionGraph:
             or media_ref.get("url")
             or segment_index
         )
-        return f"{event_id}:{segment_index}:{identity}"
+        return f"{ctx.snapshot.session_id}:{event_id}:{segment_index}:{identity}"
 
     def _safe_media_ref_for_prompt(self, media_ref: dict) -> dict:
         allowed_keys = (

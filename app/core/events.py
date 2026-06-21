@@ -17,6 +17,7 @@ class EventType(str, Enum):
 
 class ChatEvent(BaseModel):
     event_id: str
+    session_id: str = "default"
     platform: str = "webui"
     user_id: str = "user"
     event_type: EventType

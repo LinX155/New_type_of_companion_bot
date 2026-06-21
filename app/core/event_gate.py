@@ -15,10 +15,12 @@ class EventGate:
         self,
         on_decision: Callable[["ProcessContext"], Awaitable[None]],
         hot_duration_minutes: int = 30,
+        session_id: str = "default",
     ):
+        self.session_id = session_id
         self.buffer = MessageBuffer()
-        self.snapshot_manager = SnapshotManager()
-        self.state = SessionState()
+        self.snapshot_manager = SnapshotManager(session_id=session_id)
+        self.state = SessionState(session_id=session_id)
         self.on_decision = on_decision
         self.hot_duration_minutes = hot_duration_minutes
         self._pending_job_lock = asyncio.Lock()

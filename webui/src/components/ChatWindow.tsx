@@ -39,7 +39,17 @@ interface StatusInfo extends DebugStatus {
   };
 }
 
+interface SessionInfo {
+  session_id: string;
+  platform?: string;
+  user_id?: string;
+  label?: string;
+  message_count?: number;
+  last_message_at?: string | null;
+}
+
 const API_BASE = '';
+const DEFAULT_SESSION_ID = 'webui_default';
 
 const inferItemType = (text?: string, eventType?: string): Message['itemType'] => {
   if (text?.startsWith('meme:')) return 'meme';
@@ -54,6 +64,10 @@ const ChatWindow: React.FC = () => {
   const [status, setStatus] = useState<StatusInfo | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [showSystem, setShowSystem] = useState(true);
+  const [selectedSessionId, setSelectedSessionId] = useState(
+    () => window.localStorage.getItem('chat_session_id') || DEFAULT_SESSION_ID
+  );
+  const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const inputStatusTimerRef = useRef<number | null>(null);
@@ -69,16 +83,16 @@ const ChatWindow: React.FC = () => {
   }, [messages]);
 
   const fetchStatus = useCallback(() => {
-    fetch(`${API_BASE}/api/status`)
+    fetch(`${API_BASE}/api/status?session_id=${encodeURIComponent(selectedSessionId)}`)
       .then(r => r.json())
       .then(data => setStatus(data))
       .catch(() => {});
-  }, []);
+  }, [selectedSessionId]);
 
   const loadConversation = useCallback(() => {
     const loadSeq = conversationLoadSeqRef.current + 1;
     conversationLoadSeqRef.current = loadSeq;
-    return fetch(`${API_BASE}/api/conversation`)
+    return fetch(`${API_BASE}/api/conversation?session_id=${encodeURIComponent(selectedSessionId)}`)
       .then(r => r.json())
       .then(data => {
         if (loadSeq !== conversationLoadSeqRef.current) {
@@ -96,7 +110,20 @@ const ChatWindow: React.FC = () => {
         setMessages(loaded);
       })
       .catch(() => {});
-  }, []);
+  }, [selectedSessionId]);
+
+  const loadSessions = useCallback(() => {
+    fetch(`${API_BASE}/api/sessions`)
+      .then(r => r.json())
+      .then(data => {
+        const loaded = Array.isArray(data.sessions) ? data.sessions : [];
+        if (!loaded.some((item: SessionInfo) => item.session_id === selectedSessionId)) {
+          loaded.unshift({ session_id: selectedSessionId, label: selectedSessionId });
+        }
+        setSessions(loaded);
+      })
+      .catch(() => {});
+  }, [selectedSessionId]);
 
   const sendInputStatus = useCallback((composing: boolean, ttlMs = 3000) => {
     if (inputStatusTimerRef.current !== null) {
@@ -108,7 +135,7 @@ const ChatWindow: React.FC = () => {
       fetch(`${API_BASE}/api/input-status`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ composing, ttl_ms: ttlMs }),
+        body: JSON.stringify({ composing, ttl_ms: ttlMs, session_id: selectedSessionId }),
       })
         .then(() => fetchStatus())
         .catch(() => {});
@@ -119,11 +146,12 @@ const ChatWindow: React.FC = () => {
     } else {
       post();
     }
-  }, [fetchStatus]);
+  }, [fetchStatus, selectedSessionId]);
 
   useEffect(() => {
     loadConversation();
-  }, [loadConversation]);
+    loadSessions();
+  }, [loadConversation, loadSessions]);
 
   // WebSocket
   useEffect(() => {
@@ -137,9 +165,16 @@ const ChatWindow: React.FC = () => {
         try {
           const data = JSON.parse(event.data);
           if (data.type === 'conversation_changed') {
-            loadConversation();
+            loadSessions();
+            if (!data.session_id || data.session_id === selectedSessionId) {
+              loadConversation();
+            }
             fetchStatus();
           } else if (data.type === 'assistant_message') {
+            if (data.session_id && data.session_id !== selectedSessionId) {
+              loadSessions();
+              return;
+            }
             const content = data.content ?? data.text ?? '';
             const itemType = data.item_type ?? inferItemType(content);
             setMessages(prev => {
@@ -200,7 +235,7 @@ const ChatWindow: React.FC = () => {
       wsRef.current?.close();
       wsRef.current = null;
     };
-  }, [fetchStatus, loadConversation]);
+  }, [fetchStatus, loadConversation, loadSessions, selectedSessionId]);
 
   useEffect(() => {
     const interval = setInterval(fetchStatus, 3000);
@@ -242,7 +277,7 @@ const ChatWindow: React.FC = () => {
       await fetch(`${API_BASE}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, session_id: selectedSessionId }),
       });
     } catch {
       setIsLoading(false);
@@ -253,7 +288,11 @@ const ChatWindow: React.FC = () => {
 
   const sendNudge = async () => {
     try {
-      await fetch(`${API_BASE}/api/nudge`, { method: 'POST' });
+      await fetch(`${API_BASE}/api/nudge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: selectedSessionId }),
+      });
       setMessages(prev => [...prev, {
         id: `nudge_${Date.now()}_${prev.length}`,
         role: 'system',
@@ -267,9 +306,33 @@ const ChatWindow: React.FC = () => {
   };
 
   const clearConversation = async () => {
-    if (!confirm('确定要清空对话吗？')) return;
+    if (!confirm(`确定要清空当前会话 ${selectedSessionId} 的对话吗？`)) return;
     sendInputStatus(false);
-    await fetch(`${API_BASE}/api/conversation/clear`, { method: 'POST' });
+    await fetch(`${API_BASE}/api/conversation/clear?session_id=${encodeURIComponent(selectedSessionId)}`, { method: 'POST' });
+    setMessages([]);
+    setStatus(null);
+  };
+
+  const deleteCurrentSession = async () => {
+    if (selectedSessionId === DEFAULT_SESSION_ID) {
+      alert('webui_default 不能完全删除，可以使用清空对话。');
+      return;
+    }
+    if (!confirm(`确定完全清除当前用户 ${selectedSessionId} 吗？这会删除该用户私有历史、日志、运行状态和记忆目录。`)) return;
+    if (!confirm('再次确认：这个操作不会删除 SOUL 和全局表情包，但该用户私有数据会被抹除。')) return;
+    await fetch(`${API_BASE}/api/sessions/${encodeURIComponent(selectedSessionId)}`, { method: 'DELETE' });
+    const nextSession = DEFAULT_SESSION_ID;
+    window.localStorage.setItem('chat_session_id', nextSession);
+    setSelectedSessionId(nextSession);
+    setMessages([]);
+    setStatus(null);
+    loadSessions();
+  };
+
+  const handleSessionChange = (sessionId: string) => {
+    const nextSession = sessionId || DEFAULT_SESSION_ID;
+    window.localStorage.setItem('chat_session_id', nextSession);
+    setSelectedSessionId(nextSession);
     setMessages([]);
     setStatus(null);
   };
@@ -324,6 +387,26 @@ const ChatWindow: React.FC = () => {
               boxShadow: napcatConnected ? '0 0 0 3px rgba(46, 204, 113, 0.16)' : 'none',
             }} />
             <span>Napcat连接状态</span>
+            <select
+              value={selectedSessionId}
+              onChange={e => handleSessionChange(e.target.value)}
+              style={{
+                marginLeft: '8px',
+                border: '1px solid #d8dee4',
+                borderRadius: '6px',
+                padding: '3px 6px',
+                fontSize: '12px',
+                background: '#fff',
+                color: '#2c3e50',
+              }}
+              title="当前会话"
+            >
+              {sessions.map(session => (
+                <option key={session.session_id} value={session.session_id}>
+                  {session.label || session.session_id}
+                </option>
+              ))}
+            </select>
           </div>
           {messages.map(msg => (
             <div key={msg.id} style={{
@@ -456,6 +539,21 @@ const ChatWindow: React.FC = () => {
             }}
           >
             清空对话
+          </button>
+          <button
+            onClick={deleteCurrentSession}
+            disabled={selectedSessionId === DEFAULT_SESSION_ID}
+            style={{
+              padding: '8px 16px',
+              background: selectedSessionId === DEFAULT_SESSION_ID ? '#bdc3c7' : '#c0392b',
+              color: '#fff',
+              border: 'none',
+              borderRadius: '8px',
+              cursor: selectedSessionId === DEFAULT_SESSION_ID ? 'not-allowed' : 'pointer',
+              fontSize: '14px',
+            }}
+          >
+            完全清除当前用户
           </button>
           <button
             onClick={() => setShowSystem(!showSystem)}

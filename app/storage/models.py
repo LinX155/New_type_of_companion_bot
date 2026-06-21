@@ -47,6 +47,7 @@ class ScheduledJobLog(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     job_id = Column(String, index=True)
+    session_id = Column(String, index=True, default="default")
     job_type = Column(String)  # memory_analysis, midnight_cleanup, active_message
     status = Column(String)  # running, completed, failed
     start_time = Column(DateTime(timezone=True))
@@ -73,17 +74,26 @@ def ensure_storage_schema(engine):
     if not str(engine.url).startswith("sqlite"):
         return
 
-    expected = {
-        "raw_payload": "TEXT",
-        "parsed_payload": "TEXT",
-        "item_type": "VARCHAR",
-        "send_index": "INTEGER",
-        "send_count": "INTEGER",
-        "send_key": "VARCHAR",
-    }
     with engine.begin() as conn:
+        raw_expected = {
+            "raw_payload": "TEXT",
+            "parsed_payload": "TEXT",
+            "item_type": "VARCHAR",
+            "send_index": "INTEGER",
+            "send_count": "INTEGER",
+            "send_key": "VARCHAR",
+        }
         rows = conn.execute(text("PRAGMA table_info(raw_chat_logs)")).fetchall()
         existing = {row[1] for row in rows}
-        for column, column_type in expected.items():
+        for column, column_type in raw_expected.items():
             if column not in existing:
                 conn.execute(text(f"ALTER TABLE raw_chat_logs ADD COLUMN {column} {column_type}"))
+
+        scheduled_expected = {
+            "session_id": "VARCHAR",
+        }
+        rows = conn.execute(text("PRAGMA table_info(scheduled_job_logs)")).fetchall()
+        existing = {row[1] for row in rows}
+        for column, column_type in scheduled_expected.items():
+            if column not in existing:
+                conn.execute(text(f"ALTER TABLE scheduled_job_logs ADD COLUMN {column} {column_type}"))

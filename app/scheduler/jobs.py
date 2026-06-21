@@ -21,6 +21,7 @@ class SchedulerManager:
         self.memory = memory_manager or MemoryFileManager()
         self.llm = llm_client
         self.active_message_callback: Optional[Callable[[], Awaitable[dict]]] = None
+        self.session_ids_provider: Optional[Callable[[], list[str]]] = None
         self._job_configs = {
             "memory_analysis_day": {
                 "hour": 13,
@@ -81,25 +82,44 @@ class SchedulerManager:
     def set_active_message_callback(self, callback: Callable[[], Awaitable[dict]]):
         self.active_message_callback = callback
 
+    def set_session_ids_provider(self, callback: Callable[[], list[str]]):
+        self.session_ids_provider = callback
+
+    def _session_ids(self) -> list[str]:
+        if not self.session_ids_provider:
+            return ["default"]
+        session_ids = self.session_ids_provider() or []
+        return sorted({sid for sid in session_ids if sid}) or ["default"]
+
     async def _run_memory_analysis(self):
-        job_id = f"memory_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        log_id = self._start_job(job_id, "memory_analysis")
+        base_job_id = f"memory_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        failures = []
+        for session_id in self._session_ids():
+            ok, error = await self._run_memory_analysis_for_session(base_job_id, session_id)
+            if not ok:
+                failures.append({"session_id": session_id, "error": error})
+        return {"status": "completed" if not failures else "partial_failed", "failures": failures}
+
+    async def _run_memory_analysis_for_session(self, base_job_id: str, session_id: str):
+        job_id = f"{base_job_id}_{session_id}"
+        log_id = self._start_job(job_id, "memory_analysis", session_id=session_id)
         try:
             if self.llm is None:
                 raise RuntimeError("LLM client is not configured for memory analysis")
 
+            memory = self.memory.for_session(session_id)
             date_str = datetime.now().strftime("%Y-%m-%d")
-            transcript = self._load_transcript_for_date(datetime.now())
+            transcript = self._load_transcript_for_date(datetime.now(), session_id)
             if not transcript:
-                self.memory.read_today_memory()
+                memory.read_today_memory()
                 self._finish_job(log_id, "completed")
-                return
+                return True, None
 
             messages = build_memory_analysis_messages(
                 date_str=date_str,
                 transcript=transcript,
-                today_memory_md=self.memory.read_today_memory(),
-                tomorrow_topics_md=self.memory.read_tomorrow_topics(),
+                today_memory_md=memory.read_today_memory(),
+                tomorrow_topics_md=memory.read_tomorrow_topics(),
             )
             raw_output = await self.llm.chat_completion(messages=messages, temperature=0.2)
             data = self._parse_json_object(raw_output)
@@ -109,39 +129,51 @@ class SchedulerManager:
             if not today_memory or not tomorrow_topics:
                 raise RuntimeError("memory analysis response missing required markdown fields")
 
-            if not self.memory.write_today_memory(today_memory):
+            if not memory.write_today_memory(today_memory):
                 raise RuntimeError("failed to write today's dm file")
             scoped_tomorrow_topics = self._merge_tomorrow_topics_sections(
-                current=self.memory.read_tomorrow_topics(),
+                current=memory.read_tomorrow_topics(),
                 proposed=tomorrow_topics,
                 owned_sections=MEMORY_ANALYSIS_TOMORROW_SECTIONS,
             )
-            if not self.memory.write_tomorrow_topics(scoped_tomorrow_topics):
+            if not memory.write_tomorrow_topics(scoped_tomorrow_topics):
                 raise RuntimeError("failed to write TOMORROW_TOPICS.md")
 
             self._finish_job(log_id, "completed")
+            return True, None
         except Exception as e:
             self._finish_job(log_id, "failed", str(e))
+            return False, str(e)
 
     async def _run_midnight_cleanup(self):
-        job_id = f"midnight_cleanup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        log_id = self._start_job(job_id, "midnight_cleanup")
+        base_job_id = f"midnight_cleanup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        failures = []
+        for session_id in self._session_ids():
+            ok, error = await self._run_midnight_cleanup_for_session(base_job_id, session_id)
+            if not ok:
+                failures.append({"session_id": session_id, "error": error})
+        return {"status": "completed" if not failures else "partial_failed", "failures": failures}
+
+    async def _run_midnight_cleanup_for_session(self, base_job_id: str, session_id: str):
+        job_id = f"{base_job_id}_{session_id}"
+        log_id = self._start_job(job_id, "midnight_cleanup", session_id=session_id)
         try:
             if self.llm is None:
                 raise RuntimeError("LLM client is not configured for midnight cleanup")
 
+            memory = self.memory.for_session(session_id)
             target_day = datetime.now() - timedelta(days=1)
             date_str = target_day.strftime("%Y-%m-%d")
-            day_memory = self.memory.read_dm_file(date_str)
+            day_memory = memory.read_dm_file(date_str)
             if not day_memory:
                 self._finish_job(log_id, "completed")
-                return
+                return True, None
 
             messages = build_midnight_cleanup_messages(
                 date_str=date_str,
-                memory_core_md=self.memory.read_memory_core(),
+                memory_core_md=memory.read_memory_core(),
                 day_memory_md=day_memory,
-                tomorrow_topics_md=self.memory.read_tomorrow_topics(),
+                tomorrow_topics_md=memory.read_tomorrow_topics(),
             )
             raw_output = await self.llm.chat_completion(messages=messages, temperature=0.2)
             data = self._parse_json_object(raw_output)
@@ -151,14 +183,16 @@ class SchedulerManager:
             if not memory_core or not tomorrow_topics:
                 raise RuntimeError("midnight cleanup response missing required markdown fields")
 
-            if not self.memory.write_memory_core(memory_core):
+            if not memory.write_memory_core(memory_core):
                 raise RuntimeError("failed to write MEMORY_CORE.md")
-            if not self.memory.write_tomorrow_topics(tomorrow_topics):
+            if not memory.write_tomorrow_topics(tomorrow_topics):
                 raise RuntimeError("failed to write TOMORROW_TOPICS.md")
 
             self._finish_job(log_id, "completed")
+            return True, None
         except Exception as e:
             self._finish_job(log_id, "failed", str(e))
+            return False, str(e)
 
     async def _run_active_message(self):
         job_id = f"active_message_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -173,13 +207,14 @@ class SchedulerManager:
         except Exception as e:
             self._finish_job(log_id, "failed", str(e))
 
-    def _load_transcript_for_date(self, day: datetime) -> list[dict]:
+    def _load_transcript_for_date(self, day: datetime, session_id: str) -> list[dict]:
         start = day.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
         db = SessionLocal()
         try:
             rows = (
                 db.query(ConversationEvent)
+                .filter(ConversationEvent.session_id == session_id)
                 .filter(ConversationEvent.created_at >= start)
                 .filter(ConversationEvent.created_at < end)
                 .filter(ConversationEvent.event_type == "user_text")
@@ -278,11 +313,12 @@ class SchedulerManager:
 
         raise RuntimeError("LLM response is not valid JSON")
 
-    def _start_job(self, job_id: str, job_type: str) -> int:
+    def _start_job(self, job_id: str, job_type: str, session_id: str = "default") -> int:
         db = SessionLocal()
         try:
             log = ScheduledJobLog(
                 job_id=job_id,
+                session_id=session_id,
                 job_type=job_type,
                 status="running",
                 start_time=datetime.now(),
