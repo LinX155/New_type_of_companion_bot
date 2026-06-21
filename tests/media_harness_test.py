@@ -160,7 +160,10 @@ class FakeVisionLLM:
     async def chat_completion_envelope(self, messages, temperature=0.7):
         self.main_messages.append(messages)
         serialized = json.dumps(messages, ensure_ascii=False)
-        if "image_understanding_result" in serialized and "桌上有一杯咖啡" in serialized:
+        if (
+            ("image_understanding_result" in serialized or "media_followup" in serialized)
+            and "桌上有一杯咖啡" in serialized
+        ):
             raw = '{"action":"REPLY","items":[{"text":"看到啦，是咖啡续命现场对吧"}]}'
         elif "media_pending" in serialized:
             raw = '{"action":"REPLY","items":[{"text":"我看看"}]}'
@@ -420,7 +423,7 @@ class MediaHarnessTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_completed_image_result_is_available_for_future_prompt_without_paths(self):
+    def test_completed_image_result_uses_media_followup_not_next_user_prompt(self):
         async def scenario():
             with tempfile.TemporaryDirectory() as tmp_dir:
                 root = Path(tmp_dir)
@@ -477,10 +480,20 @@ class MediaHarnessTest(unittest.TestCase):
                     "raw": {},
                 }))
 
-                self.assertEqual(decision.all_items()[0].content, "看到啦，是咖啡续命现场对吧")
+                self.assertEqual(decision.all_items()[0].content, "收到")
                 serialized_main = json.dumps(llm.main_messages[-1], ensure_ascii=False)
-                self.assertIn("桌上有一杯咖啡", serialized_main)
+                self.assertNotIn("桌上有一杯咖啡", serialized_main)
                 self.assertNotIn(str(image_path), serialized_main)
+
+                followup_ctx = _media_followup_context()
+                followup = await graph.run_media_followup(followup_ctx, prompt_payloads[0])
+
+                self.assertEqual(followup.all_items()[0].content, "看到啦，是咖啡续命现场对吧")
+                serialized_followup = json.dumps(llm.main_messages[-1], ensure_ascii=False)
+                self.assertIn("media_followup", serialized_followup)
+                self.assertIn("桌上有一杯咖啡", serialized_followup)
+                self.assertNotIn("raw_output", serialized_followup)
+                self.assertNotIn(str(image_path), serialized_followup)
 
         asyncio.run(scenario())
 
@@ -548,6 +561,30 @@ def _process_context(event: dict) -> ProcessContext:
         _get_last_message_age=lambda: "just now",
     )
     return ProcessContext(fake_gate, "job-1", snapshot)
+
+
+def _media_followup_context() -> ProcessContext:
+    snapshot = ConversationSnapshot(
+        session_id="default",
+        snapshot_id=2,
+        buffer_version=1,
+        status=ChatStatus.HOT,
+        events=[],
+    )
+    fake_gate = SimpleNamespace(
+        state=SimpleNamespace(msg_index_today=1),
+        _get_last_message_age=lambda: "just now",
+    )
+    return ProcessContext(
+        fake_gate,
+        "media_followup_job",
+        snapshot,
+        internal_source="media_followup",
+        skip_buffer_clear=True,
+        bypass_snapshot_stale=True,
+        bypass_send_group_gate=True,
+        bypass_user_composing_gate=True,
+    )
 
 
 def _write_image(path: Path, color: tuple[int, int, int]) -> Path:

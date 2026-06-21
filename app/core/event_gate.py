@@ -231,6 +231,42 @@ class EventGate:
         # 异步调用 LLM（不阻塞事件处理）
         asyncio.create_task(self._run_llm_task(ctx))
 
+    async def dispatch_internal_followup(self, source: str, payload: dict) -> dict:
+        """调度不进入用户 buffer 的内部补发，例如后台看图完成后的补话。"""
+        source = source or "internal_followup"
+        job_id = f"{source}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+        async with self._pending_job_lock:
+            if self._pending_job_id is not None:
+                return {"dispatched": False, "reason": "pending_job", "pending_job_id": self._pending_job_id}
+            self._pending_job_id = job_id
+
+        _, version = await self.buffer.get_snapshot()
+        self.state.buffer_version = version
+        snapshot = self.snapshot_manager.create_snapshot(
+            events=[],
+            buffer_version=version,
+            status=self.state.status,
+            msg_index=self.state.msg_index_today,
+            last_message_age=self._get_last_message_age(),
+        )
+        self.state.current_snapshot_id = snapshot.snapshot_id
+
+        ctx = ProcessContext(
+            gate=self,
+            job_id=job_id,
+            snapshot=snapshot,
+            internal_source=source,
+            internal_payload=payload,
+            skip_buffer_clear=True,
+            bypass_snapshot_stale=True,
+            bypass_send_group_gate=True,
+            bypass_user_composing_gate=True,
+        )
+        self._last_process_context = ctx
+        asyncio.create_task(self._run_llm_task(ctx))
+        return {"dispatched": True, "job_id": job_id, "snapshot_id": snapshot.snapshot_id}
+
     async def reserve_active_message_job(self) -> Optional[str]:
         """为主动消息占用一次发送权。
 
@@ -495,10 +531,27 @@ class EventGate:
 
 
 class ProcessContext:
-    def __init__(self, gate: EventGate, job_id: str, snapshot: ConversationSnapshot):
+    def __init__(
+        self,
+        gate: EventGate,
+        job_id: str,
+        snapshot: ConversationSnapshot,
+        internal_source: Optional[str] = None,
+        internal_payload: Optional[dict] = None,
+        skip_buffer_clear: bool = False,
+        bypass_snapshot_stale: bool = False,
+        bypass_send_group_gate: bool = False,
+        bypass_user_composing_gate: bool = False,
+    ):
         self.gate = gate
         self.job_id = job_id
         self.snapshot = snapshot
+        self.internal_source = internal_source
+        self.internal_payload = internal_payload
+        self.skip_buffer_clear = skip_buffer_clear
+        self.bypass_snapshot_stale = bypass_snapshot_stale
+        self.bypass_send_group_gate = bypass_send_group_gate
+        self.bypass_user_composing_gate = bypass_user_composing_gate
         self.decision: Optional[ActionDecision] = None
         self.meme_candidates: list = []
         self.selected_meme: Optional[str] = None

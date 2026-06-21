@@ -64,7 +64,6 @@ class CompanionGraph:
         self._prompt_transcript: list[dict] = []
         self._prompt_event_ids: set[str] = set()
         self._media_harness_event_ids: set[str] = set()
-        self._media_completed_result_ids: set[str] = set()
         self._prompt_transcript_identity: Optional[str] = None
         self._prefix_rebuild_reason: Optional[str] = None
         self._last_prompt_messages: list[dict] = []
@@ -120,6 +119,35 @@ class CompanionGraph:
 
         return decision
 
+    async def run_media_followup(self, ctx: ProcessContext, media_payload: dict) -> ActionDecision:
+        self._ensure_provider_transcript_identity()
+        if not self._prompt_transcript:
+            self._initialize_prompt_transcript(ctx.snapshot)
+
+        self._last_hot_turn_reminder_hash = None
+        self._append_runtime_context(ctx)
+        self._prompt_transcript.append({
+            "role": "system",
+            "content": json.dumps(
+                self._build_media_followup_payload(media_payload),
+                ensure_ascii=False,
+            ),
+        })
+        self._append_hot_turn_system_reminder(ctx.snapshot)
+        self._prompt_transcript.append({"role": "system", "content": FINAL_ACTION_OUTPUT_REMINDER})
+
+        messages = self._copy_prompt_transcript()
+        self._record_prompt_observability(messages)
+        state: GraphState = {"ctx": ctx, "messages": messages}
+        state = await self._call_llm_for_decision(state)
+        if self._route_after_first_decision(state) == "search_meme":
+            state = await self._search_meme(state)
+        state = await self._validate_decision(state)
+        decision = state.get("decision") or ActionDecision(action=Action.WAIT, items=None)
+        ctx.decision = decision
+        self._record_parsed_decision(decision)
+        return decision
+
     async def _receive_snapshot(self, state: GraphState) -> GraphState:
         return state
 
@@ -134,7 +162,6 @@ class CompanionGraph:
         self._last_hot_turn_reminder_hash = None
         self._append_runtime_context(ctx)
         self._append_snapshot_events(snapshot.events)
-        self._append_completed_media_results_from_queue(snapshot.session_id)
         self._append_media_pending_payloads_and_enqueue_jobs(ctx)
         self._append_hot_turn_system_reminder(snapshot)
         self._prompt_transcript.append({"role": "system", "content": FINAL_ACTION_OUTPUT_REMINDER})
@@ -647,7 +674,6 @@ class CompanionGraph:
         self._prompt_transcript.clear()
         self._prompt_event_ids.clear()
         self._media_harness_event_ids.clear()
-        self._media_completed_result_ids.clear()
         self._last_prompt_messages.clear()
         self._last_prompt_observability.clear()
         self._prompt_block_hashes.clear()
@@ -720,6 +746,9 @@ class CompanionGraph:
         return self._fallback_decision(ctx), "context_repair_failed"
 
     def _validate_contextual_decision(self, ctx: ProcessContext, decision: ActionDecision) -> list[str]:
+        if ctx.internal_source == "media_followup":
+            return []
+
         if not self._is_cold_context(ctx):
             return []
 
@@ -996,22 +1025,58 @@ class CompanionGraph:
         self._last_hot_turn_reminder_hash = self._hash_text(reminder_message["content"])
         self._prompt_transcript.append(reminder_message)
 
-    def _append_completed_media_results_from_queue(self, session_id: str):
-        if not self.media_job_queue:
-            return
-        for payload in self.media_job_queue.get_completed_payloads_for_prompt(session_id):
-            result_id = (
-                f"{payload.get('media_job_id')}:"
-                f"{payload.get('internal_event_harness')}:"
-                f"{payload.get('media_key')}"
-            )
-            if result_id in self._media_completed_result_ids:
-                continue
-            self._prompt_transcript.append({
-                "role": "system",
-                "content": json.dumps(payload, ensure_ascii=False),
-            })
-            self._media_completed_result_ids.add(result_id)
+    def _build_media_followup_payload(self, payload: dict) -> dict:
+        result = payload.get("result") if isinstance(payload, dict) else None
+        media_ref = payload.get("media_ref") if isinstance(payload, dict) else None
+        download = payload.get("download") if isinstance(payload, dict) else None
+
+        allowed_media_ref_keys = (
+            "source",
+            "qq_user_id",
+            "onebot_message_id",
+            "segment_index",
+            "segment_type",
+            "sub_type",
+            "summary",
+            "file",
+            "file_size",
+            "is_sticker",
+            "download_status",
+        )
+        safe_media_ref = {}
+        if isinstance(media_ref, dict):
+            safe_media_ref = {
+                key: media_ref.get(key)
+                for key in allowed_media_ref_keys
+                if media_ref.get(key) is not None
+            }
+
+        safe_download = {}
+        if isinstance(download, dict):
+            safe_download = {
+                key: download.get(key)
+                for key in ("status", "content_type", "bytes", "error")
+                if download.get(key) is not None
+            }
+
+        return {
+            "internal_event_harness": "media_followup",
+            "status": "ready_to_reply",
+            "media_key": payload.get("media_key") if isinstance(payload, dict) else None,
+            "media_job_id": payload.get("media_job_id") if isinstance(payload, dict) else None,
+            "session_id": payload.get("session_id") if isinstance(payload, dict) else None,
+            "is_sticker": bool(payload.get("is_sticker")) if isinstance(payload, dict) else False,
+            "media_ref": safe_media_ref,
+            "download": safe_download,
+            "image_understanding": result if isinstance(result, dict) else {},
+            "required_output": (
+                "这是后台刚看完的、用户刚刚发来的普通图片。"
+                "请补发一条自然的网聊回应，明确回应图片内容或图片带来的话题。"
+                "如果用户已经继续说话，用“刚刚那张图/你刚发的那张”轻轻衔接；"
+                "不要解释内部看图流程，不要说自己在分析，不要复述字段名。"
+                "输出最终 action/items JSON；可以用 text，也可以搭配 meme/search_meme。"
+            ),
+        }
 
     def _append_media_pending_payloads_and_enqueue_jobs(self, ctx: ProcessContext):
         self._last_media_debug = []

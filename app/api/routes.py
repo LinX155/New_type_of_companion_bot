@@ -142,6 +142,7 @@ event_gate: Optional[EventGate] = None
 media_job_queue: Optional[MediaJobQueue] = None
 runtime_manager: Optional[SessionRuntimeManager] = None
 session_registry = SessionRegistry(ROOT_DIR)
+_media_followup_keys: set[str] = set()
 
 # Store for WebUI callbacks
 message_callbacks = []
@@ -294,7 +295,9 @@ def _list_sessions() -> list[dict]:
 
     add(DEFAULT_SESSION_ID, label="WebUI 默认")
     for item in session_registry.list_file_sessions():
-        add(item["session_id"], **item)
+        extra = dict(item)
+        sid = extra.pop("session_id")
+        add(sid, **extra)
 
     if runtime_manager:
         for sid in runtime_manager.active_session_ids():
@@ -334,6 +337,16 @@ def _scheduler_session_ids() -> list[str]:
     return [item["session_id"] for item in _list_sessions()]
 
 
+def _clear_media_followup_keys(session_id: Optional[str] = None):
+    if not session_id:
+        _media_followup_keys.clear()
+        return
+    prefix = f"{normalize_session_id(session_id)}:"
+    for key in list(_media_followup_keys):
+        if key.startswith(prefix):
+            _media_followup_keys.discard(key)
+
+
 async def shutdown_background_workers():
     if media_job_queue:
         await media_job_queue.shutdown()
@@ -350,6 +363,20 @@ def _event_payload(event: ChatEvent) -> dict:
     return event.model_dump(mode="json")
 
 
+def _ensure_process_context_defaults(ctx: ProcessContext):
+    defaults = {
+        "internal_source": None,
+        "internal_payload": None,
+        "skip_buffer_clear": False,
+        "bypass_snapshot_stale": False,
+        "bypass_send_group_gate": False,
+        "bypass_user_composing_gate": False,
+    }
+    for key, value in defaults.items():
+        if not hasattr(ctx, key):
+            setattr(ctx, key, value)
+
+
 def _graph_for_context(ctx: ProcessContext) -> Optional[CompanionGraph]:
     if runtime_manager:
         runtime = runtime_manager.get_if_exists(ctx.snapshot.session_id)
@@ -360,9 +387,10 @@ def _graph_for_context(ctx: ProcessContext) -> Optional[CompanionGraph]:
 
 async def on_decision(ctx: ProcessContext):
     """LLM 决策回调"""
+    _ensure_process_context_defaults(ctx)
     gate = ctx.gate
     graph = _graph_for_context(ctx)
-    target = _message_target_from_snapshot(ctx.snapshot)
+    target = _message_target_from_context(ctx)
     llm_target = {**target, "session_id": ctx.snapshot.session_id}
 
     if gate.is_job_stale(ctx.job_id):
@@ -376,7 +404,10 @@ async def on_decision(ctx: ProcessContext):
         await _emit_llm_started(llm_target)
         if not graph:
             raise RuntimeError(f"session graph is not initialized: {ctx.snapshot.session_id}")
-        decision = await graph.run(ctx)
+        if ctx.internal_source == "media_followup":
+            decision = await graph.run_media_followup(ctx, ctx.internal_payload or {})
+        else:
+            decision = await graph.run(ctx)
         _record_prompt_cache_debug(ctx, graph.get_prompt_observability())
         media_debug = (
             graph.get_last_media_debug()
@@ -395,7 +426,7 @@ async def on_decision(ctx: ProcessContext):
         })
         return
 
-    if not await gate.is_snapshot_current(ctx):
+    if not ctx.bypass_snapshot_stale and not await gate.is_snapshot_current(ctx):
         await _emit_llm_finished(llm_target, "stale_dropped")
         gate.mark_job_stale_dropped(ctx.job_id)
         await gate.dispatch_latest_after_stale(ctx.job_id)
@@ -420,8 +451,11 @@ async def on_decision(ctx: ProcessContext):
     items = list(result.get("items") or [])
 
     if result["visible"] and items:
-        cleared, send_group_version = await gate.clear_buffer_after_visible_send(ctx.snapshot.buffer_version)
-        if not cleared:
+        if ctx.skip_buffer_clear:
+            send_group_version = ctx.snapshot.buffer_version
+        else:
+            cleared, send_group_version = await gate.clear_buffer_after_visible_send(ctx.snapshot.buffer_version)
+        if not ctx.skip_buffer_clear and not cleared:
             await _emit_llm_finished(llm_target, "stale_dropped")
             gate.mark_job_stale_dropped(ctx.job_id)
             await gate.dispatch_latest_after_stale(ctx.job_id)
@@ -470,7 +504,7 @@ async def on_decision(ctx: ProcessContext):
         original_index = unit["original_index"]
         original_item = unit["original_item"]
         item = unit["display_item"]
-        if not await gate.is_send_group_current(ctx, send_group_version):
+        if not ctx.bypass_send_group_gate and not await gate.is_send_group_current(ctx, send_group_version):
             await _emit_llm_finished(llm_target, "stale_dropped")
             commit_sent_progress()
             gate.mark_job_stale_dropped(ctx.job_id)
@@ -498,14 +532,14 @@ async def on_decision(ctx: ProcessContext):
         item_type = item.type.value
         per_send_result = {**result, "text": content, "texts": [content], "item": item}
 
-        if _requires_user_composing_gate([item]):
+        if not ctx.bypass_user_composing_gate and _requires_user_composing_gate([item]):
             commit_sent_progress()
             if not await _wait_until_user_not_composing(ctx):
                 await _emit_llm_finished(llm_target, "stale_dropped")
                 return
 
         gate.record_send_meta(ctx, send_index, send_count, item_type)
-        if not await gate.is_send_group_current(ctx, send_group_version):
+        if not ctx.bypass_send_group_gate and not await gate.is_send_group_current(ctx, send_group_version):
             await _emit_llm_finished(llm_target, "stale_dropped")
             commit_sent_progress()
             gate.mark_job_stale_dropped(ctx.job_id)
@@ -713,6 +747,12 @@ def _message_target_from_snapshot(snapshot) -> dict:
             "target_user_id": str(user_id),
         }
     return {}
+
+
+def _message_target_from_context(ctx: ProcessContext) -> dict:
+    if ctx.internal_source:
+        return _message_target_from_session_id(ctx.snapshot.session_id)
+    return _message_target_from_snapshot(ctx.snapshot)
 
 
 def _message_target_from_event(event: ChatEvent) -> dict:
@@ -1421,6 +1461,63 @@ async def _record_background_media_payloads(payloads: list[dict], job: MediaJob)
         "media_key": job.media_key,
         "payloads": payloads,
     })
+    for payload in _media_followup_payloads(payloads):
+        asyncio.create_task(_dispatch_media_followup_when_idle(job, payload))
+
+
+def _media_followup_payloads(payloads: Optional[list[dict]]) -> list[dict]:
+    result: list[dict] = []
+    for payload in payloads or []:
+        if payload.get("internal_event_harness") != "image_understanding_result":
+            continue
+        if payload.get("status") != "completed":
+            continue
+        if payload.get("is_sticker"):
+            continue
+        media_key = str(payload.get("media_key") or "").strip()
+        if not media_key or media_key in _media_followup_keys:
+            continue
+        result.append(payload)
+    return result
+
+
+async def _dispatch_media_followup_when_idle(job: MediaJob, payload: dict):
+    media_key = str(payload.get("media_key") or job.media_key or "").strip()
+    if not media_key or media_key in _media_followup_keys:
+        return
+    _media_followup_keys.add(media_key)
+
+    for attempt in range(20):
+        runtime = _runtime_for_session(job.session_id)
+        dispatched = await runtime.gate.dispatch_internal_followup(
+            "media_followup",
+            {
+                **payload,
+                "session_id": job.session_id,
+                "source_job_id": job.source_job_id,
+            },
+        )
+        if dispatched.get("dispatched"):
+            await _emit_state({
+                "session_id": job.session_id,
+                "result": "media_followup_dispatched",
+                "media_job_id": job.job_id,
+                "media_key": media_key,
+                "job_id": dispatched.get("job_id"),
+                "snapshot_id": dispatched.get("snapshot_id"),
+            })
+            return
+        if dispatched.get("reason") != "pending_job":
+            break
+        await asyncio.sleep(0.5)
+
+    await _emit_state({
+        "session_id": job.session_id,
+        "result": "media_followup_skipped",
+        "media_job_id": job.job_id,
+        "media_key": media_key,
+        "reason": "gate_busy",
+    })
 
 
 def _record_media_job_payloads(payloads: Optional[list[dict]], job: MediaJob):
@@ -1963,6 +2060,7 @@ async def delete_session(session_id: str):
         runtime_manager.drop_session_runtime(sid)
     if media_job_queue:
         media_job_queue.clear(sid)
+    _clear_media_followup_keys(sid)
 
     db = next(get_db())
     try:
@@ -2124,10 +2222,12 @@ async def clear_conversation(
                 await runtime_manager.clear_session(active_sid)
         if media_job_queue:
             media_job_queue.clear()
+        _clear_media_followup_keys()
     else:
         runtime = _runtime_for_session(sid)
         if runtime_manager:
             await runtime_manager.clear_session(sid)
+        _clear_media_followup_keys(sid)
 
     db = next(get_db())
     try:
