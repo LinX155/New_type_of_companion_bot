@@ -3,7 +3,7 @@ import asyncio
 import json
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -20,7 +20,7 @@ from ..active.messages import (
     parse_active_decision,
     select_pending_candidate,
 )
-from ..core.event_gate import EventGate, ProcessContext
+from ..core.event_gate import EventGate, ProcessContext, USER_COMPOSING_MAX_BLOCK_SECONDS
 from ..core.events import ChatEvent, EventType
 from ..core.decisions import Action, ActionDecision, SendItem, SendItemType
 from ..core.graph import CompanionGraph
@@ -486,20 +486,27 @@ async def on_decision(ctx: ProcessContext):
     result = router_inst.route(decision)
     items = list(result.get("items") or [])
 
-    if result["visible"] and items:
-        if ctx.skip_buffer_clear:
-            send_group_version = ctx.snapshot.buffer_version
-        else:
-            cleared, send_group_version = await gate.clear_buffer_after_visible_send(ctx.snapshot.buffer_version)
-        if not ctx.skip_buffer_clear and not cleared:
+    send_group_version = ctx.snapshot.buffer_version
+    visible_send_claimed = not (result["visible"] and items and not ctx.skip_buffer_clear)
+
+    async def claim_visible_send(reason: str) -> bool:
+        nonlocal send_group_version, visible_send_claimed
+        if visible_send_claimed:
+            return True
+        cleared, new_version = await gate.clear_buffer_after_visible_send(ctx.snapshot.buffer_version)
+        if not cleared:
             await _emit_llm_finished(llm_target, "stale_dropped")
             gate.mark_job_stale_dropped(ctx.job_id)
             await gate.dispatch_latest_after_stale(ctx.job_id)
-            _record_job_state(ctx, "stale_dropped", {"reason": "buffer_version_changed_before_send"})
+            _record_job_state(ctx, "stale_dropped", {
+                "reason": "buffer_version_changed_before_send",
+                "claim_reason": reason,
+            })
             await _emit_state({"session_id": ctx.snapshot.session_id, "job_id": ctx.job_id, "result": "stale_dropped"})
-            return
-    else:
-        send_group_version = ctx.snapshot.buffer_version
+            return False
+        send_group_version = new_version
+        visible_send_claimed = True
+        return True
 
     if decision.action == Action.ENTER_CHAT:
         await gate._enter_hot()
@@ -599,9 +606,12 @@ async def on_decision(ctx: ProcessContext):
 
         if not ctx.bypass_user_composing_gate and _requires_user_composing_gate([item]):
             commit_sent_progress()
-            if not await _wait_until_user_not_composing(ctx):
+            if not await _wait_until_user_not_composing(ctx, send_group_version):
                 await _emit_llm_finished(llm_target, "stale_dropped")
                 return
+
+        if not await claim_visible_send(f"send_index_{send_index}"):
+            return
 
         gate.record_send_meta(ctx, send_index, send_count, item_type)
         if not ctx.bypass_send_group_gate and not await gate.is_send_group_current(ctx, send_group_version):
@@ -1151,18 +1161,26 @@ def _record_onebot_input_status(
         db.close()
 
 
-async def _wait_until_user_not_composing(ctx: ProcessContext) -> bool:
+async def _wait_until_user_not_composing(
+    ctx: ProcessContext,
+    expected_buffer_version: Optional[int] = None,
+) -> bool:
     gate = ctx.gate
     if not gate.is_user_composing():
         return True
 
     gate.mark_job_deferred(ctx.job_id)
+    wait_started_at = datetime.now()
+    wait_until = wait_started_at + timedelta(seconds=USER_COMPOSING_MAX_BLOCK_SECONDS)
     composing_meta = gate.get_user_composing_meta()
     await _emit_state({
         "session_id": ctx.snapshot.session_id,
         "job_id": ctx.job_id,
         "snapshot_id": ctx.snapshot.snapshot_id,
         "result": "deferred_user_composing",
+        "max_wait_seconds": USER_COMPOSING_MAX_BLOCK_SECONDS,
+        "wait_started_at": wait_started_at.isoformat(),
+        "wait_until": wait_until.isoformat(),
         "composing": composing_meta,
     })
 
@@ -1179,12 +1197,22 @@ async def _wait_until_user_not_composing(ctx: ProcessContext) -> bool:
                 "reason": "user_message_while_composing",
             })
             return False
-        await asyncio.sleep(0.2)
+        now = datetime.now()
+        if now >= wait_until:
+            gate.clear_user_composing(reason="send_gate_max_wait_elapsed")
+            break
+        await asyncio.sleep(min(0.2, max(0.01, (wait_until - now).total_seconds())))
 
-    if gate.is_job_stale(ctx.job_id) or not await gate.is_snapshot_current(ctx):
+    if expected_buffer_version is None:
+        expected_buffer_version = ctx.snapshot.buffer_version
+    still_current = await gate.is_send_group_current(ctx, expected_buffer_version)
+    if gate.is_job_stale(ctx.job_id) or not still_current:
         gate.mark_job_stale_dropped(ctx.job_id)
         await gate.dispatch_latest_after_stale(ctx.job_id)
-        _record_job_state(ctx, "stale_dropped", {"reason": "stale_after_user_composing"})
+        _record_job_state(ctx, "stale_dropped", {
+            "reason": "stale_after_user_composing",
+            "expected_buffer_version": expected_buffer_version,
+        })
         await _emit_state({
             "session_id": ctx.snapshot.session_id,
             "job_id": ctx.job_id,
@@ -1198,6 +1226,7 @@ async def _wait_until_user_not_composing(ctx: ProcessContext) -> bool:
         "job_id": ctx.job_id,
         "snapshot_id": ctx.snapshot.snapshot_id,
         "result": "resumed_after_user_composing",
+        "expected_buffer_version": expected_buffer_version,
     })
     return True
 

@@ -1,12 +1,12 @@
 import unittest
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from app.api.routes import _message_target_from_snapshot, _reply_target_from_context
 from app.adapters.onebot11.client import OneBotConnectionManager
 from app.adapters.onebot11.events import parse_onebot_event
-from app.core.event_gate import EventGate
+from app.core.event_gate import EventGate, USER_COMPOSING_MAX_BLOCK_SECONDS
 from app.core.events import ChatEvent, EventType
 
 
@@ -223,6 +223,60 @@ class OneBotAdapterTest(unittest.TestCase):
             self.assertFalse(meta["active"])
             self.assertFalse(meta["last_event"]["composing"])
             self.assertEqual(meta["last_event"]["reason"], "message_received")
+
+        asyncio.run(scenario())
+
+    def test_input_status_refresh_keeps_raw_composing_until_send_gate_decides(self):
+        async def scenario():
+            async def noop_decision(_ctx):
+                return None
+
+            gate = EventGate(on_decision=noop_decision)
+            await gate.handle_event(ChatEvent(
+                event_id="typing-1",
+                platform="qq",
+                user_id="550808201",
+                event_type=EventType.USER_COMPOSING,
+                timestamp=datetime.now(),
+                raw={"composing": True, "ttl_ms": 8000},
+            ))
+            first_meta = gate.get_user_composing_meta()
+            self.assertTrue(first_meta["active"])
+            self.assertEqual(first_meta["last_event"]["send_max_wait_seconds"], USER_COMPOSING_MAX_BLOCK_SECONDS)
+
+            gate._user_composing_started_at = datetime.now() - timedelta(
+                seconds=USER_COMPOSING_MAX_BLOCK_SECONDS + 1
+            )
+            await gate.handle_event(ChatEvent(
+                event_id="typing-2",
+                platform="qq",
+                user_id="550808201",
+                event_type=EventType.USER_COMPOSING,
+                timestamp=datetime.now(),
+                raw={"composing": True, "ttl_ms": 8000},
+            ))
+            refreshed_meta = gate.get_user_composing_meta()
+            self.assertTrue(refreshed_meta["active"])
+            self.assertEqual(refreshed_meta["last_event"]["reason"], "input_status")
+
+            await gate.handle_event(ChatEvent(
+                event_id="msg",
+                platform="qq",
+                user_id="550808201",
+                event_type=EventType.TEXT,
+                text="真发出来了",
+                timestamp=datetime.now(),
+                raw={"source": "onebot11"},
+            ))
+            await gate.handle_event(ChatEvent(
+                event_id="typing-3",
+                platform="qq",
+                user_id="550808201",
+                event_type=EventType.USER_COMPOSING,
+                timestamp=datetime.now(),
+                raw={"composing": True, "ttl_ms": 8000},
+            ))
+            self.assertTrue(gate.get_user_composing_meta()["active"])
 
         asyncio.run(scenario())
 

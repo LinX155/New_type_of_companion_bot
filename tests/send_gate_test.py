@@ -208,6 +208,149 @@ class SendGateTest(unittest.TestCase):
             SendItem(type=SendItemType.TEXT, content="等我一下"),
         ]))
 
+    def test_user_composing_wait_deadline_starts_when_send_gate_defers(self):
+        async def scenario():
+            class ComposingGate:
+                def __init__(self):
+                    self.composing = True
+                    self.cleared_reason = None
+                    self.deferred = []
+                    self.current_checks = []
+
+                def is_user_composing(self):
+                    return self.composing
+
+                def mark_job_deferred(self, job_id):
+                    self.deferred.append(job_id)
+
+                def get_user_composing_meta(self):
+                    return {"active": self.composing, "until": "raw-input-status-ttl"}
+
+                def is_job_stale(self, job_id):
+                    return False
+
+                def mark_job_stale_dropped(self, job_id):
+                    pass
+
+                async def dispatch_latest_after_stale(self, job_id):
+                    pass
+
+                async def is_send_group_current(self, ctx, expected_buffer_version):
+                    self.current_checks.append(expected_buffer_version)
+                    return expected_buffer_version == 42
+
+                def clear_user_composing(self, event=None, reason="cleared"):
+                    self.composing = False
+                    self.cleared_reason = reason
+
+            gate = ComposingGate()
+            states = []
+            originals = {
+                "_emit_state": routes._emit_state,
+                "USER_COMPOSING_MAX_BLOCK_SECONDS": routes.USER_COMPOSING_MAX_BLOCK_SECONDS,
+            }
+
+            async def fake_emit_state(data):
+                states.append(data)
+
+            try:
+                routes._emit_state = fake_emit_state
+                routes.USER_COMPOSING_MAX_BLOCK_SECONDS = 0.01
+                ctx = SimpleNamespace(
+                    gate=gate,
+                    job_id="job_wait",
+                    snapshot=SimpleNamespace(
+                        session_id="default",
+                        snapshot_id=1,
+                        buffer_version=10,
+                    ),
+                )
+
+                ok = await routes._wait_until_user_not_composing(ctx, expected_buffer_version=42)
+            finally:
+                for name, value in originals.items():
+                    setattr(routes, name, value)
+
+            self.assertTrue(ok)
+            self.assertEqual(gate.deferred, ["job_wait"])
+            self.assertEqual(gate.cleared_reason, "send_gate_max_wait_elapsed")
+            self.assertEqual(gate.current_checks, [42])
+            self.assertEqual(states[0]["result"], "deferred_user_composing")
+            self.assertEqual(states[0]["max_wait_seconds"], 0.01)
+            self.assertEqual(states[-1]["result"], "resumed_after_user_composing")
+
+        asyncio.run(scenario())
+
+    def test_text_composing_wait_happens_before_buffer_clear(self):
+        async def scenario():
+            decision = ActionDecision(
+                action=Action.REPLY,
+                items=[SendItem(type=SendItemType.TEXT, content="我在呢")],
+            )
+            graph = FakeGraph(decision)
+            gate = FakeGate()
+            order = []
+
+            async def fake_clear(expected_version):
+                order.append(("clear", expected_version))
+                return True, expected_version + 1
+
+            async def fake_wait(ctx, expected_buffer_version=None):
+                order.append(("wait", expected_buffer_version))
+                return True
+
+            gate.clear_buffer_after_visible_send = fake_clear
+
+            originals = {
+                "companion_graph": routes.companion_graph,
+                "event_gate": routes.event_gate,
+                "_emit_llm_started": routes._emit_llm_started,
+                "_emit_message": routes._emit_message,
+                "_emit_state": routes._emit_state,
+                "_emit_conversation_changed": routes._emit_conversation_changed,
+                "_wait_until_user_not_composing": routes._wait_until_user_not_composing,
+                "_apply_recent_repetition_guard": routes._apply_recent_repetition_guard,
+                "_record_prompt_cache_debug": routes._record_prompt_cache_debug,
+                "_record_assistant_send": routes._record_assistant_send,
+                "_record_job_state": routes._record_job_state,
+            }
+
+            async def noop_async(*args, **kwargs):
+                pass
+
+            try:
+                routes.companion_graph = graph
+                routes.event_gate = gate
+                routes._emit_llm_started = noop_async
+                routes._emit_message = noop_async
+                routes._emit_state = noop_async
+                routes._emit_conversation_changed = noop_async
+                routes._wait_until_user_not_composing = fake_wait
+                routes._apply_recent_repetition_guard = lambda ctx, decision: (decision, [])
+                routes._record_prompt_cache_debug = lambda *args, **kwargs: None
+                routes._record_assistant_send = lambda *args, **kwargs: None
+                routes._record_job_state = lambda *args, **kwargs: None
+
+                ctx = SimpleNamespace(
+                    gate=gate,
+                    job_id="job_text_wait",
+                    snapshot=SimpleNamespace(
+                        session_id="default",
+                        snapshot_id=1,
+                        buffer_version=10,
+                        events=[{"text": "在吗"}],
+                    ),
+                )
+                await routes.on_decision(ctx)
+            finally:
+                for name, value in originals.items():
+                    setattr(routes, name, value)
+
+            self.assertEqual(order, [("wait", 10), ("clear", 10)])
+            self.assertTrue(gate.sent)
+
+        asyncio.run(scenario())
+
     def test_meme_sends_before_following_text_is_deferred_by_composing(self):
         async def scenario():
             decision = ActionDecision(
@@ -242,7 +385,7 @@ class SendGateTest(unittest.TestCase):
             async def fake_emit_message(data):
                 emitted.append(data)
 
-            async def fake_wait(ctx):
+            async def fake_wait(ctx, expected_buffer_version=None):
                 wait_calls.append(ctx.job_id)
                 return False
 
@@ -334,7 +477,7 @@ class SendGateTest(unittest.TestCase):
                 routes._emit_message = fake_emit_message
                 routes._emit_state = noop_async
                 routes._emit_conversation_changed = noop_async
-                routes._wait_until_user_not_composing = lambda ctx: asyncio.sleep(0, result=True)
+                routes._wait_until_user_not_composing = lambda ctx, expected_buffer_version=None: asyncio.sleep(0, result=True)
                 routes._apply_recent_repetition_guard = lambda ctx, decision: (decision, [])
                 routes._record_prompt_cache_debug = lambda *args, **kwargs: None
                 routes._record_assistant_send = lambda *args, **kwargs: None
@@ -418,7 +561,7 @@ class SendGateTest(unittest.TestCase):
                 routes._emit_message = fake_emit_message
                 routes._emit_state = noop_async
                 routes._emit_conversation_changed = noop_async
-                routes._wait_until_user_not_composing = lambda ctx: asyncio.sleep(0, result=True)
+                routes._wait_until_user_not_composing = lambda ctx, expected_buffer_version=None: asyncio.sleep(0, result=True)
                 routes._apply_recent_repetition_guard = lambda ctx, decision: (decision, [])
                 routes._record_prompt_cache_debug = lambda *args, **kwargs: None
                 routes._record_assistant_send = lambda *args, **kwargs: None
@@ -498,7 +641,7 @@ class SendGateTest(unittest.TestCase):
                 routes._emit_message = fake_emit_message
                 routes._emit_state = fake_emit_state
                 routes._emit_conversation_changed = noop_async
-                routes._wait_until_user_not_composing = lambda ctx: asyncio.sleep(0, result=True)
+                routes._wait_until_user_not_composing = lambda ctx, expected_buffer_version=None: asyncio.sleep(0, result=True)
                 routes._apply_recent_repetition_guard = lambda ctx, decision: (decision, [])
                 routes._record_prompt_cache_debug = lambda *args, **kwargs: None
                 routes._record_assistant_send = lambda *args, **kwargs: None
@@ -562,7 +705,7 @@ class SendGateTest(unittest.TestCase):
             async def fake_emit_message(data):
                 emitted.append(data)
 
-            async def fake_wait(ctx):
+            async def fake_wait(ctx, expected_buffer_version=None):
                 return True
 
             try:

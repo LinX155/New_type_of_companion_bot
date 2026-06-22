@@ -10,6 +10,9 @@ from .events import ChatEvent, EventType
 from .decisions import ActionDecision
 
 
+USER_COMPOSING_MAX_BLOCK_SECONDS = 4.0
+
+
 class EventGate:
     def __init__(
         self,
@@ -34,6 +37,7 @@ class EventGate:
         self._last_command: Optional[str] = None
         self._last_command_result: Optional[str] = None
         self._last_process_context: Optional[ProcessContext] = None
+        self._user_composing_started_at: Optional[datetime] = None
         self._user_composing_until: Optional[datetime] = None
         self._last_composing_event: Optional[dict] = None
 
@@ -172,8 +176,12 @@ class EventGate:
         now = datetime.now()
 
         if composing:
-            self._user_composing_until = now + timedelta(milliseconds=ttl_ms)
+            if self._user_composing_started_at is None:
+                self._user_composing_started_at = now
+            ttl_until = now + timedelta(milliseconds=ttl_ms)
+            self._user_composing_until = ttl_until
         else:
+            self._user_composing_started_at = None
             self._user_composing_until = None
 
         self._set_last_composing_event(
@@ -201,6 +209,12 @@ class EventGate:
             "user_id": event.user_id,
             "composing": composing,
             "ttl_ms": ttl_ms,
+            "started_at": (
+                self._user_composing_started_at.isoformat()
+                if self._user_composing_started_at
+                else None
+            ),
+            "send_max_wait_seconds": USER_COMPOSING_MAX_BLOCK_SECONDS,
             "until": self._user_composing_until.isoformat() if self._user_composing_until else None,
         }
         if reason:
@@ -357,7 +371,8 @@ class EventGate:
     def is_user_composing(self) -> bool:
         if not self._user_composing_until:
             return False
-        if datetime.now() <= self._user_composing_until:
+        now = datetime.now()
+        if now <= self._user_composing_until:
             return True
         self._user_composing_until = None
         if self._last_composing_event and self._last_composing_event.get("composing"):
@@ -370,6 +385,7 @@ class EventGate:
         return False
 
     def clear_user_composing(self, event: Optional[ChatEvent] = None, reason: str = "cleared"):
+        self._user_composing_started_at = None
         self._user_composing_until = None
         if event:
             self._set_last_composing_event(
@@ -378,10 +394,18 @@ class EventGate:
                 ttl_ms=0,
                 reason=reason,
             )
+        elif self._last_composing_event:
+            self._last_composing_event = {
+                **self._last_composing_event,
+                "composing": False,
+                "until": None,
+                "reason": reason,
+            }
 
     def get_user_composing_meta(self) -> dict:
         return {
             "active": self.is_user_composing(),
+            "started_at": self._user_composing_started_at.isoformat() if self._user_composing_started_at else None,
             "until": self._user_composing_until.isoformat() if self._user_composing_until else None,
             "last_event": self._last_composing_event,
         }
