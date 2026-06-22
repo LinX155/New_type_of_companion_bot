@@ -384,6 +384,18 @@ start.bat
 
 打开 WebUI 即可开始对话验证。
 
+### NapCat / OneBot 连接配置
+
+如果需要接入 QQ 私聊，在 NapCat WebUI 中新增或修改 OneBot v11 反向 WebSocket 客户端：
+
+```text
+名称：情感陪伴
+地址：ws://127.0.0.1:8000/onebot/ws
+消息上报格式：array
+```
+
+后端启动后会同时提供 WebUI 和 OneBot 反向 WS 服务；NapCat 连接成功后，WebUI 左上角的 NapCat 状态灯会变为在线。
+
 ---
 
 ## 项目文档
