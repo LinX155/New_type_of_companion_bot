@@ -164,13 +164,13 @@ class FakeVisionLLM:
             ("image_understanding_result" in serialized or "media_followup" in serialized)
             and "桌上有一杯咖啡" in serialized
         ):
-            raw = '{"action":"REPLY","items":[{"text":"看到啦，是咖啡续命现场对吧"}]}'
+            raw = "看到啦，是咖啡续命现场对吧"
         elif "media_pending" in serialized:
-            raw = '{"action":"REPLY","items":[{"text":"我看看"}]}'
+            raw = "我看看"
         elif "sticker_pending" in serialized:
-            raw = '{"action":"REPLY","items":[{"text":"哈哈哈"}]}'
+            raw = "哈哈哈"
         else:
-            raw = '{"action":"REPLY","items":[{"text":"收到"}]}'
+            raw = "收到"
         return LLMResponseEnvelope(
             assistant_message={"role": "assistant", "content": raw},
             content=raw,

@@ -1,14 +1,31 @@
 import React, { useState, useEffect } from 'react';
 
 const API_BASE = '';
+const TEMPERATURE_MIN = 1;
+const DEEPSEEK_TEMPERATURE_MAX = 2;
+const MIMO_TEMPERATURE_MAX = 1.5;
+
+const getTemperatureMax = (baseUrl: string, model: string) => {
+  const identity = `${baseUrl || ''} ${model || ''}`.toLowerCase();
+  if (identity.includes('xiaomimimo') || identity.includes('mimo')) return MIMO_TEMPERATURE_MAX;
+  if (identity.includes('deepseek')) return DEEPSEEK_TEMPERATURE_MAX;
+  return DEEPSEEK_TEMPERATURE_MAX;
+};
+
+const clampTemperature = (value: number, max: number) => {
+  if (!Number.isFinite(value)) return TEMPERATURE_MIN;
+  return Math.max(TEMPERATURE_MIN, Math.min(max, value));
+};
 
 const ApiConfig: React.FC = () => {
   const [apiKey, setApiKey] = useState('');
   const [baseUrl, setBaseUrl] = useState('https://api.deepseek.com');
   const [model, setModel] = useState('deepseek-v4-flash');
   const [thinkingEnabled, setThinkingEnabled] = useState(false);
+  const [temperature, setTemperature] = useState(TEMPERATURE_MIN);
   const [savedApi, setSavedApi] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const temperatureMax = getTemperatureMax(baseUrl, model);
 
   useEffect(() => {
     fetch(`${API_BASE}/api/config`)
@@ -18,16 +35,31 @@ const ApiConfig: React.FC = () => {
         if (data.base_url) setBaseUrl(data.base_url);
         if (data.model) setModel(data.model);
         if (data.thinking_enabled !== undefined) setThinkingEnabled(data.thinking_enabled);
+        if (data.temperature !== undefined) setTemperature(Number(data.temperature) || TEMPERATURE_MIN);
       })
       .catch(() => {});
   }, []);
 
-  const saveConfig = async (thinkingValue: boolean) => {
-    await fetch(`${API_BASE}/api/config`, {
+  useEffect(() => {
+    setTemperature(prev => clampTemperature(prev, temperatureMax));
+  }, [temperatureMax]);
+
+  const saveConfig = async (thinkingValue: boolean, temperatureValue: number = temperature) => {
+    const response = await fetch(`${API_BASE}/api/config`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ api_key: apiKey, base_url: baseUrl, model, thinking_enabled: thinkingValue }),
+      body: JSON.stringify({
+        api_key: apiKey,
+        base_url: baseUrl,
+        model,
+        thinking_enabled: thinkingValue,
+        temperature: clampTemperature(temperatureValue, temperatureMax),
+      }),
     });
+    const data = await response.json().catch(() => null);
+    if (data?.temperature !== undefined) {
+      setTemperature(Number(data.temperature) || TEMPERATURE_MIN);
+    }
   };
 
   const handleSave = async () => {
@@ -44,7 +76,7 @@ const ApiConfig: React.FC = () => {
   const handleToggleThinking = async (next: boolean) => {
     setThinkingEnabled(next);
     try {
-      await saveConfig(next);
+      await saveConfig(next, temperature);
       setSavedApi(true);
       setTimeout(() => setSavedApi(false), 2000);
     } catch {
@@ -84,6 +116,36 @@ const ApiConfig: React.FC = () => {
               onChange={e => { setModel(e.target.value); setDirty(true); }}
               style={{ width: '100%', padding: '10px', border: '1px solid #ddd', borderRadius: '6px', fontSize: '14px' }}
             />
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
+              <label style={{ fontWeight: 500 }}>Temperature</label>
+              <span style={{ color: '#2c3e50', fontVariantNumeric: 'tabular-nums', fontSize: '14px' }}>
+                {temperature.toFixed(2)}
+              </span>
+            </div>
+            <input
+              type="range"
+              min={TEMPERATURE_MIN}
+              max={temperatureMax}
+              step={0.05}
+              value={clampTemperature(temperature, temperatureMax)}
+              onChange={e => {
+                setTemperature(clampTemperature(Number(e.target.value), temperatureMax));
+                setDirty(true);
+              }}
+              style={{ width: '100%' }}
+            />
+            <div style={{ display: 'flex', justifyContent: 'space-between', color: '#7f8c8d', fontSize: '12px' }}>
+              <span>最低 {TEMPERATURE_MIN.toFixed(0)}</span>
+              <span>{temperatureMax === MIMO_TEMPERATURE_MAX ? 'MiMo' : 'DeepSeek/默认'} 最高 {temperatureMax.toFixed(1)}</span>
+            </div>
+            <div style={{ color: thinkingEnabled ? '#b26a00' : '#7f8c8d', fontSize: '12px' }}>
+              {thinkingEnabled
+                ? '思考模式下部分模型会忽略自定义 temperature，后端会优先保证 API 不报错。'
+                : '影响主聊天完整链路；看图、记忆整理、存表情等后台任务仍使用低温。'}
+            </div>
           </div>
 
           <div style={{

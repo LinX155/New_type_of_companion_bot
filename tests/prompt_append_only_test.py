@@ -1,11 +1,17 @@
 import asyncio
 import json
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 
 from app.core.decisions import Action, ActionDecision, SendItem, SendItemType
 from app.core.graph import CompanionGraph
-from app.core.protocol import build_repair_messages, parse_and_validate_raw_decision
+from app.core.protocol import (
+    build_repair_messages,
+    parse_and_validate_main_output,
+    parse_and_validate_raw_decision,
+    parse_meme_selection_output,
+)
 from app.core.state import ChatStatus, ColdStartMeta, ConversationSnapshot
 from app.llm.client import LLMClient, LLMResponseEnvelope
 from app.llm.prompts import (
@@ -15,6 +21,7 @@ from app.llm.prompts import (
     build_midnight_cleanup_messages,
     build_system_prompt,
 )
+from app.scheduler.jobs import SchedulerManager
 
 
 class FakeLLM:
@@ -33,12 +40,12 @@ class FakeJsonRepairLLM(FakeLLM):
 
     async def chat_completion(self, messages, temperature=0.7, stream=False):
         self.calls += 1
-        return '{"action":"REACT","items":[{"search_meme":"amused:laugh"}]}'
+        return "&&amused:laugh&&"
 
 
 class FakeReasoningEnvelopeLLM(FakeLLM):
-    def __init__(self):
-        self.raw = '{"action":"REPLY","items":[{"text":"我在呢"}]}'
+    def __init__(self, raw=None):
+        self.raw = raw if raw is not None else "我在呢"
 
     async def chat_completion_envelope(self, messages, temperature=0.7):
         return LLMResponseEnvelope(
@@ -60,20 +67,38 @@ class FakeReasoningEnvelopeLLM(FakeLLM):
 
 
 class FakeRepairEnvelopeLLM(FakeLLM):
-    def __init__(self):
+    def __init__(self, temperature=1.0):
+        self.temperature = temperature
         self.calls = 0
         self.requests = []
+        self.temperatures = []
 
     async def chat_completion_envelope(self, messages, temperature=0.7):
         self.calls += 1
         self.requests.append([dict(item) for item in messages])
+        self.temperatures.append(temperature)
         if self.calls == 1:
             raw = '{"action":"REACT","items":[{"type":"search_meme","content":"search_meme:amused:laugh"}]}'
         else:
-            raw = '{"action":"REPLY","items":[{"text":"修好了"}]}'
+            raw = "修好了"
         return LLMResponseEnvelope(
             assistant_message={"role": "assistant", "content": raw},
             content=raw,
+        )
+
+
+class FakeMemeSelectionEnvelopeLLM(FakeLLM):
+    def __init__(self, temperature=1.0):
+        self.temperature = temperature
+        self.requests = []
+        self.temperatures = []
+
+    async def chat_completion_envelope(self, messages, temperature=0.7):
+        self.requests.append([dict(item) for item in messages])
+        self.temperatures.append(temperature)
+        return LLMResponseEnvelope(
+            assistant_message={"role": "assistant", "content": ":meme:amused_laugh_001"},
+            content=":meme:amused_laugh_001",
         )
 
 
@@ -243,7 +268,8 @@ class PromptAppendOnlyTest(unittest.TestCase):
             self.assertEqual(reminder_payload["message_type"], "SYSTEM_REMINDER")
             self.assertEqual(reminder_payload["visibility"], "internal_only_not_visible_to_user")
             self.assertTrue(any("不要每轮都用问句结尾" in rule for rule in reminder_payload["rules"]))
-            self.assertTrue(any("Action Harness JSON" in rule for rule in reminder_payload["rules"]))
+            self.assertTrue(any("&&category:keywords&&" in rule for rule in reminder_payload["rules"]))
+            self.assertTrue(any("不要输出 JSON" in rule for rule in reminder_payload["rules"]))
 
             user_index = next(
                 index for index, item in enumerate(hot_messages)
@@ -349,7 +375,7 @@ class PromptAppendOnlyTest(unittest.TestCase):
 
             self.assertEqual(len(assistant_messages), 1)
             self.assertIsNone(assistant_messages[0].get("content"))
-            self.assertIn('"action":"REPLY"', assistant_messages[0]["reasoning_content"])
+            self.assertEqual(assistant_messages[0]["reasoning_content"], "我在呢")
             self.assertTrue(graph.get_prompt_observability()["append_only_check"])
             serialized_messages = json.dumps(second_state["messages"], ensure_ascii=False)
             self.assertNotIn("prompt_tokens", serialized_messages)
@@ -358,9 +384,98 @@ class PromptAppendOnlyTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_reasoning_content_rescue_accepts_lightweight_natural_output(self):
+        async def scenario():
+            graph = CompanionGraph(FakeReasoningEnvelopeLLM(raw="我在呢"), FakeMemory(), FakeMemeCatalog())
+            ctx = SimpleNamespace(
+                gate=self._gate(msg_index=1, age="unknown"),
+                snapshot=ConversationSnapshot(
+                    snapshot_id=1,
+                    buffer_version=1,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e1",
+                            "event_type": "message.text",
+                            "text": "在吗",
+                        }
+                    ],
+                ),
+            )
+            state = await graph._build_context({"ctx": ctx})
+            decision_state = await graph._call_llm_for_decision(state)
+
+            self.assertEqual(decision_state["decision"].action, Action.REPLY)
+            self.assertEqual(decision_state["decision"].text_bubbles(), ["我在呢"])
+            self.assertEqual(graph.get_prompt_observability()["raw_output_source"], "reasoning_content_rescue")
+
+        asyncio.run(scenario())
+
+    def test_reasoning_content_rescue_blocks_obvious_cot_text(self):
+        async def scenario():
+            graph = CompanionGraph(
+                FakeReasoningEnvelopeLLM(raw="用户说在吗，我需要先判断是否回复。最终输出：我在呢"),
+                FakeMemory(),
+                FakeMemeCatalog(),
+            )
+            ctx = SimpleNamespace(
+                gate=self._gate(msg_index=1, age="unknown"),
+                snapshot=ConversationSnapshot(
+                    snapshot_id=1,
+                    buffer_version=1,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e1",
+                            "event_type": "message.text",
+                            "text": "在吗",
+                        }
+                    ],
+                ),
+            )
+            state = await graph._build_context({"ctx": ctx})
+            decision_state = await graph._call_llm_for_decision(state)
+
+            self.assertEqual(decision_state["decision"].action, Action.LIGHT_ACK)
+            self.assertEqual(decision_state["decision"].text_bubbles(), ["嗯"])
+            self.assertEqual(graph.get_prompt_observability()["raw_output_source"], "content_empty")
+
+        asyncio.run(scenario())
+
+    def test_reasoning_content_rescue_blocks_legacy_json_protocol(self):
+        async def scenario():
+            graph = CompanionGraph(
+                FakeReasoningEnvelopeLLM(raw='{"action":"REPLY","items":[{"text":"我在呢"}]}'),
+                FakeMemory(),
+                FakeMemeCatalog(),
+            )
+            ctx = SimpleNamespace(
+                gate=self._gate(msg_index=1, age="unknown"),
+                snapshot=ConversationSnapshot(
+                    snapshot_id=1,
+                    buffer_version=1,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e1",
+                            "event_type": "message.text",
+                            "text": "在吗",
+                        }
+                    ],
+                ),
+            )
+            state = await graph._build_context({"ctx": ctx})
+            decision_state = await graph._call_llm_for_decision(state)
+
+            self.assertEqual(decision_state["decision"].action, Action.LIGHT_ACK)
+            self.assertEqual(decision_state["decision"].text_bubbles(), ["嗯"])
+            self.assertEqual(graph.get_prompt_observability()["raw_output_source"], "content_empty")
+
+        asyncio.run(scenario())
+
     def test_repair_uses_same_provider_transcript_without_tool_role(self):
         async def scenario():
-            llm = FakeRepairEnvelopeLLM()
+            llm = FakeRepairEnvelopeLLM(temperature=1.35)
             graph = CompanionGraph(llm, FakeMemory(), FakeMemeCatalog())
             ctx = SimpleNamespace(
                 gate=self._gate(msg_index=1, age="unknown"),
@@ -382,6 +497,7 @@ class PromptAppendOnlyTest(unittest.TestCase):
             decision_state = await graph._call_llm_for_decision(state)
 
             self.assertEqual(llm.calls, 2)
+            self.assertEqual(llm.temperatures, [1.35, 1.35])
             self.assertEqual(decision_state["decision"].to_harness_payload(), {
                 "action": "REPLY",
                 "items": [{"text": "修好了"}],
@@ -395,6 +511,39 @@ class PromptAppendOnlyTest(unittest.TestCase):
                 for item in repair_request
             ))
             self.assertTrue(graph.get_prompt_observability()["append_only_check"])
+
+        asyncio.run(scenario())
+
+    def test_meme_second_round_uses_main_chat_temperature(self):
+        async def scenario():
+            llm = FakeMemeSelectionEnvelopeLLM(temperature=1.35)
+            graph = CompanionGraph(llm, FakeMemory(), FakeMemeCatalog())
+            graph._prompt_transcript = [
+                {"role": "system", "content": "base"},
+                {"role": "user", "content": "发个表情"},
+                {"role": "assistant", "content": "给你这个 &&amused:laugh&&"},
+            ]
+            graph.meme_search.search = lambda category, keywords, top_k=5: ["amused_laugh_001"]
+            graph.meme_renderer.render_meme = (
+                lambda stem: "C:/tmp/amused_laugh_001.png"
+                if stem == "amused_laugh_001"
+                else None
+            )
+            ctx = SimpleNamespace(
+                meme_candidates=[],
+                selected_memes=[],
+                selected_meme=None,
+            )
+
+            resolved = await graph.resolve_search_meme_item(
+                ctx,
+                SendItem(type=SendItemType.SEARCH_MEME, content="amused:laugh"),
+            )
+
+            self.assertIsNotNone(resolved)
+            self.assertEqual(resolved.type, SendItemType.MEME)
+            self.assertEqual(resolved.harness_value(), "amused_laugh_001")
+            self.assertEqual(llm.temperatures, [1.35])
 
         asyncio.run(scenario())
 
@@ -601,7 +750,9 @@ class PromptAppendOnlyTest(unittest.TestCase):
             messages = state["messages"]
 
             self.assertEqual(messages[0]["role"], "system")
-            self.assertIn("Action Harness", messages[0]["content"])
+            self.assertIn("轻量输出契约", messages[0]["content"])
+            self.assertIn("&&category:keywords&&", messages[0]["content"])
+            self.assertNotIn('"action": "WAIT"', messages[0]["content"])
             self.assertIn("不常见的陌生的名词", messages[0]["content"])
             self.assertIn("根据知识库分析一下用户为什么会提到这个陌生名词", messages[0]["content"])
             self.assertEqual(self._count_content(messages, "早。"), 1)
@@ -705,6 +856,47 @@ class PromptAppendOnlyTest(unittest.TestCase):
             "items": [{"text": "🙂"}],
         })
 
+    def test_main_harness_rejects_valid_legacy_json_as_blocked_draft(self):
+        result = parse_and_validate_main_output('{"action":"REPLY","items":[{"text":"我在呢"}]}')
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "legacy_json_protocol_error")
+        self.assertEqual(result.decision.action, Action.REPLY)
+        self.assertTrue(any("轻量文本协议" in error for error in result.errors))
+
+    def test_main_harness_accepts_malformed_ampersand_meme_markers(self):
+        cases = [
+            "&amused:laugh&",
+            "&amused:laugh&&",
+            "&&amused:laugh&",
+        ]
+        for marker in cases:
+            with self.subTest(marker=marker):
+                result = parse_and_validate_main_output(f"笑死了 {marker} 真的")
+
+                self.assertTrue(result.ok, result.errors)
+                self.assertEqual(result.decision.action, Action.REACT)
+                items = result.decision.all_items()
+                self.assertEqual([item.type for item in items], [
+                    SendItemType.TEXT,
+                    SendItemType.SEARCH_MEME,
+                    SendItemType.TEXT,
+                ])
+                self.assertEqual(items[1].harness_value(), "amused:laugh")
+                self.assertNotIn("&", "".join(item.harness_value() for item in items))
+
+    def test_main_harness_strips_invalid_ampersand_tag_without_touching_normal_ampersands(self):
+        result = parse_and_validate_main_output("笑死 &happy& 真的")
+
+        self.assertTrue(result.ok, result.errors)
+        contents = [item.harness_value() for item in result.decision.all_items()]
+        self.assertEqual(contents, ["笑死  真的"])
+        self.assertNotIn("happy", "".join(contents))
+
+        normal = parse_and_validate_main_output("Tom & Jerry & Co 也太经典了")
+        self.assertTrue(normal.ok, normal.errors)
+        self.assertEqual(normal.decision.all_items()[0].harness_value(), "Tom & Jerry & Co 也太经典了")
+
     def test_debug_parsed_items_use_short_harness_shape(self):
         graph = CompanionGraph(FakeLLM(), FakeMemory(), FakeMemeCatalog())
         graph._record_parsed_decision(
@@ -734,19 +926,19 @@ class PromptAppendOnlyTest(unittest.TestCase):
             original_decision={"action": "REACT", "items": [{"search_meme": "amused:laugh"}]},
         )
 
-        assistant_payload = json.loads(messages[1]["content"])
-        tool_payload = json.loads(messages[2]["content"])
+        tool_payload = json.loads(messages[1]["content"])
         serialized_messages = json.dumps(messages, ensure_ascii=False)
 
-        self.assertEqual(len(messages), 3)
-        self.assertEqual(assistant_payload, {"action": "REACT", "items": [{"search_meme": "amused:laugh"}]})
+        self.assertEqual(len(messages), 2)
         self.assertEqual(tool_payload["results"], [
             {"request": "amused:laugh", "candidates": ["amused_laugh_001"]}
         ])
-        self.assertIn('{"meme":"<file_stem>"}', tool_payload["instruction"])
-        self.assertNotIn('"type":"meme"', tool_payload["instruction"])
+        self.assertEqual(tool_payload["required_output"], ":meme:<file_stem>")
+        self.assertTrue(any(":meme:<file_stem>" in rule for rule in tool_payload["rules"]))
+        self.assertNotIn('"type":"meme"', serialized_messages)
         self.assertNotIn("候选表情 JSON", serialized_messages)
         self.assertEqual(serialized_messages.count("amused_laugh_001"), 1)
+        self.assertEqual(parse_meme_selection_output(":meme:amused_laugh_001", {"amused_laugh_001"}), "amused_laugh_001")
 
     def test_natural_visible_output_is_coerced_before_repair(self):
         async def scenario():
@@ -774,7 +966,7 @@ class PromptAppendOnlyTest(unittest.TestCase):
                 repair=True,
             )
 
-            self.assertEqual(status, "natural_text_coerced")
+            self.assertEqual(status, "ok")
             self.assertEqual(decision.action.value, "REPLY")
             contents = [item.content for item in decision.all_items()]
             self.assertEqual(contents, ["我在呢，刚准备找你。"])
@@ -809,7 +1001,43 @@ class PromptAppendOnlyTest(unittest.TestCase):
                 repair=True,
             )
 
-            self.assertEqual(status, "json_repair_ok")
+            self.assertEqual(status, "repair_ok")
+            self.assertEqual(llm.calls, 1)
+            self.assertEqual(decision.to_harness_payload(), {
+                "action": "REACT",
+                "items": [{"search_meme": "amused:laugh"}],
+            })
+
+        asyncio.run(scenario())
+
+    def test_valid_legacy_json_uses_repair_in_main_harness(self):
+        async def scenario():
+            llm = FakeJsonRepairLLM()
+            graph = CompanionGraph(llm, FakeMemory(), FakeMemeCatalog())
+            ctx = SimpleNamespace(
+                gate=self._gate(msg_index=2, age="just now"),
+                snapshot=ConversationSnapshot(
+                    snapshot_id=2,
+                    buffer_version=2,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e2",
+                            "event_type": "message.text",
+                            "text": "给我个好笑的表情包",
+                        }
+                    ],
+                ),
+            )
+
+            decision, status = await graph._parse_decision_with_harness(
+                ctx=ctx,
+                base_messages=[],
+                raw_output='{"action":"REACT","items":[{"search_meme":"amused:laugh"}]}',
+                repair=True,
+            )
+
+            self.assertEqual(status, "repair_ok")
             self.assertEqual(llm.calls, 1)
             self.assertEqual(decision.to_harness_payload(), {
                 "action": "REACT",
@@ -845,7 +1073,7 @@ class PromptAppendOnlyTest(unittest.TestCase):
                 repair=True,
             )
 
-            self.assertEqual(status, "json_repair_ok")
+            self.assertEqual(status, "repair_ok")
             self.assertEqual(llm.calls, 1)
             self.assertEqual(decision.to_harness_payload(), {
                 "action": "REACT",
@@ -935,10 +1163,12 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertIn("COLD 下每轮先做入热判断", prompt)
         self.assertIn("进入 HOT 代表接下来一段时间你会更在场", prompt)
         self.assertIn("不是为了绕过 COLD 限制发一句普通回复", prompt)
-        self.assertIn("COLD 下 REACT 必须保持纯表情包", prompt)
-        self.assertIn("COLD 下如果文字+表情值得进入热聊，用 ENTER_CHAT.items", prompt)
+        self.assertIn("&&category:keywords&&", prompt)
+        self.assertIn("COLD 下如果要展开文字回复", prompt)
+        self.assertIn("使用 ENTER_CHAT:", prompt)
         self.assertIn("用户: 早，醒了吗", prompt)
-        self.assertIn('"action":"ENTER_CHAT"', prompt)
+        self.assertIn("输出: ENTER_CHAT: 醒了，刚看手机。", prompt)
+        self.assertNotIn('"action":"ENTER_CHAT"', prompt)
 
     def test_midnight_cleanup_prompt_handles_shared_context_and_expired_memory(self):
         messages = build_midnight_cleanup_messages(
@@ -986,7 +1216,72 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertIn("用户原话 > 用户文字 + 图片理解 > 单独图片理解", system_prompt)
         self.assertIn("用户只发图片、没有文字确认时", system_prompt)
         self.assertIn("表情包理解结果通常只代表当下心情、语气或接梗信号", system_prompt)
-        self.assertIn("今天下班路上看到这个晚霞", payload["user_visible_events"])
+        self.assertIn("今天下班路上看到这个晚霞", payload["visible_conversation_events"])
+
+    def test_memory_analysis_prompt_uses_visible_assistant_as_context_only(self):
+        messages = build_memory_analysis_messages(
+            date_str="2026-06-21",
+            transcript=[
+                {
+                    "created_at": "2026-06-21T12:00:00",
+                    "role": "assistant",
+                    "text": "我刚才说等你忙完再聊那家烤冷面",
+                },
+                {
+                    "created_at": "2026-06-21T12:01:00",
+                    "role": "user",
+                    "text": "你刚才说的那个我下班想去买",
+                },
+            ],
+            today_memory_md="# 每日记忆",
+            tomorrow_topics_md="# 明日话题",
+        )
+        system_prompt = messages[0]["content"]
+        payload = json.loads(messages[1]["content"])
+
+        self.assertIn("每行都带 role:user 或 role:assistant", system_prompt)
+        self.assertIn("以 user 明确表达或可见用户行为为主", system_prompt)
+        self.assertIn("我刚才说等你忙完再聊那家烤冷面", payload["visible_conversation_events"])
+        self.assertIn("你刚才说的那个我下班想去买", payload["visible_conversation_events"])
+
+    def test_memory_analysis_transcript_filters_visible_conversation_events(self):
+        manager = SchedulerManager()
+        rows = [
+            SimpleNamespace(
+                event_type="user_text",
+                text="你刚才说的那个我想记一下",
+                action=None,
+                created_at=datetime(2026, 6, 21, 12, 0, 0),
+            ),
+            SimpleNamespace(
+                event_type="assistant_text",
+                text="我刚才说晚点提醒你喝水",
+                action="REPLY",
+                created_at=datetime(2026, 6, 21, 12, 1, 0),
+            ),
+            SimpleNamespace(
+                event_type="assistant_system",
+                text="已存入记忆",
+                action="command.mem",
+                created_at=datetime(2026, 6, 21, 12, 2, 0),
+            ),
+            SimpleNamespace(
+                event_type="user_composing",
+                text="",
+                action="user.composing",
+                created_at=datetime(2026, 6, 21, 12, 3, 0),
+            ),
+        ]
+
+        transcript = [
+            item
+            for row in rows
+            if (item := manager._conversation_event_to_memory_transcript_item(row))
+        ]
+
+        self.assertEqual([item["role"] for item in transcript], ["user", "assistant"])
+        self.assertEqual([item["text"] for item in transcript], ["你刚才说的那个我想记一下", "我刚才说晚点提醒你喝水"])
+        self.assertEqual([item["event_type"] for item in transcript], ["user_text", "assistant_text"])
 
     def test_mem_command_prompt_disambiguates_user_first_person(self):
         messages = build_mem_command_messages(
@@ -1023,22 +1318,16 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertIn("not user-visible chat history", joined)
         self.assertIn("Do not produce a follow-up reply to original_raw_output", joined)
         self.assertIn("不要丢成“嗯”", joined)
-        self.assertIn("修复 COLD 错误时先判断入热价值", joined)
-        self.assertIn("COLD 下混合文字和表情必须先判断是否值得进入 HOT", joined)
-        self.assertIn("不要为了保留长句机械使用 ENTER_CHAT", joined)
+        self.assertIn("WAIT、ENTER_CHAT: <自然语言>、普通自然语言", joined)
+        self.assertIn("&&category:keywords&&", joined)
+        self.assertIn("不要输出 JSON", joined)
         payload = json.loads(messages[1]["content"])
         self.assertEqual(payload["message_type"], "SYSTEM_REMINDER")
         self.assertEqual(payload["status"], "ACTION_HARNESS_PROTOCOL_ERROR")
         self.assertEqual(payload["blocked_output_visibility"], "internal_only_not_visible_to_user")
-        self.assertEqual(payload["schema"]["items"], [
-            {"text": "用户可见文本或 emoji"},
-            {"meme": "<file_stem>"},
-            {"search_meme": "<category>:<keywords>"},
-        ])
-        self.assertEqual(payload["conversion_examples"][0]["good"], {
-            "action": "REPLY",
-            "items": [{"text": "在呢宝，怎么啦？"}],
-        })
+        self.assertNotIn("schema", payload)
+        self.assertEqual(payload["conversion_examples"][0]["good"], "在呢宝，怎么啦？")
+        self.assertEqual(payload["conversion_examples"][2]["good"], "&&amused:laugh&&")
 
     def _gate(self, msg_index: int, age: str):
         gate = SimpleNamespace()

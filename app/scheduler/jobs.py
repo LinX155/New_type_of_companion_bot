@@ -13,6 +13,14 @@ from ..memory.files import MemoryFileManager
 
 TOMORROW_TOPIC_SECTIONS = ("未闭合话题", "昨日记忆", "生活感消息备选")
 MEMORY_ANALYSIS_TOMORROW_SECTIONS = {"未闭合话题"}
+MEMORY_ANALYSIS_EVENT_ROLES = {
+    "user_text": "user",
+    "user_image": "user",
+    "user_sticker": "user",
+    "nudge": "user",
+    "assistant_text": "assistant",
+    "assistant_react": "assistant",
+}
 
 
 class SchedulerManager:
@@ -217,23 +225,32 @@ class SchedulerManager:
                 .filter(ConversationEvent.session_id == session_id)
                 .filter(ConversationEvent.created_at >= start)
                 .filter(ConversationEvent.created_at < end)
-                .filter(ConversationEvent.event_type == "user_text")
+                .filter(ConversationEvent.is_visible.is_(True))
+                .filter(ConversationEvent.event_type.in_(tuple(MEMORY_ANALYSIS_EVENT_ROLES.keys())))
                 .order_by(ConversationEvent.created_at)
                 .all()
             )
             transcript = []
             for row in rows:
-                transcript.append(
-                    {
-                        "role": "user",
-                        "text": row.text,
-                        "action": row.action,
-                        "created_at": row.created_at.isoformat() if row.created_at else "",
-                    }
-                )
+                item = self._conversation_event_to_memory_transcript_item(row)
+                if item:
+                    transcript.append(item)
             return transcript
         finally:
             db.close()
+
+    def _conversation_event_to_memory_transcript_item(self, row) -> Optional[dict]:
+        role = MEMORY_ANALYSIS_EVENT_ROLES.get(row.event_type)
+        text = (row.text or "").strip()
+        if not role or not text:
+            return None
+        return {
+            "role": role,
+            "text": text,
+            "action": row.action,
+            "event_type": row.event_type,
+            "created_at": row.created_at.isoformat() if row.created_at else "",
+        }
 
     def _merge_tomorrow_topics_sections(
         self,

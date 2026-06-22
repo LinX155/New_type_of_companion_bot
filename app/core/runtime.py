@@ -118,6 +118,7 @@ class SessionRuntimeManager:
             base_url=base.base_url,
             model=base.model,
             thinking_enabled=base.thinking_enabled,
+            temperature=base.temperature,
             cache_affinity_enabled=base.cache_affinity_enabled,
             cache_session_id=self._cache_session_id(session_id),
         )
@@ -128,6 +129,7 @@ class SessionRuntimeManager:
             "base_url": self.base_llm_client.base_url,
             "model": self.base_llm_client.model,
             "thinking_enabled": self.base_llm_client.thinking_enabled,
+            "temperature": self.base_llm_client.temperature,
         }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]

@@ -59,6 +59,10 @@ router = APIRouter()
 # 全局实例（MVP 阶段简化）
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DEFAULT_SESSION_ID = WEBUI_DEFAULT_SESSION_ID
+TEMPERATURE_MIN = 1.0
+DEEPSEEK_TEMPERATURE_MAX = 2.0
+MIMO_TEMPERATURE_MAX = 1.5
+DEFAULT_TEMPERATURE = 1.0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -73,6 +77,26 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _temperature_max_for_provider(base_url: str, model: str) -> float:
+    identity = f"{base_url or ''} {model or ''}".lower()
+    if "xiaomimimo" in identity or "mimo" in identity:
+        return MIMO_TEMPERATURE_MAX
+    if "deepseek" in identity:
+        return DEEPSEEK_TEMPERATURE_MAX
+    return DEEPSEEK_TEMPERATURE_MAX
+
+
+def _normalize_temperature_for_provider(value, base_url: str, model: str) -> float:
+    try:
+        temperature = float(value)
+    except (TypeError, ValueError):
+        temperature = DEFAULT_TEMPERATURE
+    if temperature != temperature:
+        temperature = DEFAULT_TEMPERATURE
+    max_temperature = _temperature_max_for_provider(base_url, model)
+    return max(TEMPERATURE_MIN, min(max_temperature, temperature))
 
 
 # NapCat exposes set_input_status.event_type as a raw number and its public docs
@@ -99,6 +123,7 @@ def _load_default_llm_config() -> dict:
         "api_key": os.getenv("LLM_API_KEY", ""),
         "base_url": os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
         "model": os.getenv("LLM_MODEL", "gpt-4o-mini"),
+        "temperature": _env_float("LLM_TEMPERATURE", DEFAULT_TEMPERATURE),
     }
     path = os.path.join(ROOT_DIR, "api_key.txt")
     if os.path.exists(path):
@@ -108,12 +133,15 @@ def _load_default_llm_config() -> dict:
             api_key_match = re.search(r"api_key\s*=\s*[\"']?([A-Za-z0-9_\-]+)", content)
             base_url_match = re.search(r"base_url\s*=\s*[\"']([^\"']+)", content)
             model_match = re.search(r"model\s*=\s*[\"']([^\"']+)", content)
+            temperature_match = re.search(r"temperature\s*=\s*[\"']?([0-9]+(?:\.[0-9]+)?)", content)
             if api_key_match:
                 config["api_key"] = api_key_match.group(1)
             if base_url_match:
                 config["base_url"] = base_url_match.group(1)
             if model_match:
                 config["model"] = model_match.group(1)
+            if temperature_match:
+                config["temperature"] = float(temperature_match.group(1))
         except Exception:
             pass
 
@@ -125,6 +153,13 @@ def _load_default_llm_config() -> dict:
     if _persisted.get("model"):
         config["model"] = _persisted["model"]
     config["thinking_enabled"] = _persisted.get("thinking_enabled", False)
+    if "temperature" in _persisted:
+        config["temperature"] = _persisted.get("temperature")
+    config["temperature"] = _normalize_temperature_for_provider(
+        config.get("temperature"),
+        config.get("base_url", ""),
+        config.get("model", ""),
+    )
     return config
 
 
@@ -162,6 +197,7 @@ class ApiConfig(BaseModel):
     base_url: str
     model: str
     thinking_enabled: bool = False
+    temperature: float = DEFAULT_TEMPERATURE
 
 
 class ChatMessage(BaseModel):
@@ -503,6 +539,7 @@ async def on_decision(ctx: ProcessContext):
     for send_index, unit in enumerate(display_units):
         original_index = unit["original_index"]
         original_item = unit["original_item"]
+        commit_item = original_item
         item = unit["display_item"]
         if not ctx.bypass_send_group_gate and not await gate.is_send_group_current(ctx, send_group_version):
             await _emit_llm_finished(llm_target, "stale_dropped")
@@ -527,6 +564,34 @@ async def on_decision(ctx: ProcessContext):
         send_key = gate.build_send_key(ctx, send_index)
         if gate.is_send_key_sent(send_key):
             continue
+
+        if item.type == SendItemType.SEARCH_MEME:
+            if not graph:
+                continue
+            resolved_item = await graph.resolve_search_meme_item(ctx, item)
+            if not resolved_item:
+                continue
+            item = resolved_item
+            commit_item = resolved_item
+            if not ctx.bypass_send_group_gate and not await gate.is_send_group_current(ctx, send_group_version):
+                await _emit_llm_finished(llm_target, "stale_dropped")
+                commit_sent_progress()
+                gate.mark_job_stale_dropped(ctx.job_id)
+                await gate.dispatch_latest_after_stale(ctx.job_id)
+                _record_job_state(ctx, "stale_dropped", {
+                    "reason": "send_group_changed_after_meme_selection",
+                    "send_index": send_index,
+                    "send_count": send_count,
+                })
+                await _emit_state({
+                    "session_id": ctx.snapshot.session_id,
+                    "job_id": ctx.job_id,
+                    "snapshot_id": ctx.snapshot.snapshot_id,
+                    "send_index": send_index,
+                    "send_count": send_count,
+                    "result": "stale_dropped",
+                })
+                return
 
         content = item.content
         item_type = item.type.value
@@ -588,12 +653,16 @@ async def on_decision(ctx: ProcessContext):
         )
         await _emit_conversation_changed("assistant_send", session_id=ctx.snapshot.session_id)
         if unit["is_last_part"] and original_index not in sent_original_indices:
-            sent_items.append(original_item)
+            sent_items.append(commit_item)
             sent_original_indices.add(original_index)
 
     commit_sent_progress()
-    gate.mark_job_sent(ctx.job_id)
-    await _emit_llm_finished(llm_target, "sent")
+    if sent_items:
+        gate.mark_job_sent(ctx.job_id)
+        await _emit_llm_finished(llm_target, "sent")
+    else:
+        gate.mark_job_dropped(ctx.job_id)
+        await _emit_llm_finished(llm_target, "dropped")
 
 
 def _apply_recent_repetition_guard(
@@ -1057,11 +1126,13 @@ async def _wait_until_user_not_composing(ctx: ProcessContext) -> bool:
 
 @router.post("/api/config")
 async def update_config(config: ApiConfig):
+    temperature = _normalize_temperature_for_provider(config.temperature, config.base_url, config.model)
     llm_client.update_config(
         api_key=config.api_key,
         base_url=config.base_url,
         model=config.model,
         thinking_enabled=config.thinking_enabled,
+        temperature=temperature,
     )
     if runtime_manager:
         runtime_manager.reconfigure_llm_clients(reason="llm_config_changed")
@@ -1072,8 +1143,14 @@ async def update_config(config: ApiConfig):
         "base_url": config.base_url,
         "model": config.model,
         "thinking_enabled": config.thinking_enabled,
+        "temperature": temperature,
     })
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "temperature": temperature,
+        "temperature_min": TEMPERATURE_MIN,
+        "temperature_max": _temperature_max_for_provider(config.base_url, config.model),
+    }
 
 
 @router.get("/api/config")
@@ -1083,6 +1160,9 @@ async def get_config():
         "base_url": llm_client.base_url,
         "model": llm_client.model,
         "thinking_enabled": llm_client.thinking_enabled,
+        "temperature": llm_client.temperature,
+        "temperature_min": TEMPERATURE_MIN,
+        "temperature_max": _temperature_max_for_provider(llm_client.base_url, llm_client.model),
     }
 
 

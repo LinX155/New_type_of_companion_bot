@@ -11,7 +11,7 @@ class ActionRouter:
     def route(self, decision: ActionDecision) -> dict:
         """路由 action 决定，返回发送层可消费的 typed items。"""
         self._last_action = decision.action
-        send_items = decision.send_items()
+        send_items = decision.all_items()
         first_item = send_items[0] if send_items else None
         first_text = first_item.content if first_item else None
         texts = [item.content for item in send_items]
@@ -21,12 +21,6 @@ class ActionRouter:
 
         if decision.action == Action.END_CHAT:
             return self._hidden(Action.END_CHAT.value, "end_chat")
-
-        if decision.action == Action.REACT and not send_items and decision.search_meme_items():
-            return {
-                **self._hidden(Action.REACT.value, "internal_meme_search"),
-                "is_meme": False,
-            }
 
         if decision.action == Action.ENTER_CHAT:
             return self._visible_or_hidden(

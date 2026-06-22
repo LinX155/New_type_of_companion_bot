@@ -7,6 +7,9 @@ from typing import Any, List, Dict, Optional, AsyncGenerator
 from openai import AsyncOpenAI
 
 
+DEFAULT_TEMPERATURE = 1.0
+
+
 @dataclass
 class LLMResponseEnvelope:
     assistant_message: dict
@@ -23,6 +26,7 @@ class LLMClient:
         base_url: Optional[str] = None,
         model: Optional[str] = None,
         thinking_enabled: bool = False,
+        temperature: Optional[float] = None,
         cache_affinity_enabled: bool = True,
         cache_session_id: Optional[str] = None,
     ):
@@ -30,6 +34,9 @@ class LLMClient:
         self.base_url = base_url or os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
         self.model = model or os.getenv("LLM_MODEL", "gpt-4o-mini")
         self.thinking_enabled = thinking_enabled
+        self.temperature = self._normalize_temperature(
+            temperature if temperature is not None else os.getenv("LLM_TEMPERATURE")
+        )
         self.cache_affinity_enabled = cache_affinity_enabled
         self.cache_session_id = cache_session_id or os.getenv("LLM_CACHE_SESSION_ID") or self._new_cache_session_id()
         self._prompt_cache_key_disabled_reason: Optional[str] = None
@@ -305,6 +312,7 @@ class LLMClient:
             "base_url": self.base_url,
             "model": self.model,
             "thinking_enabled": self.thinking_enabled,
+            "temperature": self.temperature,
         })
 
     def get_cache_debug(self) -> dict:
@@ -360,6 +368,7 @@ class LLMClient:
         base_url: Optional[str] = None,
         model: Optional[str] = None,
         thinking_enabled: Optional[bool] = None,
+        temperature: Optional[float] = None,
     ):
         if api_key is not None:
             self.api_key = api_key
@@ -369,9 +378,20 @@ class LLMClient:
             self.model = model
         if thinking_enabled is not None:
             self.thinking_enabled = thinking_enabled
+        if temperature is not None:
+            self.temperature = self._normalize_temperature(temperature)
         # Reset client to use new config
         self._client = None
         self.reset_cache_session()
+
+    def _normalize_temperature(self, value: Any) -> float:
+        try:
+            temperature = float(value)
+        except (TypeError, ValueError):
+            return DEFAULT_TEMPERATURE
+        if temperature != temperature:
+            return DEFAULT_TEMPERATURE
+        return max(0.0, min(2.0, temperature))
 
 
 def json_dumps_stable(payload: dict) -> str:

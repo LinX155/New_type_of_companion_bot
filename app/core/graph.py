@@ -12,8 +12,8 @@ from .protocol import (
     ProtocolResult,
     VALID_MEME_CATEGORIES,
     build_repair_messages,
-    parse_and_validate_raw_decision,
-    validate_executable,
+    parse_and_validate_main_output,
+    parse_meme_selection_output,
 )
 from .state import ChatStatus
 from ..active.messages import ACTIVE_SECTIONS, expire_stale_candidates, parse_active_candidates
@@ -38,6 +38,55 @@ PROMPT_VIEW_LIMITS = {
     "today_memory": 4000,
     "tomorrow_topics": 4000,
 }
+
+REASONING_RESCUE_BLOCKLIST = (
+    "用户说",
+    "系统提示",
+    "系统要求",
+    "我应该",
+    "我们应该",
+    "我需要",
+    "我们需要",
+    "需要输出",
+    "输出json",
+    "输出 json",
+    "最终输出",
+    "候选",
+    "分析",
+    "思考",
+    "推理",
+    "考虑：",
+    "当前是",
+    "根据",
+    "the user",
+    "the system",
+    "i should",
+    "i need",
+    "we need",
+    "let me",
+    "final json",
+    "output json",
+    "candidate",
+    "reasoning",
+    "analysis",
+)
+
+
+def _looks_like_rescuable_reasoning_output(raw_output: str) -> bool:
+    text = (raw_output or "").strip()
+    if not text or len(text) > 260:
+        return False
+    if text.count("\n") > 2:
+        return False
+
+    compact_lower = re.sub(r"\s+", "", text.lower())
+    spaced_lower = text.lower()
+    for marker in REASONING_RESCUE_BLOCKLIST:
+        marker_lower = marker.lower()
+        if marker_lower in compact_lower or marker_lower in spaced_lower:
+            return False
+
+    return True
 
 
 class GraphState(TypedDict, total=False):
@@ -93,21 +142,12 @@ class CompanionGraph:
         graph.add_node("receive_snapshot", self._receive_snapshot)
         graph.add_node("build_context", self._build_context)
         graph.add_node("call_llm_for_decision", self._call_llm_for_decision)
-        graph.add_node("search_meme", self._search_meme)
         graph.add_node("validate_decision", self._validate_decision)
 
         graph.set_entry_point("receive_snapshot")
         graph.add_edge("receive_snapshot", "build_context")
         graph.add_edge("build_context", "call_llm_for_decision")
-        graph.add_conditional_edges(
-            "call_llm_for_decision",
-            self._route_after_first_decision,
-            {
-                "search_meme": "search_meme",
-                "validate_decision": "validate_decision",
-            },
-        )
-        graph.add_edge("search_meme", "validate_decision")
+        graph.add_edge("call_llm_for_decision", "validate_decision")
         graph.add_edge("validate_decision", END)
         return graph.compile()
 
@@ -140,8 +180,6 @@ class CompanionGraph:
         self._record_prompt_observability(messages)
         state: GraphState = {"ctx": ctx, "messages": messages}
         state = await self._call_llm_for_decision(state)
-        if self._route_after_first_decision(state) == "search_meme":
-            state = await self._search_meme(state)
         state = await self._validate_decision(state)
         decision = state.get("decision") or ActionDecision(action=Action.WAIT, items=None)
         ctx.decision = decision
@@ -173,7 +211,7 @@ class CompanionGraph:
     async def _call_llm_for_decision(self, state: GraphState) -> GraphState:
         raw_output = await self._call_llm_for_messages(
             messages=state["messages"],
-            temperature=0.3,
+            temperature=self._main_chat_temperature(),
             append_assistant_to_transcript=True,
         )
         decision, parse_status = await self._parse_decision_with_harness(
@@ -188,12 +226,6 @@ class CompanionGraph:
         state["ctx"].decision = decision
         return {**state, "decision": decision, "messages": self._copy_prompt_transcript()}
 
-    def _route_after_first_decision(self, state: GraphState) -> str:
-        decision = state.get("decision")
-        if decision and decision.search_meme_items():
-            return "search_meme"
-        return "validate_decision"
-
     async def _parse_decision_with_harness(
         self,
         ctx: ProcessContext,
@@ -201,7 +233,10 @@ class CompanionGraph:
         raw_output: str,
         repair: bool,
     ) -> tuple[ActionDecision, str]:
-        result = parse_and_validate_raw_decision(raw_output)
+        result = parse_and_validate_main_output(
+            raw_output,
+            is_cold_context=self._is_cold_context(ctx),
+        )
         if result.ok and result.decision:
             return result.decision, result.status
 
@@ -222,7 +257,7 @@ class CompanionGraph:
                 if repaired.ok and repaired.decision:
                     if repaired.status == "natural_text_coerced":
                         return repaired.decision, repaired.status
-                    return repaired.decision, "json_repair_ok"
+                    return repaired.decision, "repair_ok"
             return self._fallback_decision(ctx), "repair_failed"
 
         relaxed = self._relaxed_visible_decision(raw_output, ctx)
@@ -257,13 +292,16 @@ class CompanionGraph:
         try:
             repaired_raw = await self._call_llm_for_messages(
                 messages=messages,
-                temperature=0.2,
+                temperature=self._main_chat_temperature(),
                 append_assistant_to_transcript=append_assistant,
             )
         except Exception as exc:
             return ProtocolResult(status="repair_failed", errors=[str(exc)])
 
-        repaired = parse_and_validate_raw_decision(repaired_raw)
+        repaired = parse_and_validate_main_output(
+            repaired_raw,
+            is_cold_context=self._is_cold_context(ctx),
+        )
         if repaired.ok:
             return repaired
         relaxed = self._relaxed_visible_decision(repaired_raw, ctx)
@@ -385,129 +423,68 @@ class CompanionGraph:
             )
         return ActionDecision(action=Action.WAIT, items=None)
 
-    async def _search_meme(self, state: GraphState) -> GraphState:
-        ctx = state["ctx"]
-        decision = state["decision"]
-        search_items = decision.search_meme_items()
+    async def resolve_search_meme_item(
+        self,
+        ctx: ProcessContext,
+        item: SendItem,
+    ) -> Optional[SendItem]:
+        """Resolve one internal search_meme marker into a concrete meme item.
 
-        self._last_search_meme = "\n".join(item.harness_value() for item in search_items) or None
-        self._last_render_status = None
+        This is called by the send loop at the marker position, after any
+        prefix text has already been sent. The second LLM call only selects a
+        file_stem; it must not rewrite or add chat text.
+        """
+        if item.type != SendItemType.SEARCH_MEME:
+            return None
 
-        if ctx.meme_search_used:
-            self._last_render_status = "fallback"
-            return {**state, "decision": self._drop_search_items_or_fallback(decision)}
-
-        ctx.meme_search_used = True
-        search_results = []
-        candidate_union: set[str] = set()
-
-        for item in search_items:
-            request_text = item.harness_value()
-            parsed = self.meme_renderer.parse_react_text(item.content)
-            category = parsed.get("category", "")
-            keywords = parsed.get("keywords", "")
-            candidates = self.meme_search.search(category, keywords, top_k=5)
-            search_results.append(
-                {
-                    "request": request_text,
-                    "category": category,
-                    "keywords": keywords,
-                    "candidates": candidates,
-                }
-            )
-            candidate_union.update(candidates)
-
+        request_text = item.harness_value()
+        parsed = self.meme_renderer.parse_react_text(item.content)
+        category = parsed.get("category", "")
+        keywords = parsed.get("keywords", "")
+        candidates = self.meme_search.search(category, keywords, top_k=5)
+        search_results = [
+            {
+                "request": request_text,
+                "category": category,
+                "keywords": keywords,
+                "candidates": candidates,
+            }
+        ]
         ctx.meme_candidates = search_results
+        self._last_search_meme = request_text
 
-        if not candidate_union:
+        if not candidates:
             self._last_render_status = "fallback"
-            return {**state, "decision": self._drop_search_items_or_fallback(decision)}
+            return None
 
-        if self._prompt_transcript:
-            meme_tail = build_meme_search_messages(
-                base_messages=[],
-                search_results=search_results,
-                original_decision=decision.to_harness_payload(exclude_none=True),
-            )[1:]
-            messages = self._append_transcript_messages_for_call(meme_tail)
-            append_assistant = True
-        else:
-            messages = build_meme_search_messages(
-                base_messages=state["messages"],
-                search_results=search_results,
-                original_decision=decision.to_harness_payload(exclude_none=True),
-            )
-            append_assistant = False
-
+        messages = self._append_transcript_messages_for_call(
+            build_meme_search_messages(base_messages=[], search_results=search_results)
+        )
         raw_output = await self._call_llm_for_messages(
             messages=messages,
-            temperature=0.2,
-            append_assistant_to_transcript=append_assistant,
+            temperature=self._main_chat_temperature(),
+            append_assistant_to_transcript=True,
         )
-        second_result = parse_and_validate_raw_decision(raw_output)
-        if not second_result.ok or not second_result.decision:
-            fallback_decision = self._replace_search_items_with_first_candidates(decision, search_results)
-            selected = self._selected_meme_stems(fallback_decision)
-            ctx.selected_memes = selected
-            ctx.selected_meme = selected[0] if selected else None
-            self._last_render_status = "fallback"
-            return {**state, "decision": fallback_decision, "messages": self._copy_prompt_transcript()}
+        selected = parse_meme_selection_output(raw_output, set(candidates))
+        if not selected:
+            selected = self._first_renderable_candidate(candidates)
+            self._last_render_status = "fallback" if selected else "miss"
+        else:
+            selected = selected if self.meme_renderer.render_meme(selected) else None
+            self._last_render_status = "hit" if selected else "miss"
 
-        second_decision = second_result.decision
+        if not selected:
+            return None
 
-        if self._meme_selection_is_valid(second_decision, candidate_union):
-            selected = self._selected_meme_stems(second_decision)
-            ctx.selected_memes = selected
-            ctx.selected_meme = selected[0] if selected else None
-            self._last_render_status = "hit"
-            return {**state, "decision": second_decision, "messages": self._copy_prompt_transcript()}
+        ctx.selected_memes = [selected]
+        ctx.selected_meme = selected
+        return SendItem(type=SendItemType.MEME, content=selected)
 
-        fallback_decision = self._replace_search_items_with_first_candidates(decision, search_results)
-        selected = self._selected_meme_stems(fallback_decision)
-        ctx.selected_memes = selected
-        ctx.selected_meme = selected[0] if selected else None
-        self._last_render_status = "fallback"
-        return {**state, "decision": fallback_decision, "messages": self._copy_prompt_transcript()}
-
-    def _meme_selection_is_valid(self, decision: ActionDecision, candidate_union: set[str]) -> bool:
-        executable = validate_executable(
-            decision,
-            allowed_meme_stems=candidate_union,
-            allow_search_meme=False,
-        )
-        if not executable.ok:
-            return False
-        return bool(decision.send_items())
-
-    def _selected_meme_stems(self, decision: ActionDecision) -> list[str]:
-        return [item.harness_value() for item in decision.all_items() if item.type == SendItemType.MEME]
-
-    def _replace_search_items_with_first_candidates(
-        self,
-        decision: ActionDecision,
-        search_results: list[dict],
-    ) -> ActionDecision:
-        results_by_request = {item.get("request"): item.get("candidates") or [] for item in search_results}
-        replaced_items: list[SendItem] = []
-
-        for item in decision.all_items():
-            if item.type != SendItemType.SEARCH_MEME:
-                replaced_items.append(item)
-                continue
-
-            candidates = results_by_request.get(item.harness_value()) or []
-            if candidates:
-                replaced_items.append(SendItem(type=SendItemType.MEME, content=candidates[0]))
-
-        if replaced_items:
-            return decision.with_items(replaced_items)
-        return ActionDecision(action=Action.LIGHT_ACK, items=[SendItem(type=SendItemType.TEXT, content="嗯")])
-
-    def _drop_search_items_or_fallback(self, decision: ActionDecision) -> ActionDecision:
-        kept_items = [item for item in decision.all_items() if item.type != SendItemType.SEARCH_MEME]
-        if kept_items:
-            return decision.with_items(kept_items)
-        return ActionDecision(action=Action.LIGHT_ACK, items=[SendItem(type=SendItemType.TEXT, content="嗯")])
+    def _first_renderable_candidate(self, candidates: list[str]) -> Optional[str]:
+        for stem in candidates:
+            if self.meme_renderer.render_meme(stem):
+                return stem
+        return None
 
     async def _validate_decision(self, state: GraphState) -> GraphState:
         decision = state["decision"]
@@ -521,21 +498,16 @@ class CompanionGraph:
             self._last_parse_status = context_status
             state = {**state, "decision": decision, "messages": self._copy_prompt_transcript()}
 
-        if decision.search_meme_items() and not ctx.meme_search_used:
-            searched_state = await self._search_meme(state)
-            return await self._validate_decision({**searched_state, "decision": searched_state["decision"]})
-
         ctx.selected_memes = []
         ctx.selected_meme = None
         validated_items: list[SendItem] = []
         selected_memes: list[str] = []
-        dropped_internal = False
         missed_meme = False
         missing_meme_stems: list[str] = []
 
         for item in decision.all_items():
             if item.type == SendItemType.SEARCH_MEME:
-                dropped_internal = True
+                validated_items.append(item)
                 continue
 
             if item.type == SendItemType.MEME:
@@ -554,9 +526,6 @@ class CompanionGraph:
             ctx.missing_meme_repair_used = True
             repaired = await self._repair_missing_meme_decision(state, decision, missing_meme_stems)
             if repaired:
-                if repaired.search_meme_items():
-                    searched_state = await self._search_meme({**state, "decision": repaired})
-                    return await self._validate_decision({**searched_state, "decision": searched_state["decision"]})
                 return await self._validate_decision({**state, "decision": repaired, "messages": self._copy_prompt_transcript()})
 
         if selected_memes:
@@ -567,8 +536,6 @@ class CompanionGraph:
             self._last_render_status = "miss"
             ctx.selected_memes = []
             ctx.selected_meme = None
-        elif dropped_internal:
-            self._last_render_status = "fallback"
 
         if validated_items != decision.all_items():
             if validated_items:
@@ -608,12 +575,15 @@ class CompanionGraph:
         try:
             raw_output = await self._call_llm_for_messages(
                 messages=messages,
-                temperature=0.2,
+                temperature=self._main_chat_temperature(),
                 append_assistant_to_transcript=append_assistant,
             )
-            result = parse_and_validate_raw_decision(raw_output)
+            result = parse_and_validate_main_output(
+                raw_output,
+                is_cold_context=self._is_cold_context(state["ctx"]),
+            )
             if result.ok and result.decision:
-                self._last_parse_status = "json_repair_ok"
+                self._last_parse_status = "repair_ok"
                 return result.decision
             self._last_parse_status = "repair_failed"
             return None
@@ -762,16 +732,16 @@ class CompanionGraph:
             return [
                 "当前聊天状态是 COLD。包含 text item 的 REACT 属于文字+表情混合回复；"
                 "先判断这条用户输入是否值得进入 HOT；"
-                "如果用户明确开启对话、求陪、提问、倾诉或继续追问，需要发送文字+表情并进入热聊，请改用 ENTER_CHAT.items；"
-                "如果只是低负担回应，请删除 text item，保持纯 REACT；如果不回应，请使用 WAIT.items:null。"
+                "如果用户明确开启对话、求陪、提问、倾诉或继续追问，需要发送文字+表情并进入热聊，请改用 ENTER_CHAT: 自然语言；"
+                "如果只是低负担回应，请只保留表情占位或短句；如果不回应，请输出 WAIT。"
             ]
 
         if decision.action == Action.REPLY:
             return [
                 "当前聊天状态是 COLD。普通文本展开回复不能使用 REPLY；"
                 "先判断这条用户输入是否值得进入 HOT；"
-                "如果用户明确开启对话、求陪、提问、倾诉或继续追问，需要展开接话并进入热聊，请改用 ENTER_CHAT.items；"
-                "如果只是轻轻接一下，请使用 LIGHT_ACK；如果不回应，请使用 WAIT.items:null。"
+                "如果用户明确开启对话、求陪、提问、倾诉或继续追问，需要展开接话并进入热聊，请改用 ENTER_CHAT: 自然语言；"
+                "如果只是轻轻接一下，请使用很短自然句；如果不回应，请输出 WAIT。"
             ]
 
         return []
@@ -884,9 +854,10 @@ class CompanionGraph:
 
         reasoning_content = envelope.reasoning_content or ""
         if reasoning_content.strip():
-            result = parse_and_validate_raw_decision(reasoning_content)
+            result = parse_and_validate_main_output(reasoning_content)
             if result.ok:
-                return reasoning_content, "reasoning_content_rescue"
+                if _looks_like_rescuable_reasoning_output(reasoning_content):
+                    return reasoning_content, "reasoning_content_rescue"
 
         return content, "content_empty"
 
@@ -1074,7 +1045,7 @@ class CompanionGraph:
                 "请补发一条自然的网聊回应，明确回应图片内容或图片带来的话题。"
                 "如果用户已经继续说话，用“刚刚那张图/你刚发的那张”轻轻衔接；"
                 "不要解释内部看图流程，不要说自己在分析，不要复述字段名。"
-                "输出最终 action/items JSON；可以用 text，也可以搭配 meme/search_meme。"
+                "输出普通自然语言；如果适合表情包，可在自然文本中插入 &&category:keywords&&。"
             ),
         }
 
@@ -1287,6 +1258,9 @@ class CompanionGraph:
 
     def _provider_role_sequence(self, messages: list[dict]) -> list[str]:
         return [str(item.get("role", "")) for item in messages]
+
+    def _main_chat_temperature(self) -> float:
+        return float(getattr(self.llm, "temperature", 1.0) or 1.0)
 
     def _sanitize_provider_assistant_message(self, assistant_message: Optional[dict]) -> tuple[dict, Optional[str]]:
         if not assistant_message:

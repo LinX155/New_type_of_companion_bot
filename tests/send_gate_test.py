@@ -14,6 +14,9 @@ class FakeGraph:
     async def run(self, ctx):
         return self.decision
 
+    async def resolve_search_meme_item(self, ctx, item):
+        return SendItem(type=SendItemType.MEME, content="amused_laugh")
+
     def get_prompt_observability(self):
         return {}
 
@@ -68,6 +71,9 @@ class FakeGate:
 
     def mark_job_sent(self, job_id):
         self.sent = True
+
+    def mark_job_dropped(self, job_id):
+        self.sent = False
 
     async def _enter_hot(self):
         pass
@@ -276,6 +282,252 @@ class SendGateTest(unittest.TestCase):
             self.assertFalse(gate.sent)
             self.assertEqual(graph.committed[0][0], "turn")
             self.assertEqual(graph.committed[0][1][0].type, SendItemType.MEME)
+
+        asyncio.run(scenario())
+
+    def test_search_meme_marker_sends_prefix_before_second_round_selection(self):
+        async def scenario():
+            decision = ActionDecision(
+                action=Action.REACT,
+                items=[
+                    SendItem(type=SendItemType.TEXT, content="先笑一下"),
+                    SendItem(type=SendItemType.SEARCH_MEME, content="amused:laugh"),
+                    SendItem(type=SendItemType.TEXT, content="然后继续说"),
+                ],
+            )
+            graph = FakeGraph(decision)
+            gate = FakeGate()
+            emitted = []
+            resolve_seen_counts = []
+
+            originals = {
+                "companion_graph": routes.companion_graph,
+                "event_gate": routes.event_gate,
+                "_emit_llm_started": routes._emit_llm_started,
+                "_emit_message": routes._emit_message,
+                "_emit_state": routes._emit_state,
+                "_emit_conversation_changed": routes._emit_conversation_changed,
+                "_wait_until_user_not_composing": routes._wait_until_user_not_composing,
+                "_apply_recent_repetition_guard": routes._apply_recent_repetition_guard,
+                "_record_prompt_cache_debug": routes._record_prompt_cache_debug,
+                "_record_assistant_send": routes._record_assistant_send,
+                "_record_job_state": routes._record_job_state,
+            }
+
+            async def noop_async(*args, **kwargs):
+                pass
+
+            async def fake_emit_message(data):
+                emitted.append(data)
+
+            async def fake_resolve(ctx, item):
+                resolve_seen_counts.append(len([
+                    event for event in emitted if event.get("type") == "assistant_message"
+                ]))
+                return SendItem(type=SendItemType.MEME, content="amused_laugh")
+
+            try:
+                graph.resolve_search_meme_item = fake_resolve
+                routes.companion_graph = graph
+                routes.event_gate = gate
+                routes._emit_llm_started = noop_async
+                routes._emit_message = fake_emit_message
+                routes._emit_state = noop_async
+                routes._emit_conversation_changed = noop_async
+                routes._wait_until_user_not_composing = lambda ctx: asyncio.sleep(0, result=True)
+                routes._apply_recent_repetition_guard = lambda ctx, decision: (decision, [])
+                routes._record_prompt_cache_debug = lambda *args, **kwargs: None
+                routes._record_assistant_send = lambda *args, **kwargs: None
+                routes._record_job_state = lambda *args, **kwargs: None
+
+                ctx = SimpleNamespace(
+                    gate=gate,
+                    job_id="job_marker",
+                    snapshot=SimpleNamespace(
+                        session_id="default",
+                        snapshot_id=1,
+                        buffer_version=10,
+                        events=[{"text": "哈哈哈"}],
+                    ),
+                )
+                await routes.on_decision(ctx)
+            finally:
+                for name, value in originals.items():
+                    setattr(routes, name, value)
+
+            assistant_messages = [item for item in emitted if item.get("type") == "assistant_message"]
+            self.assertEqual(resolve_seen_counts, [1])
+            self.assertEqual([item["content"] for item in assistant_messages], [
+                "先笑一下",
+                "meme:amused_laugh",
+                "然后继续说",
+            ])
+            self.assertEqual([item["item_type"] for item in assistant_messages], ["text", "meme", "text"])
+            self.assertTrue(gate.sent)
+            committed = [item for _, batch in graph.committed for item in batch]
+            self.assertEqual([item.type for item in committed], [
+                SendItemType.TEXT,
+                SendItemType.MEME,
+                SendItemType.TEXT,
+            ])
+
+        asyncio.run(scenario())
+
+    def test_search_meme_marker_without_candidate_skips_marker_and_sends_suffix(self):
+        async def scenario():
+            decision = ActionDecision(
+                action=Action.REACT,
+                items=[
+                    SendItem(type=SendItemType.TEXT, content="先说这句"),
+                    SendItem(type=SendItemType.SEARCH_MEME, content="amused:laugh"),
+                    SendItem(type=SendItemType.TEXT, content="后面继续"),
+                ],
+            )
+            graph = FakeGraph(decision)
+            gate = FakeGate()
+            emitted = []
+
+            originals = {
+                "companion_graph": routes.companion_graph,
+                "event_gate": routes.event_gate,
+                "_emit_llm_started": routes._emit_llm_started,
+                "_emit_message": routes._emit_message,
+                "_emit_state": routes._emit_state,
+                "_emit_conversation_changed": routes._emit_conversation_changed,
+                "_wait_until_user_not_composing": routes._wait_until_user_not_composing,
+                "_apply_recent_repetition_guard": routes._apply_recent_repetition_guard,
+                "_record_prompt_cache_debug": routes._record_prompt_cache_debug,
+                "_record_assistant_send": routes._record_assistant_send,
+                "_record_job_state": routes._record_job_state,
+            }
+
+            async def noop_async(*args, **kwargs):
+                pass
+
+            async def fake_emit_message(data):
+                emitted.append(data)
+
+            async def fake_resolve(ctx, item):
+                return None
+
+            try:
+                graph.resolve_search_meme_item = fake_resolve
+                routes.companion_graph = graph
+                routes.event_gate = gate
+                routes._emit_llm_started = noop_async
+                routes._emit_message = fake_emit_message
+                routes._emit_state = noop_async
+                routes._emit_conversation_changed = noop_async
+                routes._wait_until_user_not_composing = lambda ctx: asyncio.sleep(0, result=True)
+                routes._apply_recent_repetition_guard = lambda ctx, decision: (decision, [])
+                routes._record_prompt_cache_debug = lambda *args, **kwargs: None
+                routes._record_assistant_send = lambda *args, **kwargs: None
+                routes._record_job_state = lambda *args, **kwargs: None
+
+                ctx = SimpleNamespace(
+                    gate=gate,
+                    job_id="job_marker_skip",
+                    snapshot=SimpleNamespace(
+                        session_id="default",
+                        snapshot_id=1,
+                        buffer_version=10,
+                        events=[{"text": "哈哈哈"}],
+                    ),
+                )
+                await routes.on_decision(ctx)
+            finally:
+                for name, value in originals.items():
+                    setattr(routes, name, value)
+
+            assistant_messages = [item for item in emitted if item.get("type") == "assistant_message"]
+            self.assertEqual([item["content"] for item in assistant_messages], ["先说这句", "后面继续"])
+            self.assertEqual([item["item_type"] for item in assistant_messages], ["text", "text"])
+            self.assertTrue(gate.sent)
+            committed = [item for _, batch in graph.committed for item in batch]
+            self.assertEqual([item.type for item in committed], [SendItemType.TEXT, SendItemType.TEXT])
+
+        asyncio.run(scenario())
+
+    def test_search_meme_marker_drops_meme_and_suffix_when_stale_after_selection(self):
+        async def scenario():
+            decision = ActionDecision(
+                action=Action.REACT,
+                items=[
+                    SendItem(type=SendItemType.TEXT, content="先说这句"),
+                    SendItem(type=SendItemType.SEARCH_MEME, content="amused:laugh"),
+                    SendItem(type=SendItemType.TEXT, content="这句不该发"),
+                ],
+            )
+            graph = FakeGraph(decision)
+            gate = FakeGate()
+            emitted = []
+            states = []
+            checks = {"count": 0}
+
+            originals = {
+                "companion_graph": routes.companion_graph,
+                "event_gate": routes.event_gate,
+                "_emit_llm_started": routes._emit_llm_started,
+                "_emit_message": routes._emit_message,
+                "_emit_state": routes._emit_state,
+                "_emit_conversation_changed": routes._emit_conversation_changed,
+                "_wait_until_user_not_composing": routes._wait_until_user_not_composing,
+                "_apply_recent_repetition_guard": routes._apply_recent_repetition_guard,
+                "_record_prompt_cache_debug": routes._record_prompt_cache_debug,
+                "_record_assistant_send": routes._record_assistant_send,
+                "_record_job_state": routes._record_job_state,
+            }
+
+            async def noop_async(*args, **kwargs):
+                pass
+
+            async def fake_emit_message(data):
+                emitted.append(data)
+
+            async def fake_emit_state(data):
+                states.append(data)
+
+            async def fake_is_send_group_current(ctx, expected_buffer_version):
+                checks["count"] += 1
+                return checks["count"] < 4
+
+            try:
+                routes.companion_graph = graph
+                routes.event_gate = gate
+                routes._emit_llm_started = noop_async
+                routes._emit_message = fake_emit_message
+                routes._emit_state = fake_emit_state
+                routes._emit_conversation_changed = noop_async
+                routes._wait_until_user_not_composing = lambda ctx: asyncio.sleep(0, result=True)
+                routes._apply_recent_repetition_guard = lambda ctx, decision: (decision, [])
+                routes._record_prompt_cache_debug = lambda *args, **kwargs: None
+                routes._record_assistant_send = lambda *args, **kwargs: None
+                routes._record_job_state = lambda *args, **kwargs: None
+                gate.is_send_group_current = fake_is_send_group_current
+
+                ctx = SimpleNamespace(
+                    gate=gate,
+                    job_id="job_marker_stale",
+                    snapshot=SimpleNamespace(
+                        session_id="default",
+                        snapshot_id=1,
+                        buffer_version=10,
+                        events=[{"text": "哈哈哈"}],
+                    ),
+                )
+                await routes.on_decision(ctx)
+            finally:
+                for name, value in originals.items():
+                    setattr(routes, name, value)
+
+            assistant_messages = [item for item in emitted if item.get("type") == "assistant_message"]
+            self.assertEqual([item["content"] for item in assistant_messages], ["先说这句"])
+            self.assertFalse(gate.sent)
+            self.assertTrue(gate.stale)
+            self.assertEqual(states[-1]["result"], "stale_dropped")
+            self.assertEqual(states[-1]["send_index"], 1)
+            committed = [item for _, batch in graph.committed for item in batch]
+            self.assertEqual([item.type for item in committed], [SendItemType.TEXT])
 
         asyncio.run(scenario())
 
