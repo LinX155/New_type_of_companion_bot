@@ -94,24 +94,41 @@ class OneBotConnectionManager:
         finally:
             self._pending.pop(echo, None)
 
-    async def send_private_text(self, user_id: str, text: str) -> dict:
+    async def send_private_text(
+        self,
+        user_id: str,
+        text: str,
+        reply_to_message_id: Optional[str] = None,
+    ) -> dict:
         return await self.send_private_message(
             user_id=user_id,
             message=[{"type": "text", "data": {"text": text}}],
+            reply_to_message_id=reply_to_message_id,
         )
 
-    async def send_private_image(self, user_id: str, file_uri: str) -> dict:
+    async def send_private_image(
+        self,
+        user_id: str,
+        file_uri: str,
+        reply_to_message_id: Optional[str] = None,
+    ) -> dict:
         return await self.send_private_message(
             user_id=user_id,
             message=[{"type": "image", "data": {"file": file_uri}}],
+            reply_to_message_id=reply_to_message_id,
         )
 
-    async def send_private_message(self, user_id: str, message: list[dict]) -> dict:
+    async def send_private_message(
+        self,
+        user_id: str,
+        message: list[dict],
+        reply_to_message_id: Optional[str] = None,
+    ) -> dict:
         return await self.request(
             action="send_private_msg",
             params={
                 "user_id": _coerce_int(user_id),
-                "message": message,
+                "message": _with_reply_segment(message, reply_to_message_id),
             },
         )
 
@@ -210,3 +227,16 @@ def _coerce_int(value):
         return int(value)
     except (TypeError, ValueError):
         return value
+
+
+def _with_reply_segment(message: list[dict], reply_to_message_id: Optional[str]) -> list[dict]:
+    reply_id = str(reply_to_message_id or "").strip()
+    if not reply_id:
+        return list(message or [])
+    segments = list(message or [])
+    if segments and segments[0].get("type") == "reply":
+        return segments
+    return [
+        {"type": "reply", "data": {"id": _coerce_int(reply_id)}},
+        *segments,
+    ]

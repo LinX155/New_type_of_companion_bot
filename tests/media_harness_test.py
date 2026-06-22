@@ -181,6 +181,29 @@ class FakeVisionLLM:
 
 
 class MediaHarnessTest(unittest.TestCase):
+    def test_prompt_text_for_reply_event_includes_lightweight_quote_context(self):
+        graph = CompanionGraph(
+            FakeVisionLLM(),
+            FakeMemory(),
+            FakeMemeCatalog(),
+        )
+
+        text = graph._prompt_text_for_event({
+            "event_type": "message.text",
+            "text": "这个呢",
+            "raw": {
+                "reply_to_message_id": "893164517",
+                "reply_context": {
+                    "role": "assistant",
+                    "text": "看到啦，是咖啡续命现场对吧",
+                    "source": "local_onebot_send_log",
+                },
+            },
+        })
+
+        self.assertIn("用户引用了 assistant 的消息：看到啦，是咖啡续命现场对吧", text)
+        self.assertIn("用户回复：这个呢", text)
+
     def test_image_understanding_prompt_treats_photo_as_contextual_share(self):
         messages = build_image_understanding_messages(
             image_url="data:image/png;base64,abc",

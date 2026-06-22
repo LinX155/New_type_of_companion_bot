@@ -3,7 +3,7 @@ import asyncio
 from datetime import datetime
 from types import SimpleNamespace
 
-from app.api.routes import _message_target_from_snapshot
+from app.api.routes import _message_target_from_snapshot, _reply_target_from_context
 from app.adapters.onebot11.client import OneBotConnectionManager
 from app.adapters.onebot11.events import parse_onebot_event
 from app.core.event_gate import EventGate
@@ -253,6 +253,52 @@ class OneBotAdapterTest(unittest.TestCase):
             self.assertEqual(response["data"]["message_id"], 123)
 
         asyncio.run(scenario())
+
+    def test_connection_manager_can_prefix_reply_segment(self):
+        async def scenario():
+            manager = OneBotConnectionManager()
+            websocket = FakeWebSocket()
+            manager._websocket = websocket
+
+            task = asyncio.create_task(
+                manager.send_private_text("550808201", "看到了", reply_to_message_id="893164517")
+            )
+            await asyncio.sleep(0)
+
+            action = websocket.sent[0]
+            self.assertEqual(action["action"], "send_private_msg")
+            self.assertEqual(action["params"]["message"], [
+                {"type": "reply", "data": {"id": 893164517}},
+                {"type": "text", "data": {"text": "看到了"}},
+            ])
+
+            manager._resolve_action_response({
+                "status": "ok",
+                "retcode": 0,
+                "data": {"message_id": 456},
+                "echo": action["echo"],
+            })
+            response = await task
+            self.assertEqual(response["data"]["message_id"], 456)
+
+        asyncio.run(scenario())
+
+    def test_media_followup_reply_target_uses_original_image_message_once(self):
+        ctx = SimpleNamespace(
+            internal_source="media_followup",
+            internal_payload={
+                "media_ref": {
+                    "onebot_message_id": "1411302046",
+                    "segment_type": "image",
+                },
+            },
+        )
+
+        self.assertEqual(
+            _reply_target_from_context(ctx, send_index=0),
+            {"reply_to_message_id": "1411302046"},
+        )
+        self.assertEqual(_reply_target_from_context(ctx, send_index=1), {})
 
     def test_connection_manager_sets_input_status(self):
         async def scenario():

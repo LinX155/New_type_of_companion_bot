@@ -1224,7 +1224,21 @@ class CompanionGraph:
             text = "[图片]"
         if not text and event_type.endswith("sticker"):
             text = "[表情]"
-        return text or ""
+        text = text or ""
+
+        raw = self._event_get(evt, "raw") or {}
+        if not isinstance(raw, dict):
+            return text
+        reply_context = raw.get("reply_context")
+        reply_to_message_id = str(raw.get("reply_to_message_id") or "").strip()
+        if isinstance(reply_context, dict):
+            quoted_text = str(reply_context.get("text") or "").strip()
+            quoted_role = str(reply_context.get("role") or "unknown").strip() or "unknown"
+            if quoted_text:
+                return f"用户引用了 {quoted_role} 的消息：{quoted_text}\n用户回复：{text or '(空消息)'}"
+        if reply_to_message_id:
+            return f"用户引用了一条消息（message_id={reply_to_message_id}）\n用户回复：{text or '(空消息)'}"
+        return text
 
     def _event_get(self, evt, key: str, default=None):
         if isinstance(evt, dict):

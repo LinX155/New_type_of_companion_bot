@@ -59,7 +59,7 @@ router = APIRouter()
 # 全局实例（MVP 阶段简化）
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DEFAULT_SESSION_ID = WEBUI_DEFAULT_SESSION_ID
-TEMPERATURE_MIN = 1.0
+TEMPERATURE_MIN = 0.0
 DEEPSEEK_TEMPERATURE_MAX = 2.0
 MIMO_TEMPERATURE_MAX = 1.5
 DEFAULT_TEMPERATURE = 1.0
@@ -639,7 +639,8 @@ async def on_decision(ctx: ProcessContext):
             "send_index": send_index,
             "send_count": send_count,
             "send_key": send_key,
-            **_message_target_from_snapshot(ctx.snapshot),
+            **target,
+            **_reply_target_from_context(ctx, send_index),
         })
         gate.mark_send_key_sent(send_key)
         _record_assistant_send(
@@ -824,6 +825,28 @@ def _message_target_from_context(ctx: ProcessContext) -> dict:
     return _message_target_from_snapshot(ctx.snapshot)
 
 
+def _reply_target_from_context(ctx: ProcessContext, send_index: int = 0) -> dict:
+    if send_index != 0:
+        return {}
+    if ctx.internal_source != "media_followup":
+        return {}
+    payload = ctx.internal_payload or {}
+    if not isinstance(payload, dict):
+        return {}
+    media_ref = payload.get("media_ref") or {}
+    if not isinstance(media_ref, dict):
+        media_ref = {}
+    message_id = (
+        media_ref.get("onebot_message_id")
+        or payload.get("onebot_message_id")
+        or payload.get("reply_to_message_id")
+    )
+    message_id = str(message_id or "").strip()
+    if not message_id:
+        return {}
+    return {"reply_to_message_id": message_id}
+
+
 def _message_target_from_event(event: ChatEvent) -> dict:
     if event.platform != "qq":
         return {}
@@ -977,19 +1000,56 @@ async def _send_onebot_assistant_message(data: dict) -> None:
     send_key = data.get("send_key") or f"onebot_command_{uuid.uuid4().hex[:8]}"
     item_type = str(data.get("item_type") or "text")
     content = str(data.get("content") or data.get("text") or "")
+    reply_to_message_id = str(data.get("reply_to_message_id") or "").strip() or None
     try:
         if item_type == SendItemType.MEME.value or content.startswith("meme:"):
             stem = content[5:] if content.startswith("meme:") else content
             image_path = _meme_path_for_stem(stem)
             if not image_path:
-                _record_onebot_send(session_id, send_key, target_user_id, item_type, content, None, "skipped:meme_not_found")
+                _record_onebot_send(
+                    session_id,
+                    send_key,
+                    target_user_id,
+                    item_type,
+                    content,
+                    None,
+                    "skipped:meme_not_found",
+                    reply_to_message_id=reply_to_message_id,
+                )
                 return
-            response = await onebot_manager.send_private_image(target_user_id, Path(image_path).resolve().as_uri())
+            response = await onebot_manager.send_private_image(
+                target_user_id,
+                Path(image_path).resolve().as_uri(),
+                reply_to_message_id=reply_to_message_id,
+            )
         else:
-            response = await onebot_manager.send_private_text(target_user_id, content)
-        _record_onebot_send(session_id, send_key, target_user_id, item_type, content, response, "sent")
+            response = await onebot_manager.send_private_text(
+                target_user_id,
+                content,
+                reply_to_message_id=reply_to_message_id,
+            )
+        _record_onebot_send(
+            session_id,
+            send_key,
+            target_user_id,
+            item_type,
+            content,
+            response,
+            "sent",
+            reply_to_message_id=reply_to_message_id,
+        )
     except Exception as exc:
-        _record_onebot_send(session_id, send_key, target_user_id, item_type, content, None, "error", str(exc))
+        _record_onebot_send(
+            session_id,
+            send_key,
+            target_user_id,
+            item_type,
+            content,
+            None,
+            "error",
+            str(exc),
+            reply_to_message_id=reply_to_message_id,
+        )
 
 
 def _meme_path_for_stem(stem: str) -> str:
@@ -1002,6 +1062,20 @@ def _meme_path_for_stem(stem: str) -> str:
     return ""
 
 
+def _onebot_response_message_id(response: Optional[dict]) -> Optional[str]:
+    if not isinstance(response, dict):
+        return None
+    data = response.get("data")
+    if isinstance(data, dict):
+        message_id = data.get("message_id")
+        if message_id is not None:
+            return str(message_id)
+    message_id = response.get("message_id")
+    if message_id is not None:
+        return str(message_id)
+    return None
+
+
 def _record_onebot_send(
     session_id: str,
     send_key: str,
@@ -1011,6 +1085,7 @@ def _record_onebot_send(
     response: Optional[dict],
     status: str,
     error_message: Optional[str] = None,
+    reply_to_message_id: Optional[str] = None,
 ):
     db = next(get_db())
     try:
@@ -1023,6 +1098,8 @@ def _record_onebot_send(
             raw_payload=_json_dumps({
                 "target_user_id": target_user_id,
                 "item_type": item_type,
+                "reply_to_message_id": reply_to_message_id,
+                "onebot_message_id": _onebot_response_message_id(response),
                 "response": response,
             }),
             final_text=content,
@@ -1253,12 +1330,157 @@ async def debug_send_onebot_private_text(request: Request, payload: OneBotDebugS
     return {"status": "sent", "response": response}
 
 
+async def _enrich_onebot_reply_context(event: ChatEvent) -> ChatEvent:
+    raw = event.raw or {}
+    if event.platform != "qq" or not isinstance(raw, dict):
+        return event
+
+    reply_to_message_id = str(raw.get("reply_to_message_id") or "").strip()
+    if not reply_to_message_id:
+        return event
+    if raw.get("reply_context"):
+        return event
+
+    enriched = dict(raw)
+    context = _lookup_local_onebot_reply_context(event.session_id, reply_to_message_id)
+    if context:
+        enriched["reply_context"] = context
+        return event.model_copy(update={"raw": enriched})
+
+    try:
+        response = await asyncio.wait_for(onebot_manager.get_msg(reply_to_message_id), timeout=3.0)
+        context = _reply_context_from_get_msg_response(response, reply_to_message_id)
+        if context:
+            enriched["reply_context"] = context
+        else:
+            enriched["reply_context_error"] = "empty get_msg response"
+    except Exception as exc:  # noqa: BLE001
+        enriched["reply_context_error"] = str(exc)[:300]
+
+    return event.model_copy(update={"raw": enriched})
+
+
+def _lookup_local_onebot_reply_context(session_id: str, message_id: str) -> Optional[dict]:
+    target_id = str(message_id or "").strip()
+    if not target_id:
+        return None
+
+    db = next(get_db())
+    try:
+        rows = (
+            db.query(RawChatLog)
+            .filter(RawChatLog.session_id == normalize_session_id(session_id or DEFAULT_SESSION_ID))
+            .order_by(desc(RawChatLog.id))
+            .limit(300)
+            .all()
+        )
+        for row in rows:
+            payload = _safe_json_object(row.raw_payload)
+            if row.event_type == "onebot_send":
+                if str(payload.get("onebot_message_id") or "") == target_id:
+                    return {
+                        "message_id": target_id,
+                        "role": "assistant",
+                        "text": row.final_text or "",
+                        "item_type": row.item_type or "text",
+                        "source": "local_onebot_send_log",
+                    }
+
+            raw = payload.get("raw") if isinstance(payload, dict) else None
+            if not isinstance(raw, dict):
+                raw = payload
+            if str(raw.get("onebot_message_id") or "") == target_id:
+                return {
+                    "message_id": target_id,
+                    "role": "user",
+                    "text": row.input_text or _segments_to_reply_summary(raw.get("message_segments") or []),
+                    "item_type": row.event_type or "message",
+                    "source": "local_incoming_log",
+                }
+    except Exception:
+        return None
+    finally:
+        db.close()
+    return None
+
+
+def _reply_context_from_get_msg_response(response: dict, message_id: str) -> Optional[dict]:
+    if not isinstance(response, dict):
+        return None
+    data = response.get("data")
+    if not isinstance(data, dict):
+        return None
+
+    segments = data.get("message")
+    text = (
+        _segments_to_reply_summary(segments if isinstance(segments, list) else [])
+        or str(data.get("raw_message") or "").strip()
+        or str(data.get("message") or "").strip()
+    )
+    if not text:
+        return None
+
+    sender = data.get("sender") if isinstance(data.get("sender"), dict) else {}
+    sender_id = str(sender.get("user_id") or data.get("user_id") or "").strip()
+    self_id = str(onebot_manager.status().get("self_id") or "").strip()
+    role = "assistant" if self_id and sender_id == self_id else "user"
+
+    return {
+        "message_id": str(data.get("message_id") or message_id),
+        "role": role,
+        "text": text,
+        "item_type": str(data.get("message_type") or "message"),
+        "source": "onebot_get_msg",
+    }
+
+
+def _segments_to_reply_summary(segments: list) -> str:
+    parts: list[str] = []
+    for segment in segments or []:
+        if not isinstance(segment, dict):
+            continue
+        seg_type = str(segment.get("type") or "").strip().lower()
+        data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
+        if seg_type == "reply":
+            continue
+        if seg_type == "text":
+            text = str(data.get("text") or "").strip()
+            if text:
+                parts.append(text)
+            continue
+        if seg_type == "face":
+            face_id = str(data.get("id") or "").strip()
+            parts.append(f"[QQ表情: face:{face_id}]" if face_id else "[QQ表情]")
+            continue
+        if seg_type == "mface":
+            parts.append("[表情]")
+            continue
+        if seg_type == "image":
+            summary = str(data.get("summary") or "").strip()
+            parts.append(summary or "[图片]")
+            continue
+        if seg_type:
+            parts.append(f"[{seg_type}]")
+    return "".join(parts).strip()
+
+
+def _safe_json_object(text: Optional[str]) -> dict:
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 async def handle_onebot_payload(payload: dict) -> None:
     event = parse_onebot_event(payload)
     if not event:
         return
 
     init_gate()
+    event = await _enrich_onebot_reply_context(event)
     if event.event_type == EventType.TEXT:
         event_type = _event_type_for_text(event.text or "")
         if event_type != event.event_type:
