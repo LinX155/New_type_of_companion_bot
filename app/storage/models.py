@@ -56,6 +56,19 @@ class ScheduledJobLog(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class ContextCheckpoint(Base):
+    __tablename__ = "context_checkpoints"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String, index=True, default="default")
+    checkpoint_text = Column(Text, nullable=False)
+    covered_until_event_id = Column(Integer, nullable=True)
+    source_prompt_debug_id = Column(Integer, nullable=True)
+    estimated_tokens_before = Column(Integer, nullable=True)
+    prompt_tokens_before = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class SystemConfig(Base):
     __tablename__ = "system_configs"
 

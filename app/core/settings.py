@@ -21,6 +21,7 @@ _DEFAULTS = {
     "memory_analysis_day": {"hour": 13, "minute": 0},
     "memory_analysis_night": {"hour": 19, "minute": 0},
     "midnight_cleanup": {"hour": 3, "minute": 30},
+    "context_checkpoint": {"threshold_k": 500},
     "active_message": {
         "enabled": False,
         "hour": 10,

@@ -1,9 +1,11 @@
 import asyncio
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 
 from app.api import routes
 from app.core.decisions import Action, ActionDecision, SendItem, SendItemType
+from app.core.events import ChatEvent, EventType
 
 
 class FakeGraph:
@@ -92,6 +94,67 @@ class FakeOneBotManager:
 
 
 class SendGateTest(unittest.TestCase):
+    def test_successful_mem_command_resets_provider_transcript(self):
+        async def scenario():
+            reset_reasons = []
+            recorded_commands = []
+            runtime = SimpleNamespace(
+                graph=SimpleNamespace(
+                    reset_provider_transcript=lambda reason: reset_reasons.append(reason),
+                ),
+                gate=SimpleNamespace(
+                    record_command=lambda command, status: recorded_commands.append((command, status)),
+                ),
+            )
+            event = ChatEvent(
+                event_id="mem1",
+                session_id="qq_private_10001",
+                platform="qq",
+                user_id="10001",
+                event_type=EventType.COMMAND_MEM,
+                text="/mem 记住不要发表情包",
+                timestamp=datetime.now(),
+            )
+            emitted_messages = []
+
+            async def fake_run_mem_command(text, session_id, target):
+                return True, "已通过记忆线程写入 CORE。"
+
+            async def noop_async(*args, **kwargs):
+                return None
+
+            async def fake_emit_message(data):
+                emitted_messages.append(data)
+
+            originals = {
+                "_runtime_for_event": routes._runtime_for_event,
+                "_run_mem_command": routes._run_mem_command,
+                "_record_command_response": routes._record_command_response,
+                "_emit_llm_finished": routes._emit_llm_finished,
+                "_emit_message": routes._emit_message,
+                "_emit_conversation_changed": routes._emit_conversation_changed,
+            }
+
+            try:
+                routes._runtime_for_event = lambda _event: runtime
+                routes._run_mem_command = fake_run_mem_command
+                routes._record_command_response = noop_async
+                routes._emit_llm_finished = noop_async
+                routes._emit_message = fake_emit_message
+                routes._emit_conversation_changed = noop_async
+
+                result = await routes._handle_command_event(event)
+            finally:
+                for name, value in originals.items():
+                    setattr(routes, name, value)
+
+            self.assertTrue(result["memory_updated"])
+            self.assertEqual(recorded_commands, [("/mem", "success")])
+            self.assertEqual(reset_reasons, ["command.mem_memory_updated"])
+            self.assertEqual(emitted_messages[0]["content"], "已通过记忆线程写入 CORE。")
+
+        asyncio.run(scenario())
+
     def test_text_display_split_breaks_after_long_chinese_clause_comma(self):
         self.assertEqual(
             routes._split_text_for_display("刚在阳台给花浇水呢，晚霞好漂亮，想叫你来看"),
@@ -108,6 +171,34 @@ class SendGateTest(unittest.TestCase):
         self.assertEqual(
             routes._split_text_for_display("刚在阳台给花浇水呢，晚霞好漂亮，今天风也很温柔，想叫你来看"),
             ["刚在阳台给花浇水呢，", "晚霞好漂亮，今天风也很温柔，", "想叫你来看"],
+        )
+
+    def test_text_display_split_is_disabled_when_model_already_outputs_four_items(self):
+        long_text = "刚在阳台给花浇水呢，晚霞好漂亮，想叫你来看"
+
+        three_items = [
+            SendItem(type=SendItemType.TEXT, content=long_text),
+            SendItem(type=SendItemType.TEXT, content="第二句"),
+            SendItem(type=SendItemType.TEXT, content="第三句"),
+        ]
+        three_item_units = routes._build_display_send_units(three_items)
+
+        self.assertEqual(
+            [unit["display_item"].content for unit in three_item_units],
+            ["刚在阳台给花浇水呢，", "晚霞好漂亮，想叫你来看", "第二句", "第三句"],
+        )
+
+        four_items = [
+            SendItem(type=SendItemType.TEXT, content=long_text),
+            SendItem(type=SendItemType.TEXT, content="第二句"),
+            SendItem(type=SendItemType.TEXT, content="第三句"),
+            SendItem(type=SendItemType.TEXT, content="第四句"),
+        ]
+        four_item_units = routes._build_display_send_units(four_items)
+
+        self.assertEqual(
+            [unit["display_item"].content for unit in four_item_units],
+            [long_text, "第二句", "第三句", "第四句"],
         )
 
     def test_llm_typing_state_syncs_to_onebot_target_only(self):

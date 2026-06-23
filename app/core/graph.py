@@ -174,6 +174,7 @@ class CompanionGraph:
         self.meme_renderer = MemeRenderer(meme_catalog)
         self.media_job_queue = media_job_queue
         self._conversation_history: list = []
+        self._context_checkpoint_text: Optional[str] = None
         self._prompt_transcript: list[dict] = []
         self._prompt_event_ids: set[str] = set()
         self._media_harness_event_ids: set[str] = set()
@@ -702,7 +703,13 @@ class CompanionGraph:
 
     def clear_prompt_state(self):
         self._conversation_history.clear()
+        self._context_checkpoint_text = None
         self.reset_provider_transcript(reason="conversation_cleared")
+
+    def load_conversation_context(self, checkpoint_text: Optional[str], history: Optional[list[dict]] = None):
+        self._context_checkpoint_text = (checkpoint_text or "").strip() or None
+        self._conversation_history = self._sanitize_history_items(history or [])
+        self.reset_provider_transcript(reason="context_checkpoint_loaded")
 
     def reset_provider_transcript(self, reason: str = "provider_transcript_reset"):
         self._prompt_transcript.clear()
@@ -825,6 +832,9 @@ class CompanionGraph:
     def get_history(self) -> list:
         return list(self._conversation_history)
 
+    def get_context_checkpoint_text(self) -> Optional[str]:
+        return self._context_checkpoint_text
+
     def get_prompt_observability(self) -> dict:
         return dict(self._last_prompt_observability)
 
@@ -936,6 +946,11 @@ class CompanionGraph:
             include_profile=include_profile,
         )
         self._prompt_transcript = [{"role": "system", "content": system_prompt}]
+        if self._context_checkpoint_text:
+            self._prompt_transcript.append({
+                "role": "system",
+                "content": self._build_context_checkpoint_system_message(self._context_checkpoint_text),
+            })
         self._prompt_block_hashes = {
             "stable_block_hash": self._hash_text(build_stable_prompt_hash_source()),
             "profile_block_hash": self._hash_text(
@@ -948,6 +963,25 @@ class CompanionGraph:
             content = item.get("text", "")
             if content:
                 self._prompt_transcript.append({"role": role, "content": content})
+
+    def _build_context_checkpoint_system_message(self, checkpoint_text: str) -> str:
+        return (
+            "SYSTEM_REMINDER: 以下是此前主聊天的 context checkpoint 压缩摘要。"
+            "它用于替代 checkpoint 之前的长对话历史，不是用户刚刚发送的新消息，"
+            "也不是 MEMORY_CORE.md 的长期记忆。后续接话时可把它作为上下文参考，"
+            "但不要向用户解释 checkpoint 机制。\n\n"
+            f"{checkpoint_text.strip()}"
+        )
+
+    def _sanitize_history_items(self, history: list[dict]) -> list[dict]:
+        result = []
+        for item in history:
+            role = str(item.get("role") or "").strip()
+            text = str(item.get("text") or item.get("content") or "").strip()
+            if role not in {"user", "assistant"} or not text:
+                continue
+            result.append({"role": role, "text": text})
+        return result
 
     def _ensure_provider_transcript_identity(self):
         identity = self._current_llm_identity()

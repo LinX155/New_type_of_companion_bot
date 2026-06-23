@@ -48,8 +48,12 @@ from ..memory.files import MemoryFileManager
 from ..memes.catalog import MemeCatalog
 from ..memes.steal import MemeStealAnalyzer, MemeStealSaver
 from ..scheduler.jobs import SchedulerManager
+from ..storage.context_checkpoints import (
+    load_conversation_context,
+    normalize_context_checkpoint_config,
+)
 from ..storage.db import get_db, engine
-from ..storage.models import Base, RawChatLog, ConversationEvent, ensure_storage_schema
+from ..storage.models import Base, ContextCheckpoint, RawChatLog, ConversationEvent, ensure_storage_schema
 
 Base.metadata.create_all(bind=engine)
 ensure_storage_schema(engine)
@@ -63,6 +67,7 @@ TEMPERATURE_MIN = 0.0
 DEEPSEEK_TEMPERATURE_MAX = 2.0
 MIMO_TEMPERATURE_MAX = 1.5
 DEFAULT_TEMPERATURE = 1.0
+DISPLAY_SPLIT_DISABLE_ITEM_COUNT = 4
 
 
 def _env_int(name: str, default: int) -> int:
@@ -236,6 +241,10 @@ class ActiveMessageConfig(BaseModel):
     quiet_end_hour: int = 9
 
 
+class ContextCheckpointConfig(BaseModel):
+    threshold_k: int = 500
+
+
 class InputStatusConfig(BaseModel):
     composing: bool = True
     ttl_ms: int = 3000
@@ -275,6 +284,7 @@ def init_gate():
             media_job_queue=media_job_queue,
             on_decision=on_decision,
             hot_duration_minutes=_persisted.get("hot_duration_minutes", 30),
+            conversation_context_loader=_load_conversation_context_for_runtime,
         )
         media_job_queue.set_llm_client_factory(runtime_manager.make_llm_for_session)
         scheduler_manager.set_llm_client_factory(runtime_manager.make_llm_for_session)
@@ -290,6 +300,7 @@ def init_gate():
         scheduler_manager.update_schedule("active_message", active_cfg["hour"], active_cfg["minute"])
         scheduler_manager.set_active_message_callback(run_active_messages_for_all_sessions)
         scheduler_manager.set_session_ids_provider(_scheduler_session_ids)
+        scheduler_manager.set_context_checkpoint_callback(_apply_context_checkpoint_to_runtime)
         scheduler_manager.start()
     elif media_job_queue:
         media_job_queue.start()
@@ -306,6 +317,19 @@ def _runtime_for_session(session_id: Optional[str]) -> SessionRuntime:
 
 def _runtime_for_event(event: ChatEvent) -> SessionRuntime:
     return _runtime_for_session(event.session_id)
+
+
+def _load_conversation_context_for_runtime(session_id: str) -> dict:
+    return load_conversation_context(normalize_session_id(session_id or DEFAULT_SESSION_ID))
+
+
+def _apply_context_checkpoint_to_runtime(session_id: str, checkpoint_text: str, history: list[dict]):
+    if not runtime_manager:
+        return
+    runtime = runtime_manager.get_if_exists(session_id)
+    if not runtime:
+        return
+    runtime.graph.load_conversation_context(checkpoint_text, history)
 
 
 def _session_id_from_query(session_id: Optional[str]) -> str:
@@ -753,10 +777,11 @@ def _requires_user_composing_gate(items: list[SendItem]) -> bool:
 
 def _build_display_send_units(items: list[SendItem]) -> list[dict]:
     units: list[dict] = []
+    allow_text_split = len(items) < DISPLAY_SPLIT_DISABLE_ITEM_COUNT
     for original_index, item in enumerate(items):
         display_parts = (
             _split_text_for_display(item.content)
-            if item.type == SendItemType.TEXT
+            if item.type == SendItemType.TEXT and allow_text_split
             else [item.content]
         )
         for part_index, part in enumerate(display_parts):
@@ -1562,6 +1587,8 @@ async def _handle_command_event(event: ChatEvent, result: Optional[dict] = None)
 
     runtime = _runtime_for_event(event)
     runtime.gate.record_command(command, "success" if success else "error")
+    if success and hasattr(runtime.graph, "reset_provider_transcript"):
+        runtime.graph.reset_provider_transcript(reason=f"{action_key}_memory_updated")
     await _record_command_response(event.session_id, action_key, response_text, success)
     await _emit_llm_finished({**target, "session_id": event.session_id}, "command_response")
     await _emit_message({
@@ -2369,6 +2396,18 @@ async def update_hot_duration(config: HotDurationConfig):
     }
 
 
+@router.get("/api/context-checkpoint/config")
+async def get_context_checkpoint_config():
+    return normalize_context_checkpoint_config(load_settings().get("context_checkpoint"))
+
+
+@router.post("/api/context-checkpoint/config")
+async def update_context_checkpoint_config(config: ContextCheckpointConfig):
+    normalized = normalize_context_checkpoint_config(config.model_dump())
+    save_settings({"context_checkpoint": normalized})
+    return {"status": "ok", "config": normalized}
+
+
 @router.get("/api/sessions")
 async def get_sessions():
     return {"current": DEFAULT_SESSION_ID, "sessions": _list_sessions()}
@@ -2399,6 +2438,7 @@ async def delete_session(session_id: str):
     try:
         db.query(ConversationEvent).filter(ConversationEvent.session_id == sid).delete()
         db.query(RawChatLog).filter(RawChatLog.session_id == sid).delete()
+        db.query(ContextCheckpoint).filter(ContextCheckpoint.session_id == sid).delete()
         db.commit()
     finally:
         db.close()
@@ -2567,9 +2607,11 @@ async def clear_conversation(
         if all_sessions:
             db.query(ConversationEvent).delete()
             db.query(RawChatLog).delete()
+            db.query(ContextCheckpoint).delete()
         else:
             db.query(ConversationEvent).filter(ConversationEvent.session_id == sid).delete()
             db.query(RawChatLog).filter(RawChatLog.session_id == sid).delete()
+            db.query(ContextCheckpoint).filter(ContextCheckpoint.session_id == sid).delete()
         db.commit()
     finally:
         db.close()

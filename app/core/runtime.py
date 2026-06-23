@@ -32,6 +32,7 @@ class SessionRuntimeManager:
         media_job_queue: Optional[MediaJobQueue],
         on_decision: Callable,
         hot_duration_minutes: int,
+        conversation_context_loader: Optional[Callable[[str], dict]] = None,
     ):
         self.root_dir = root_dir
         self.base_llm_client = base_llm_client
@@ -40,6 +41,7 @@ class SessionRuntimeManager:
         self.media_job_queue = media_job_queue
         self.on_decision = on_decision
         self.hot_duration_minutes = hot_duration_minutes
+        self.conversation_context_loader = conversation_context_loader
         self.registry = SessionRegistry(root_dir)
         self._runtimes: dict[str, SessionRuntime] = {}
 
@@ -59,6 +61,13 @@ class SessionRuntimeManager:
                 meme_catalog=self.meme_catalog,
                 media_job_queue=self.media_job_queue,
             )
+            if self.conversation_context_loader:
+                context = self.conversation_context_loader(sid) or {}
+                if context.get("checkpoint_text"):
+                    graph.load_conversation_context(
+                        context.get("checkpoint_text"),
+                        context.get("history") or [],
+                    )
             self._runtimes[sid] = SessionRuntime(
                 session_id=sid,
                 gate=gate,

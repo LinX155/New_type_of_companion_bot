@@ -6,8 +6,21 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from ..llm.client import LLMClient
-from ..llm.prompts import build_memory_analysis_messages, build_midnight_cleanup_messages
-from ..storage.models import ScheduledJobLog, ConversationEvent
+from ..core.settings import load_settings
+from ..llm.prompts import (
+    build_context_checkpoint_messages,
+    build_memory_analysis_messages,
+    build_midnight_cleanup_messages,
+)
+from ..storage.context_checkpoints import (
+    latest_context_checkpoint_for_session,
+    latest_prompt_debug_for_session,
+    latest_visible_event_id,
+    load_conversation_context,
+    load_visible_events_for_checkpoint,
+    normalize_context_checkpoint_config,
+)
+from ..storage.models import ContextCheckpoint, ConversationEvent, RawChatLog, ScheduledJobLog
 from ..storage.db import SessionLocal
 from ..memory.files import MemoryFileManager
 
@@ -31,6 +44,7 @@ class SchedulerManager:
         self.llm_client_factory: Optional[Callable[[str], LLMClient]] = None
         self.active_message_callback: Optional[Callable[[], Awaitable[dict]]] = None
         self.session_ids_provider: Optional[Callable[[], list[str]]] = None
+        self.context_checkpoint_callback: Optional[Callable[[str, str, list[dict]], None]] = None
         self._job_configs = {
             "memory_analysis_day": {
                 "hour": 13,
@@ -96,6 +110,9 @@ class SchedulerManager:
 
     def set_llm_client_factory(self, callback: Callable[[str], LLMClient]):
         self.llm_client_factory = callback
+
+    def set_context_checkpoint_callback(self, callback: Callable[[str, str, list[dict]], None]):
+        self.context_checkpoint_callback = callback
 
     def _session_ids(self) -> list[str]:
         if not self.session_ids_provider:
@@ -165,11 +182,15 @@ class SchedulerManager:
 
     async def _run_midnight_cleanup(self):
         base_job_id = f"midnight_cleanup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        checkpoint_job_id = f"context_checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         failures = []
         for session_id in self._session_ids():
             ok, error = await self._run_midnight_cleanup_for_session(base_job_id, session_id)
             if not ok:
                 failures.append({"session_id": session_id, "error": error})
+            checkpoint_ok, checkpoint_error = await self._run_context_checkpoint_for_session(checkpoint_job_id, session_id)
+            if not checkpoint_ok:
+                failures.append({"session_id": session_id, "job_type": "context_checkpoint", "error": checkpoint_error})
         return {"status": "completed" if not failures else "partial_failed", "failures": failures}
 
     async def _run_midnight_cleanup_for_session(self, base_job_id: str, session_id: str):
@@ -184,34 +205,194 @@ class SchedulerManager:
             target_day = datetime.now() - timedelta(days=1)
             date_str = target_day.strftime("%Y-%m-%d")
             day_memory = memory.read_dm_file(date_str)
-            if not day_memory:
-                self._finish_job(log_id, "completed")
-                return True, None
+            if day_memory:
+                messages = build_midnight_cleanup_messages(
+                    date_str=date_str,
+                    memory_core_md=memory.read_memory_core(),
+                    day_memory_md=day_memory,
+                    tomorrow_topics_md=memory.read_tomorrow_topics(),
+                )
+                raw_output = await llm.chat_completion(messages=messages, temperature=0.2)
+                data = self._parse_json_object(raw_output)
 
-            messages = build_midnight_cleanup_messages(
-                date_str=date_str,
-                memory_core_md=memory.read_memory_core(),
-                day_memory_md=day_memory,
-                tomorrow_topics_md=memory.read_tomorrow_topics(),
-            )
-            raw_output = await llm.chat_completion(messages=messages, temperature=0.2)
-            data = self._parse_json_object(raw_output)
+                memory_core = data.get("memory_core_md")
+                tomorrow_topics = data.get("tomorrow_topics_md")
+                if not memory_core or not tomorrow_topics:
+                    raise RuntimeError("midnight cleanup response missing required markdown fields")
 
-            memory_core = data.get("memory_core_md")
-            tomorrow_topics = data.get("tomorrow_topics_md")
-            if not memory_core or not tomorrow_topics:
-                raise RuntimeError("midnight cleanup response missing required markdown fields")
-
-            if not memory.write_memory_core(memory_core):
-                raise RuntimeError("failed to write MEMORY_CORE.md")
-            if not memory.write_tomorrow_topics(tomorrow_topics):
-                raise RuntimeError("failed to write TOMORROW_TOPICS.md")
+                if not memory.write_memory_core(memory_core):
+                    raise RuntimeError("failed to write MEMORY_CORE.md")
+                if not memory.write_tomorrow_topics(tomorrow_topics):
+                    raise RuntimeError("failed to write TOMORROW_TOPICS.md")
 
             self._finish_job(log_id, "completed")
             return True, None
         except Exception as e:
             self._finish_job(log_id, "failed", str(e))
             return False, str(e)
+
+    async def _run_context_checkpoint_for_session(self, base_job_id: str, session_id: str):
+        job_id = f"{base_job_id}_{session_id}"
+        log_id = self._start_job(job_id, "context_checkpoint", session_id=session_id)
+        try:
+            result = await self._maybe_create_context_checkpoint(job_id, session_id)
+            self._record_context_checkpoint_audit(session_id, job_id, result, "completed")
+            self._finish_job(log_id, "completed")
+            return True, None
+        except Exception as e:
+            result = {"status": "failed", "error": str(e)}
+            self._record_context_checkpoint_audit(session_id, job_id, result, "failed")
+            self._finish_job(log_id, "failed", str(e))
+            return False, str(e)
+
+    async def _maybe_create_context_checkpoint(self, job_id: str, session_id: str) -> dict:
+        config = normalize_context_checkpoint_config(load_settings().get("context_checkpoint"))
+        threshold_tokens = int(config["threshold_k"]) * 1000
+        latest_debug = latest_prompt_debug_for_session(session_id)
+        if not latest_debug:
+            return {"status": "skipped", "reason": "no_prompt_debug", "threshold_tokens": threshold_tokens}
+
+        current_tokens = int(latest_debug.get("tokens") or 0)
+        if current_tokens < threshold_tokens:
+            return {
+                "status": "skipped",
+                "reason": "below_threshold",
+                "tokens": current_tokens,
+                "threshold_tokens": threshold_tokens,
+                "source_prompt_debug_id": latest_debug.get("id"),
+            }
+
+        latest_checkpoint = latest_context_checkpoint_for_session(session_id)
+        if (
+            latest_checkpoint
+            and latest_checkpoint.get("source_prompt_debug_id")
+            and latest_checkpoint["source_prompt_debug_id"] >= latest_debug["id"]
+        ):
+            return {
+                "status": "skipped",
+                "reason": "already_checkpointed_for_latest_debug",
+                "tokens": current_tokens,
+                "threshold_tokens": threshold_tokens,
+                "source_prompt_debug_id": latest_debug.get("id"),
+                "context_checkpoint_id": latest_checkpoint.get("id"),
+            }
+
+        through_event_id = latest_visible_event_id(session_id)
+        if not through_event_id:
+            return {
+                "status": "skipped",
+                "reason": "no_visible_events",
+                "tokens": current_tokens,
+                "threshold_tokens": threshold_tokens,
+                "source_prompt_debug_id": latest_debug.get("id"),
+            }
+
+        after_event_id = latest_checkpoint.get("covered_until_event_id") if latest_checkpoint else None
+        visible_events = load_visible_events_for_checkpoint(session_id, after_event_id, through_event_id)
+        if not visible_events and latest_checkpoint:
+            return {
+                "status": "skipped",
+                "reason": "no_new_visible_events_after_checkpoint",
+                "tokens": current_tokens,
+                "threshold_tokens": threshold_tokens,
+                "source_prompt_debug_id": latest_debug.get("id"),
+                "context_checkpoint_id": latest_checkpoint.get("id"),
+            }
+        if not visible_events:
+            return {
+                "status": "skipped",
+                "reason": "no_visible_events_to_compress",
+                "tokens": current_tokens,
+                "threshold_tokens": threshold_tokens,
+                "source_prompt_debug_id": latest_debug.get("id"),
+            }
+
+        llm = self._llm_for_session(session_id)
+        if llm is None or not getattr(llm, "api_key", ""):
+            raise RuntimeError("LLM client is not configured for context checkpoint")
+
+        memory = self.memory.for_session(session_id)
+        messages = build_context_checkpoint_messages(
+            session_id=session_id,
+            previous_checkpoint_text=(latest_checkpoint or {}).get("checkpoint_text") or "",
+            visible_events=visible_events,
+            memory_core_md=memory.read_memory_core(),
+            today_memory_md=memory.read_dm_file(datetime.now().strftime("%Y-%m-%d")),
+            tomorrow_topics_md=memory.read_tomorrow_topics(),
+            estimated_tokens_before=current_tokens,
+        )
+        raw_output = await llm.chat_completion(messages=messages, temperature=0.2)
+        data = self._parse_json_object(raw_output)
+        checkpoint_text = (data.get("checkpoint_text") or "").strip()
+        if not checkpoint_text:
+            raise RuntimeError("context checkpoint response missing checkpoint_text")
+
+        checkpoint_id = self._write_context_checkpoint(
+            session_id=session_id,
+            checkpoint_text=checkpoint_text,
+            covered_until_event_id=through_event_id,
+            source_prompt_debug_id=latest_debug["id"],
+            estimated_tokens_before=latest_debug.get("estimated_tokens"),
+            prompt_tokens_before=latest_debug.get("prompt_tokens"),
+        )
+        context = load_conversation_context(session_id)
+        if self.context_checkpoint_callback:
+            self.context_checkpoint_callback(
+                session_id,
+                context.get("checkpoint_text") or checkpoint_text,
+                context.get("history") or [],
+            )
+        return {
+            "status": "created",
+            "context_checkpoint_id": checkpoint_id,
+            "covered_until_event_id": through_event_id,
+            "source_prompt_debug_id": latest_debug["id"],
+            "tokens": current_tokens,
+            "threshold_tokens": threshold_tokens,
+            "compressed_event_count": len(visible_events),
+        }
+
+    def _write_context_checkpoint(
+        self,
+        *,
+        session_id: str,
+        checkpoint_text: str,
+        covered_until_event_id: int,
+        source_prompt_debug_id: int,
+        estimated_tokens_before: Optional[int],
+        prompt_tokens_before: Optional[int],
+    ) -> int:
+        db = SessionLocal()
+        try:
+            row = ContextCheckpoint(
+                session_id=session_id,
+                checkpoint_text=checkpoint_text,
+                covered_until_event_id=covered_until_event_id,
+                source_prompt_debug_id=source_prompt_debug_id,
+                estimated_tokens_before=estimated_tokens_before,
+                prompt_tokens_before=prompt_tokens_before,
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            return row.id
+        finally:
+            db.close()
+
+    def _record_context_checkpoint_audit(self, session_id: str, job_id: str, payload: dict, status: str):
+        db = SessionLocal()
+        try:
+            db.add(RawChatLog(
+                event_id=f"context_checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}",
+                session_id=session_id,
+                event_type="context_checkpoint",
+                raw_payload=json.dumps(payload or {}, ensure_ascii=False),
+                job_id=job_id,
+                status=status,
+            ))
+            db.commit()
+        finally:
+            db.close()
 
     async def _run_active_message(self):
         job_id = f"active_message_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
