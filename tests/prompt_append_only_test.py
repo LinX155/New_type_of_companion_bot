@@ -1057,6 +1057,20 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertEqual(result.status, "internal_protocol_leak")
         self.assertTrue(any("内部协议" in error for error in result.errors))
 
+    def test_main_harness_blocks_quote_tags(self):
+        raw = (
+            "[[quote]]\n"
+            "一张新闻截图的内部理解摘要。\n"
+            "[/quote]]\n"
+            "这种文章看着好压抑。"
+        )
+
+        result = parse_and_validate_main_output(raw)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "internal_protocol_leak")
+        self.assertTrue(any("内部协议" in error for error in result.errors))
+
     def test_main_harness_blocks_tool_call_even_with_valid_meme_marker(self):
         raw = """<tool_call>
 <tool_name>run_background_process</tool_name>
@@ -1093,6 +1107,8 @@ class PromptAppendOnlyTest(unittest.TestCase):
             None,
             [
                 {"role": "assistant", "text": "[[MEMORIZATION_INTENTS_START]] should not return"},
+                {"role": "assistant", "text": "[[quote]]"},
+                {"role": "assistant", "text": "[/quote]]"},
                 {"role": "assistant", "text": "confused:pout&&"},
                 {"role": "assistant", "text": "&&resting:zzz|||"},
                 {"role": "assistant", "text": "正常历史"},
@@ -1111,6 +1127,8 @@ class PromptAppendOnlyTest(unittest.TestCase):
 
         self.assertIn("正常历史", contents)
         self.assertFalse(any("MEMORIZATION_INTENTS" in item for item in contents))
+        self.assertFalse(any("[[quote]]" in item for item in contents))
+        self.assertFalse(any("[/quote]]" in item for item in contents))
         self.assertFalse(any("confused:pout" in item for item in contents))
         self.assertFalse(any("resting:zzz" in item for item in contents))
         self.assertFalse(any("tool_call" in item for item in contents))

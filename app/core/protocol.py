@@ -44,6 +44,7 @@ MALFORMED_MEME_MARKER_RE = re.compile(
     r")(?!&)"
 )
 INTERNAL_SENTINEL_RE = re.compile(r"\[\[[A-Z][A-Z0-9_:\-]{2,}\]\]")
+INTERNAL_QUOTE_TAG_RE = re.compile(r"\[{1,2}\s*/?\s*quote\s*\]\]?", re.IGNORECASE)
 INTERNAL_XML_TAG_RE = re.compile(
     r"<\s*/?\s*(?:tool_call|tool_name|tool|json|name|param|parameter|function|function_call|output|assistant_message|messages)\b[^>]*>",
     re.IGNORECASE,
@@ -620,6 +621,8 @@ def contains_internal_visible_protocol(text: str) -> bool:
         return False
 
     if INTERNAL_SENTINEL_RE.search(content):
+        return True
+    if INTERNAL_QUOTE_TAG_RE.search(content):
         return True
     if INTERNAL_XML_TAG_RE.search(content):
         return True

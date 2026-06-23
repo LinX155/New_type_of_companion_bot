@@ -170,6 +170,18 @@ class ContextCheckpointTest(unittest.TestCase):
                     ConversationEvent(
                         session_id="qq_private_903919427",
                         event_type="assistant_text",
+                        text="[[quote]]",
+                        is_visible=True,
+                    ),
+                    ConversationEvent(
+                        session_id="qq_private_903919427",
+                        event_type="assistant_text",
+                        text="[/quote]]",
+                        is_visible=True,
+                    ),
+                    ConversationEvent(
+                        session_id="qq_private_903919427",
+                        event_type="assistant_text",
                         text="confused:pout&&",
                         is_visible=True,
                     ),
@@ -252,6 +264,18 @@ class ContextCheckpointTest(unittest.TestCase):
                     session_id="qq_private_903919427",
                     event_type="assistant_text",
                     text="[[MEMORIZATION_INTENTS_START]]",
+                    is_visible=True,
+                ),
+                ConversationEvent(
+                    session_id="qq_private_903919427",
+                    event_type="assistant_text",
+                    text="[[quote]]",
+                    is_visible=True,
+                ),
+                ConversationEvent(
+                    session_id="qq_private_903919427",
+                    event_type="assistant_text",
+                    text="[/quote]]",
                     is_visible=True,
                 ),
                 ConversationEvent(

@@ -205,6 +205,23 @@ class SendGateTest(unittest.TestCase):
             [long_text, "第二句", "第三句", "第四句"],
         )
 
+    def test_text_display_split_rolls_back_when_split_would_exceed_four_items(self):
+        items = [
+            SendItem(
+                type=SendItemType.TEXT,
+                content="就是那种... 像是有预知似的，看到了后面可能发生什么，越明白原理、越明白那些人的逻辑，反而感觉更绝望。",
+            ),
+            SendItem(type=SendItemType.TEXT, content="有点像“看得越清，痛感越真”。"),
+            SendItem(type=SendItemType.TEXT, content="这种感觉会让你觉得心里更踏实，还是反而会更烦躁呀？"),
+        ]
+
+        units = routes._build_display_send_units(items)
+
+        self.assertEqual(
+            [unit["display_item"].content for unit in units],
+            [item.content for item in items],
+        )
+
     def test_llm_typing_state_syncs_to_onebot_target_only(self):
         async def scenario():
             manager = FakeOneBotManager()
@@ -853,6 +870,7 @@ class SendGateTest(unittest.TestCase):
                     SendItem(type=SendItemType.TEXT, content="<tool_call>"),
                     SendItem(type=SendItemType.TEXT, content="<tool_name>run_background_process</tool_name>"),
                     SendItem(type=SendItemType.TEXT, content='{"message_type": "STICKER_PROCESSED_USER_INPUT"}'),
+                    SendItem(type=SendItemType.TEXT, content="[[quote]]"),
                     SendItem(type=SendItemType.TEXT, content="confused:pout&&"),
                 ],
             )
@@ -926,7 +944,7 @@ class SendGateTest(unittest.TestCase):
             self.assertEqual(graph.reset_reasons, ["internal_output_guard_filtered"])
             self.assertFalse(gate.sent)
             self.assertEqual(guard_logs[0][0].action, Action.WAIT)
-            self.assertEqual(len(guard_logs[0][1]), 4)
+            self.assertEqual(len(guard_logs[0][1]), 5)
 
         asyncio.run(scenario())
 

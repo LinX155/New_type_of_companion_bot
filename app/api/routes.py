@@ -858,14 +858,20 @@ def _requires_user_composing_gate(items: list[SendItem]) -> bool:
 
 
 def _build_display_send_units(items: list[SendItem]) -> list[dict]:
-    units: list[dict] = []
     allow_text_split = len(items) < DISPLAY_SPLIT_DISABLE_ITEM_COUNT
+    units = _display_send_units_with_split(items, allow_text_split=allow_text_split)
+    if allow_text_split and len(units) > DISPLAY_SPLIT_DISABLE_ITEM_COUNT:
+        return _display_send_units_with_split(items, allow_text_split=False)
+    return units
+
+
+def _display_send_units_with_split(items: list[SendItem], allow_text_split: bool) -> list[dict]:
+    units: list[dict] = []
     for original_index, item in enumerate(items):
-        display_parts = (
-            _split_text_for_display(item.content)
-            if item.type == SendItemType.TEXT and allow_text_split
-            else [item.content]
-        )
+        if item.type == SendItemType.TEXT and allow_text_split:
+            display_parts = _split_text_for_display(item.content)
+        else:
+            display_parts = [item.content]
         for part_index, part in enumerate(display_parts):
             display_item = item
             if item.type == SendItemType.TEXT and part != item.content:
