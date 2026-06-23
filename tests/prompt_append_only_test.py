@@ -740,6 +740,38 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertEqual(kwargs["temperature"], 1.5)
         self.assertEqual(kwargs["extra_body"]["thinking"], {"type": "disabled"})
 
+    def test_llm_client_sends_deepseek_provider_user_id_outside_messages(self):
+        client = LLMClient(
+            api_key="test-key",
+            base_url="https://api.deepseek.com",
+            model="deepseek-chat",
+            provider_user_id="u_0123456789abcdef0123456789abcdef",
+            thinking_enabled=True,
+        )
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = client._build_kwargs(messages, temperature=1.0, max_tokens=None, stream=False)
+
+        self.assertIs(kwargs["messages"], messages)
+        self.assertEqual(kwargs["extra_body"]["user_id"], "u_0123456789abcdef0123456789abcdef")
+        self.assertNotIn("u_0123456789abcdef0123456789abcdef", json.dumps(messages, ensure_ascii=False))
+        self.assertTrue(client.get_cache_debug()["provider_user_id_sent"])
+        self.assertEqual(len(client.get_cache_debug()["provider_user_id_hash"]), 16)
+
+    def test_llm_client_sends_provider_user_id_to_mimo_compatible_endpoint(self):
+        client = LLMClient(
+            api_key="test-key",
+            base_url="https://api.xiaomimimo.com/v1",
+            model="mimo-v2.5",
+            provider_user_id="u_0123456789abcdef0123456789abcdef",
+            thinking_enabled=False,
+        )
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = client._build_kwargs(messages, temperature=1.0, max_tokens=None, stream=False)
+
+        self.assertEqual(kwargs["extra_body"]["user_id"], "u_0123456789abcdef0123456789abcdef")
+        self.assertNotIn("u_0123456789abcdef0123456789abcdef", json.dumps(messages, ensure_ascii=False))
+        self.assertTrue(client.get_cache_debug()["provider_user_id_sent"])
+
     def test_repeated_buffer_event_is_not_duplicated(self):
         async def scenario():
             graph = CompanionGraph(FakeLLM(), FakeMemory(), FakeMemeCatalog())
@@ -841,8 +873,8 @@ class PromptAppendOnlyTest(unittest.TestCase):
             self.assertNotIn('"action": "WAIT"', messages[0]["content"])
             self.assertIn("不常见的陌生的名词", messages[0]["content"])
             self.assertIn("根据知识库分析一下用户为什么会提到这个陌生名词", messages[0]["content"])
-            self.assertIn("你是一个有趣、有网感的人", messages[0]["content"])
-            self.assertIn("也可以顺着联想、玩梗、轻轻岔开或发散接话", messages[0]["content"])
+            self.assertIn("你是一个有趣有网感的人", messages[0]["content"])
+            self.assertIn("也可以任意联想发散接话", messages[0]["content"])
             self.assertIn("非必要不使用“😂”", messages[0]["content"])
             self.assertEqual(self._count_content(messages, "早。"), 1)
             self.assertEqual(self._count_content(messages, "早"), 1)
@@ -1019,11 +1051,19 @@ class PromptAppendOnlyTest(unittest.TestCase):
         serialized_messages = json.dumps(messages, ensure_ascii=False)
 
         self.assertEqual(len(messages), 2)
-        self.assertEqual(tool_payload["results"], [
+        self.assertEqual(tool_payload["meme"], [
             {"request": "amused:laugh", "candidates": ["amused_laugh_001"]}
         ])
-        self.assertEqual(tool_payload["required_output"], ":meme:<file_stem>")
+        self.assertEqual(tool_payload["output"], ":meme:<file_stem>")
         self.assertTrue(any(":meme:<file_stem>" in rule for rule in tool_payload["rules"]))
+        self.assertIn("这是内部二轮选图，不是用户消息。", tool_payload["rules"])
+        self.assertIn("不要输出 JSON、解释、聊天文本、Markdown 或额外字符。", tool_payload["rules"])
+        self.assertIn("不要改写主对话文字；主对话前后文本已经由系统发送或排队。", tool_payload["rules"])
+        self.assertNotIn("internal_tool", tool_payload)
+        self.assertNotIn("select_meme_candidate", serialized_messages)
+        self.assertNotIn('"status"', serialized_messages)
+        self.assertNotIn('"results"', serialized_messages)
+        self.assertNotIn('"required_output"', serialized_messages)
         self.assertNotIn('"type":"meme"', serialized_messages)
         self.assertNotIn("候选表情 JSON", serialized_messages)
         self.assertEqual(serialized_messages.count("amused_laugh_001"), 1)

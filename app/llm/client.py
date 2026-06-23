@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Any, List, Dict, Optional, AsyncGenerator
 from openai import AsyncOpenAI
 
+from app.core.provider_identity import is_valid_provider_user_id, provider_user_id_hash
+
 
 DEFAULT_TEMPERATURE = 1.0
 
@@ -29,6 +31,7 @@ class LLMClient:
         temperature: Optional[float] = None,
         cache_affinity_enabled: bool = True,
         cache_session_id: Optional[str] = None,
+        provider_user_id: Optional[str] = None,
     ):
         self.api_key = api_key or os.getenv("LLM_API_KEY", "")
         self.base_url = base_url or os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
@@ -39,6 +42,9 @@ class LLMClient:
         )
         self.cache_affinity_enabled = cache_affinity_enabled
         self.cache_session_id = cache_session_id or os.getenv("LLM_CACHE_SESSION_ID") or self._new_cache_session_id()
+        self.provider_user_id = self._normalize_provider_user_id(
+            provider_user_id if provider_user_id is not None else os.getenv("LLM_PROVIDER_USER_ID")
+        )
         self._prompt_cache_key_disabled_reason: Optional[str] = None
         self._client: Optional[AsyncOpenAI] = None
         self._last_usage: Optional[dict] = None
@@ -70,13 +76,17 @@ class LLMClient:
             kwargs["max_tokens"] = max_tokens
         if self.thinking_enabled:
             # 思考模式：reasoning 模型通常要求省略 temperature，并用 thinking 字段开启
-            kwargs["extra_body"] = {
+            extra_body = {
                 "thinking": {"type": "enabled"},
                 "reasoning_effort": "high",
             }
         else:
-            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            extra_body = {"thinking": {"type": "disabled"}}
             kwargs["temperature"] = temperature
+        provider_user_id = self._provider_user_id_for_request()
+        if provider_user_id:
+            extra_body["user_id"] = provider_user_id
+        kwargs["extra_body"] = extra_body
         if self.cache_affinity_enabled:
             kwargs["extra_headers"] = self._cache_affinity_headers()
             if include_prompt_cache_key and not self._prompt_cache_key_disabled_reason:
@@ -314,15 +324,20 @@ class LLMClient:
             "model": self.model,
             "thinking_enabled": self.thinking_enabled,
             "temperature": self.temperature,
+            "provider_user_id": self._provider_user_id_for_request(),
         })
 
     def get_cache_debug(self) -> dict:
+        provider_user_id = self._provider_user_id_for_request()
         return {
             "cache_affinity_enabled": self.cache_affinity_enabled,
             "cache_session_id": self.cache_session_id if self.cache_affinity_enabled else None,
             "prompt_cache_key": self._prompt_cache_key() if self.cache_affinity_enabled else None,
             "prompt_cache_key_disabled": bool(self._prompt_cache_key_disabled_reason),
             "prompt_cache_key_disabled_reason": self._prompt_cache_key_disabled_reason,
+            "provider_user_id_configured": bool(self.provider_user_id),
+            "provider_user_id_sent": bool(provider_user_id),
+            "provider_user_id_hash": provider_user_id_hash(provider_user_id),
         }
 
     def reset_cache_session(self):
@@ -370,6 +385,7 @@ class LLMClient:
         model: Optional[str] = None,
         thinking_enabled: Optional[bool] = None,
         temperature: Optional[float] = None,
+        provider_user_id: Optional[str] = None,
     ):
         if api_key is not None:
             self.api_key = api_key
@@ -381,6 +397,8 @@ class LLMClient:
             self.thinking_enabled = thinking_enabled
         if temperature is not None:
             self.temperature = self._normalize_temperature(temperature)
+        if provider_user_id is not None:
+            self.provider_user_id = self._normalize_provider_user_id(provider_user_id)
         # Reset client to use new config
         self._client = None
         self.reset_cache_session()
@@ -393,6 +411,17 @@ class LLMClient:
         if temperature != temperature:
             return DEFAULT_TEMPERATURE
         return max(0.0, min(2.0, temperature))
+
+    def _normalize_provider_user_id(self, value: Any) -> Optional[str]:
+        user_id = str(value or "").strip()
+        if not user_id:
+            return None
+        return user_id if is_valid_provider_user_id(user_id) else None
+
+    def _provider_user_id_for_request(self) -> Optional[str]:
+        if not self.provider_user_id:
+            return None
+        return self.provider_user_id
 
 
 def json_dumps_stable(payload: dict) -> str:

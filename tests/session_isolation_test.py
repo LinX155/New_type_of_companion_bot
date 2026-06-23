@@ -8,7 +8,7 @@ from app.adapters.onebot11.events import parse_onebot_event
 from app.core.events import ChatEvent, EventType
 from app.core.media_jobs import MediaJobQueue
 from app.core.runtime import SessionRuntimeManager
-from app.core.sessions import qq_private_session_id
+from app.core.sessions import SessionRegistry, qq_private_session_id
 from app.core.snapshots import SnapshotManager
 from app.core.state import ChatStatus
 from app.llm.client import LLMClient
@@ -133,6 +133,58 @@ class SessionIsolationTest(unittest.TestCase):
                 self.assertEqual(runtime_b.gate.snapshot_manager.session_id, session_b)
                 self.assertEqual(runtime_b.gate.state.status, ChatStatus.COLD)
                 self.assertNotEqual(runtime_a.graph.llm.cache_session_id, runtime_b.graph.llm.cache_session_id)
+
+        asyncio.run(scenario())
+
+    def test_provider_user_id_is_stable_and_private_per_session(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            registry = SessionRegistry(tmp_dir)
+            session_id = qq_private_session_id("10001")
+
+            first = registry.provider_user_id(session_id)
+            second = SessionRegistry(tmp_dir).provider_user_id(session_id)
+            other = registry.provider_user_id(qq_private_session_id("10002"))
+
+            self.assertEqual(first, second)
+            self.assertNotEqual(first, other)
+            self.assertRegex(first, r"^u_[0-9a-f]{32}$")
+            self.assertNotIn("10001", first)
+
+    def test_provider_user_id_rotates_after_session_delete(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            registry = SessionRegistry(tmp_dir)
+            session_id = qq_private_session_id("10001")
+            first = registry.provider_user_id(session_id)
+
+            self.assertTrue(registry.delete_private_files(session_id))
+            second = registry.provider_user_id(session_id)
+
+            self.assertNotEqual(first, second)
+
+    def test_runtime_manager_passes_provider_user_id_to_session_llm(self):
+        async def scenario():
+            async def noop_on_decision(_ctx):
+                return None
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                manager = SessionRuntimeManager(
+                    root_dir=tmp_dir,
+                    base_llm_client=LLMClient(
+                        api_key="",
+                        base_url="https://api.deepseek.com",
+                        model="deepseek-chat",
+                    ),
+                    base_memory_manager=MemoryFileManager(tmp_dir),
+                    meme_catalog=MemeCatalog(str(Path(tmp_dir) / "memes")),
+                    media_job_queue=None,
+                    on_decision=noop_on_decision,
+                    hot_duration_minutes=30,
+                )
+
+                runtime = manager.get(qq_private_session_id("10001"))
+
+                self.assertRegex(runtime.graph.llm.provider_user_id, r"^u_[0-9a-f]{32}$")
+                self.assertTrue(runtime.graph.llm.get_cache_debug()["provider_user_id_sent"])
 
         asyncio.run(scenario())
 

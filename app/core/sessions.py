@@ -6,11 +6,18 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
+from .provider_identity import (
+    is_valid_provider_user_seed,
+    new_provider_user_seed,
+    provider_user_id_for_seed,
+)
+
 
 WEBUI_DEFAULT_SESSION_ID = "webui_default"
 LEGACY_DEFAULT_SESSION_ID = "default"
 SESSION_ROOT_DIR = os.path.join("memory", "sessions")
 _SAFE_SESSION_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+PROVIDER_USER_SEED_KEY = "provider_user_seed"
 
 
 @dataclass(frozen=True)
@@ -82,11 +89,17 @@ class SessionRegistry:
         os.makedirs(path, exist_ok=True)
         os.makedirs(os.path.join(path, "dm"), exist_ok=True)
         meta_path = os.path.join(path, "session.json")
+        existing = self._read_session_meta(path)
+        provider_user_seed = existing.get(PROVIDER_USER_SEED_KEY)
+        if not is_valid_provider_user_seed(provider_user_seed):
+            provider_user_seed = new_provider_user_seed()
         payload = {
+            **existing,
             "session_id": sid,
             "platform": identity.platform,
             "user_id": identity.user_id,
             "label": identity.label,
+            PROVIDER_USER_SEED_KEY: provider_user_seed,
             "updated_at": datetime.now().isoformat(),
         }
         try:
@@ -95,6 +108,16 @@ class SessionRegistry:
         except Exception as exc:  # noqa: BLE001
             print(f"Error writing session metadata {meta_path}: {exc}")
         return sid
+
+    def provider_user_id(self, session_id: str) -> str:
+        sid = self.ensure_session(session_id)
+        meta = self._read_session_meta(self.session_dir(sid))
+        provider_user_seed = meta.get(PROVIDER_USER_SEED_KEY)
+        if not is_valid_provider_user_seed(provider_user_seed):
+            sid = self.ensure_session(sid)
+            meta = self._read_session_meta(self.session_dir(sid))
+            provider_user_seed = meta.get(PROVIDER_USER_SEED_KEY)
+        return provider_user_id_for_seed(self.base_dir, str(provider_user_seed or ""))
 
     def list_file_sessions(self) -> list[dict]:
         sessions: list[dict] = []

@@ -52,9 +52,11 @@ class MediaJobQueue:
         meme_steal_analyzer: Optional[MemeStealAnalyzer] = None,
         meme_steal_saver: Optional[MemeStealSaver] = None,
         on_payloads: Optional[MediaJobCallback] = None,
+        llm_client_factory: Optional[Callable[[str], LLMClient]] = None,
         max_workers: int = 1,
     ):
         self.llm = llm_client
+        self.llm_client_factory = llm_client_factory
         self.media_downloader = media_downloader
         self.meme_steal_analyzer = meme_steal_analyzer
         self.meme_steal_saver = meme_steal_saver
@@ -86,6 +88,9 @@ class MediaJobQueue:
             return
         for index in range(self.max_workers):
             self._workers.append(loop.create_task(self._worker_loop(index)))
+
+    def set_llm_client_factory(self, factory: Optional[Callable[[str], LLMClient]]):
+        self.llm_client_factory = factory
 
     async def shutdown(self):
         tasks = list(self._workers)
@@ -266,7 +271,7 @@ class MediaJobQueue:
                 event_text=job.event_text,
                 context_text=job.context_text,
             )
-            raw_output = await self.llm.chat_completion(messages=messages, temperature=0.2)
+            raw_output = await self._llm_for_job(job).chat_completion(messages=messages, temperature=0.2)
             parsed = self._parse_internal_json_object(raw_output)
             return {
                 **base,
@@ -310,7 +315,7 @@ class MediaJobQueue:
         try:
             analysis = await self.meme_steal_analyzer.analyze(
                 image_ref=local_path,
-                llm_client=self.llm,
+                llm_client=self._llm_for_job(job),
                 context_text=self._meme_intake_context_text(job.context_text, image_understanding),
             )
         except Exception as exc:  # noqa: BLE001
@@ -445,6 +450,11 @@ class MediaJobQueue:
     def _event_raw(self, event: dict) -> dict:
         raw = event.get("raw") or {}
         return raw if isinstance(raw, dict) else {}
+
+    def _llm_for_job(self, job: MediaJob) -> LLMClient:
+        if self.llm_client_factory:
+            return self.llm_client_factory(job.session_id)
+        return self.llm
 
     def _meme_intake_context_text(self, context_text: str, image_understanding: dict) -> str:
         result = image_understanding.get("result") if isinstance(image_understanding, dict) else None

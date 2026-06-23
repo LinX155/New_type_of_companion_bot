@@ -276,6 +276,8 @@ def init_gate():
             on_decision=on_decision,
             hot_duration_minutes=_persisted.get("hot_duration_minutes", 30),
         )
+        media_job_queue.set_llm_client_factory(runtime_manager.make_llm_for_session)
+        scheduler_manager.set_llm_client_factory(runtime_manager.make_llm_for_session)
         default_runtime = runtime_manager.get(DEFAULT_SESSION_ID)
         event_gate = default_runtime.gate
         companion_graph = default_runtime.graph
@@ -1580,14 +1582,14 @@ async def _handle_command_event(event: ChatEvent, result: Optional[dict] = None)
 
 async def _run_mem_command(text: str, session_id: str, target: Optional[dict] = None) -> tuple[bool, str]:
     await _emit_llm_started({**(target or {}), "session_id": session_id})
-    manager = memory_manager.for_session(normalize_session_id(session_id or DEFAULT_SESSION_ID))
-    return await manager.apply_mem_via_llm(text, llm_client)
+    runtime = _runtime_for_session(session_id)
+    return await runtime.memory.apply_mem_via_llm(text, runtime.graph.llm)
 
 
 async def _run_forget_command(text: str, session_id: str, target: Optional[dict] = None) -> tuple[bool, str]:
     await _emit_llm_started({**(target or {}), "session_id": session_id})
-    manager = memory_manager.for_session(normalize_session_id(session_id or DEFAULT_SESSION_ID))
-    return await manager.apply_forget_via_llm(text, llm_client)
+    runtime = _runtime_for_session(session_id)
+    return await runtime.memory.apply_forget_via_llm(text, runtime.graph.llm)
 
 
 def _event_type_for_text(text: str) -> EventType:
@@ -1962,7 +1964,7 @@ async def run_active_message_once(manual: bool = False, session_id: Optional[str
             await gate.finish_active_message_job(job_id, "dropped")
             return {"status": "skipped", "reason": "no_candidate"}
 
-        if not llm_client.api_key:
+        if not graph.llm.api_key:
             await gate.finish_active_message_job(job_id, "dropped")
             return {"status": "skipped", "reason": "llm_not_configured"}
 
@@ -1975,7 +1977,7 @@ async def run_active_message_once(manual: bool = False, session_id: Optional[str
             memory_core_md=memory.read_memory_core(),
             current_time=now.strftime("%H:%M"),
         )
-        raw_output = await llm_client.chat_completion(messages=messages, temperature=0.3)
+        raw_output = await graph.llm.chat_completion(messages=messages, temperature=0.3)
         decision = parse_active_decision(raw_output)
 
         if not await gate.is_active_message_job_current(job_id):

@@ -28,6 +28,7 @@ class SchedulerManager:
         self.scheduler = AsyncIOScheduler()
         self.memory = memory_manager or MemoryFileManager()
         self.llm = llm_client
+        self.llm_client_factory: Optional[Callable[[str], LLMClient]] = None
         self.active_message_callback: Optional[Callable[[], Awaitable[dict]]] = None
         self.session_ids_provider: Optional[Callable[[], list[str]]] = None
         self._job_configs = {
@@ -93,11 +94,19 @@ class SchedulerManager:
     def set_session_ids_provider(self, callback: Callable[[], list[str]]):
         self.session_ids_provider = callback
 
+    def set_llm_client_factory(self, callback: Callable[[str], LLMClient]):
+        self.llm_client_factory = callback
+
     def _session_ids(self) -> list[str]:
         if not self.session_ids_provider:
             return ["default"]
         session_ids = self.session_ids_provider() or []
         return sorted({sid for sid in session_ids if sid}) or ["default"]
+
+    def _llm_for_session(self, session_id: str) -> Optional[LLMClient]:
+        if self.llm_client_factory:
+            return self.llm_client_factory(session_id)
+        return self.llm
 
     async def _run_memory_analysis(self):
         base_job_id = f"memory_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -112,7 +121,8 @@ class SchedulerManager:
         job_id = f"{base_job_id}_{session_id}"
         log_id = self._start_job(job_id, "memory_analysis", session_id=session_id)
         try:
-            if self.llm is None:
+            llm = self._llm_for_session(session_id)
+            if llm is None:
                 raise RuntimeError("LLM client is not configured for memory analysis")
 
             memory = self.memory.for_session(session_id)
@@ -129,7 +139,7 @@ class SchedulerManager:
                 today_memory_md=memory.read_today_memory(),
                 tomorrow_topics_md=memory.read_tomorrow_topics(),
             )
-            raw_output = await self.llm.chat_completion(messages=messages, temperature=0.2)
+            raw_output = await llm.chat_completion(messages=messages, temperature=0.2)
             data = self._parse_json_object(raw_output)
 
             today_memory = data.get("today_memory_md")
@@ -166,7 +176,8 @@ class SchedulerManager:
         job_id = f"{base_job_id}_{session_id}"
         log_id = self._start_job(job_id, "midnight_cleanup", session_id=session_id)
         try:
-            if self.llm is None:
+            llm = self._llm_for_session(session_id)
+            if llm is None:
                 raise RuntimeError("LLM client is not configured for midnight cleanup")
 
             memory = self.memory.for_session(session_id)
@@ -183,7 +194,7 @@ class SchedulerManager:
                 day_memory_md=day_memory,
                 tomorrow_topics_md=memory.read_tomorrow_topics(),
             )
-            raw_output = await self.llm.chat_completion(messages=messages, temperature=0.2)
+            raw_output = await llm.chat_completion(messages=messages, temperature=0.2)
             data = self._parse_json_object(raw_output)
 
             memory_core = data.get("memory_core_md")

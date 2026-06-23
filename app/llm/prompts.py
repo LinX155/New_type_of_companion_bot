@@ -412,23 +412,21 @@ def build_meme_search_messages(
             }
         ]
 
-    compact_results = []
+    meme_candidates = []
     for item in search_results:
         request = str(item.get("request") or "").strip()
         if not request:
             category_part = str(item.get("category") or "").strip()
             keywords_part = str(item.get("keywords") or "").strip()
             request = f"{category_part}:{keywords_part}".strip(":")
-        compact_results.append({
+        meme_candidates.append({
             "request": request,
             "candidates": item.get("candidates") or [],
         })
 
     tool_result = {
-        "internal_tool": "select_meme_candidate",
-        "status": "completed",
-        "results": compact_results,
-        "required_output": ":meme:<file_stem>",
+        "meme": meme_candidates,
+        "output": ":meme:<file_stem>",
         "rules": [
             "这是内部二轮选图，不是用户消息。",
             "只从 candidates 中选一个最贴近当前语境的 file_stem。",
