@@ -12,6 +12,9 @@ from .protocol import (
     ProtocolResult,
     VALID_MEME_CATEGORIES,
     build_repair_messages,
+    contains_internal_visible_protocol,
+    contains_malformed_visible_meme_marker,
+    contains_visible_meme_marker,
     parse_and_validate_main_output,
     parse_meme_selection_output,
 )
@@ -277,7 +280,7 @@ class CompanionGraph:
         raw_output = await self._call_llm_for_messages(
             messages=state["messages"],
             temperature=self._main_chat_temperature(),
-            append_assistant_to_transcript=True,
+            append_assistant_to_transcript=False,
         )
         decision, parse_status = await self._parse_decision_with_harness(
             ctx=state["ctx"],
@@ -344,8 +347,8 @@ class CompanionGraph:
                 original_raw=raw_output,
                 original_decision=result.decision,
             )
-            messages = self._append_transcript_messages_for_call(repair_tail)
-            append_assistant = True
+            messages = self._transcript_messages_for_internal_call(repair_tail)
+            append_assistant = False
         else:
             messages = build_repair_messages(
                 base_messages=base_messages,
@@ -359,6 +362,7 @@ class CompanionGraph:
                 messages=messages,
                 temperature=self._main_chat_temperature(),
                 append_assistant_to_transcript=append_assistant,
+                record_prompt_usage=False,
             )
         except Exception as exc:
             return ProtocolResult(status="repair_failed", errors=[str(exc)])
@@ -382,6 +386,8 @@ class CompanionGraph:
     def _should_attempt_json_repair(self, raw_output: str, result: ProtocolResult) -> bool:
         if result.status == "protocol_error":
             return True
+        if result.status == "internal_protocol_leak":
+            return True
         return self._looks_like_protocol_output(raw_output)
 
     def _relaxed_visible_decision(self, raw_output: str, ctx: ProcessContext) -> Optional[ActionDecision]:
@@ -399,7 +405,13 @@ class CompanionGraph:
 
     def _visible_items_from_relaxed_output(self, raw_output: str) -> list[SendItem]:
         text = (raw_output or "").strip()
-        if not text or self._looks_like_protocol_output(text):
+        if (
+            not text
+            or self._looks_like_protocol_output(text)
+            or contains_internal_visible_protocol(text)
+            or contains_malformed_visible_meme_marker(text)
+            or contains_visible_meme_marker(text)
+        ):
             return []
 
         items: list[SendItem] = []
@@ -452,7 +464,7 @@ class CompanionGraph:
             "prefix_rebuild",
             "search_meme:",
         )
-        return any(marker in stripped for marker in protocol_markers)
+        return any(marker in stripped for marker in protocol_markers) or contains_internal_visible_protocol(stripped)
 
     def _contains_internal_protocol(self, line: str) -> bool:
         markers = (
@@ -466,6 +478,12 @@ class CompanionGraph:
             '"items"',
         )
         if any(marker in line for marker in markers):
+            return True
+        if (
+            contains_internal_visible_protocol(line)
+            or contains_malformed_visible_meme_marker(line)
+            or contains_visible_meme_marker(line)
+        ):
             return True
         return "meme:" in line and not self._extract_relaxed_meme_stem(line)
 
@@ -522,13 +540,14 @@ class CompanionGraph:
             self._last_render_status = "fallback"
             return None
 
-        messages = self._append_transcript_messages_for_call(
+        messages = self._transcript_messages_for_internal_call(
             build_meme_search_messages(base_messages=[], search_results=search_results)
         )
         raw_output = await self._call_llm_for_messages(
             messages=messages,
             temperature=self._main_chat_temperature(),
-            append_assistant_to_transcript=True,
+            append_assistant_to_transcript=False,
+            record_prompt_usage=False,
         )
         selected = parse_meme_selection_output(raw_output, set(candidates))
         if not selected:
@@ -627,8 +646,8 @@ class CompanionGraph:
                 original_raw=self._last_llm_raw_output or "",
                 original_decision=decision,
             )
-            messages = self._append_transcript_messages_for_call(repair_tail)
-            append_assistant = True
+            messages = self._transcript_messages_for_internal_call(repair_tail)
+            append_assistant = False
         else:
             messages = build_repair_messages(
                 base_messages=state["messages"],
@@ -642,6 +661,7 @@ class CompanionGraph:
                 messages=messages,
                 temperature=self._main_chat_temperature(),
                 append_assistant_to_transcript=append_assistant,
+                record_prompt_usage=False,
             )
             result = parse_and_validate_main_output(
                 raw_output,
@@ -675,6 +695,8 @@ class CompanionGraph:
         for item in items:
             text = self._history_text_for_item(item)
             self._conversation_history.append({"role": "assistant", "text": text})
+            if self._prompt_transcript:
+                self._append_assistant_text_to_prompt(text)
 
     def commit_assistant_items(self, items: list[SendItem]):
         if not items:
@@ -683,6 +705,8 @@ class CompanionGraph:
         for item in items:
             text = self._history_text_for_item(item)
             self._conversation_history.append({"role": "assistant", "text": text})
+            if self._prompt_transcript:
+                self._append_assistant_text_to_prompt(text)
 
     def commit_external_assistant_text(self, text: str):
         if not text:
@@ -882,10 +906,12 @@ class CompanionGraph:
         messages: list[dict],
         temperature: float,
         append_assistant_to_transcript: bool,
+        record_prompt_usage: bool = True,
     ) -> str:
         envelope = await self._request_llm_envelope(messages, temperature)
         raw_output, raw_source = self._raw_output_from_envelope(envelope)
-        self._record_prompt_usage(envelope=envelope, raw_output_source=raw_source)
+        if record_prompt_usage:
+            self._record_prompt_usage(envelope=envelope, raw_output_source=raw_source)
         self._record_llm_raw_output(raw_output)
         if append_assistant_to_transcript:
             self._append_provider_assistant_message(envelope.assistant_message)
@@ -979,6 +1005,8 @@ class CompanionGraph:
             role = str(item.get("role") or "").strip()
             text = str(item.get("text") or item.get("content") or "").strip()
             if role not in {"user", "assistant"} or not text:
+                continue
+            if self._is_internal_visible_leak(text):
                 continue
             result.append({"role": role, "text": text})
         return result
@@ -1331,11 +1359,22 @@ class CompanionGraph:
         if isinstance(reply_context, dict):
             quoted_text = str(reply_context.get("text") or "").strip()
             quoted_role = str(reply_context.get("role") or "unknown").strip() or "unknown"
+            if self._is_internal_visible_leak(quoted_text):
+                quoted_text = ""
             if quoted_text:
                 return f"用户引用了 {quoted_role} 的消息：{quoted_text}\n用户回复：{text or '(空消息)'}"
         if reply_to_message_id:
             return f"用户引用了一条消息（message_id={reply_to_message_id}）\n用户回复：{text or '(空消息)'}"
+        if self._is_internal_visible_leak(text):
+            return ""
         return text
+
+    def _is_internal_visible_leak(self, text: str) -> bool:
+        return (
+            contains_internal_visible_protocol(text)
+            or contains_malformed_visible_meme_marker(text)
+            or contains_visible_meme_marker(text)
+        )
 
     def _event_get(self, evt, key: str, default=None):
         if isinstance(evt, dict):
@@ -1358,10 +1397,9 @@ class CompanionGraph:
             return
         self._prompt_transcript.append(sanitized)
 
-    def _append_transcript_messages_for_call(self, messages: list[dict]) -> list[dict]:
-        self._prompt_transcript.extend(copy.deepcopy(item) for item in messages)
+    def _transcript_messages_for_internal_call(self, messages: list[dict]) -> list[dict]:
         current = self._copy_prompt_transcript()
-        self._record_prompt_observability(current)
+        current.extend(copy.deepcopy(item) for item in messages)
         return current
 
     def _copy_prompt_transcript(self) -> list[dict]:
@@ -1397,6 +1435,8 @@ class CompanionGraph:
         has_content = bool(str(sanitized.get("content") or "").strip())
         has_reasoning = bool(str(sanitized.get("reasoning_content") or "").strip())
         has_tool_calls = bool(sanitized.get("tool_calls") or sanitized.get("function_call"))
+        if has_content and self._is_internal_visible_leak(str(sanitized.get("content") or "")):
+            return {}, "internal_visible_protocol_leak"
         if not (has_content or has_reasoning or has_tool_calls):
             return {}, "empty_assistant_message"
         return sanitized, None

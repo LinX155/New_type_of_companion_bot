@@ -25,6 +25,11 @@ from ..core.events import ChatEvent, EventType
 from ..core.decisions import Action, ActionDecision, SendItem, SendItemType
 from ..core.graph import CompanionGraph
 from ..core.media_jobs import MediaJob, MediaJobQueue
+from ..core.protocol import (
+    contains_internal_visible_protocol,
+    contains_malformed_visible_meme_marker,
+    contains_visible_meme_marker,
+)
 from ..core.repetition_guard import (
     RECENT_REPETITION_WINDOW,
     RepetitionRemoval,
@@ -504,6 +509,12 @@ async def on_decision(ctx: ProcessContext):
                 build_repetition_guard_system_reminder(repetition_removed)
             )
 
+    decision, internal_removed = _apply_internal_output_guard(decision)
+    if internal_removed:
+        _record_internal_output_guard_filter(ctx, decision, internal_removed)
+        if graph:
+            graph.reset_provider_transcript(reason="internal_output_guard_filtered")
+
     gate.record_decision(decision)
 
     # 路由决策
@@ -755,6 +766,77 @@ def _record_repetition_guard_filter(
             event_id=f"evt_{uuid.uuid4().hex[:8]}",
             session_id=ctx.snapshot.session_id,
             event_type="repetition_guard",
+            raw_payload=_json_dumps(payload),
+            parsed_payload=_json_dumps(decision.to_harness_payload(exclude_none=True)),
+            action=decision.action.value,
+            snapshot_id=ctx.snapshot.snapshot_id,
+            buffer_version=ctx.snapshot.buffer_version,
+            job_id=ctx.job_id,
+            status="filtered",
+        )
+        db.add(log)
+        db.commit()
+    except Exception as e:
+        print(f"DB error: {e}")
+    finally:
+        db.close()
+
+
+def _apply_internal_output_guard(decision: ActionDecision) -> tuple[ActionDecision, list[dict]]:
+    if decision.action in (Action.WAIT, Action.END_CHAT):
+        return decision, []
+
+    kept: list[SendItem] = []
+    removed: list[dict] = []
+    for index, item in enumerate(decision.all_items()):
+        reason = _internal_output_guard_reason(item)
+        if reason:
+            removed.append({
+                "item_index": index,
+                "item_type": item.type.value,
+                "reason": reason,
+                "content_preview": item.content[:200],
+            })
+            continue
+        kept.append(item)
+
+    if not removed:
+        return decision, []
+    if not kept:
+        return ActionDecision(action=Action.WAIT, items=None), removed
+    return decision.with_items(kept), removed
+
+
+def _internal_output_guard_reason(item: SendItem) -> Optional[str]:
+    if item.type != SendItemType.TEXT:
+        return None
+    content = item.content or ""
+    if contains_internal_visible_protocol(content):
+        return "internal_visible_protocol"
+    if contains_malformed_visible_meme_marker(content):
+        return "malformed_meme_marker"
+    if contains_visible_meme_marker(content):
+        return "unparsed_meme_marker"
+    return None
+
+
+def _record_internal_output_guard_filter(
+    ctx: ProcessContext,
+    decision: ActionDecision,
+    removed: list[dict],
+):
+    db = next(get_db())
+    try:
+        payload = {
+            "removed": removed,
+            "visibility": "internal_debug_only",
+            "history_mutation": "provider_transcript_reset",
+            "reason": "blocked_user_visible_internal_protocol",
+        }
+        log = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id=ctx.snapshot.session_id,
+            event_type="internal_output_guard",
             raw_payload=_json_dumps(payload),
             parsed_payload=_json_dumps(decision.to_harness_payload(exclude_none=True)),
             action=decision.action.value,

@@ -3,6 +3,11 @@ from typing import Optional
 
 from sqlalchemy import desc
 
+from ..core.protocol import (
+    contains_internal_visible_protocol,
+    contains_malformed_visible_meme_marker,
+    contains_visible_meme_marker,
+)
 from .db import SessionLocal
 from .models import ContextCheckpoint, ConversationEvent, RawChatLog
 
@@ -114,7 +119,12 @@ def load_visible_events_for_checkpoint(
         if through_event_id:
             query = query.filter(ConversationEvent.id <= through_event_id)
         rows = query.order_by(ConversationEvent.id).all()
-        return [_event_to_checkpoint_item(row) for row in rows if _event_to_checkpoint_item(row)]
+        items = []
+        for row in rows:
+            item = _event_to_checkpoint_item(row)
+            if item:
+                items.append(item)
+        return items
     finally:
         db.close()
 
@@ -163,13 +173,20 @@ def _load_history_rows_after(db, session_id: str, covered_until_event_id: Option
     if covered_until_event_id:
         query = query.filter(ConversationEvent.id > covered_until_event_id)
     rows = query.order_by(ConversationEvent.id).all()
-    return [_event_to_history_item(row) for row in rows if _event_to_history_item(row)]
+    items = []
+    for row in rows:
+        item = _event_to_history_item(row)
+        if item:
+            items.append(item)
+    return items
 
 
 def _event_to_history_item(row: ConversationEvent) -> Optional[dict]:
     role = CONVERSATION_CONTEXT_EVENT_ROLES.get(row.event_type)
     text = (row.text or "").strip()
     if not role or not text:
+        return None
+    if _is_internal_visible_leak(text):
         return None
     return {"role": role, "text": text}
 
@@ -179,6 +196,8 @@ def _event_to_checkpoint_item(row: ConversationEvent) -> Optional[dict]:
     text = (row.text or "").strip()
     if not role or not text:
         return None
+    if _is_internal_visible_leak(text):
+        return None
     return {
         "id": row.id,
         "role": role,
@@ -186,6 +205,14 @@ def _event_to_checkpoint_item(row: ConversationEvent) -> Optional[dict]:
         "text": text,
         "created_at": row.created_at.isoformat() if row.created_at else "",
     }
+
+
+def _is_internal_visible_leak(text: str) -> bool:
+    return (
+        contains_internal_visible_protocol(text)
+        or contains_malformed_visible_meme_marker(text)
+        or contains_visible_meme_marker(text)
+    )
 
 
 def _latest_checkpoint_row(db, session_id: str) -> Optional[ContextCheckpoint]:

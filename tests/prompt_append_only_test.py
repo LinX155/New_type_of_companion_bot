@@ -249,7 +249,7 @@ class PromptAppendOnlyTest(unittest.TestCase):
             self.assertEqual(hot_messages[: len(cold_messages)], cold_messages)
             self.assertTrue(graph.get_prompt_observability()["append_only_check"])
             self.assertEqual(self._count_content(hot_messages, "你在吗"), 1)
-            self.assertEqual(self._count_content(hot_messages, "在。怎么了？"), 0)
+            self.assertEqual(self._count_content(hot_messages, "在。怎么了？"), 1)
             self.assertTrue(any(
                 item.get("role") == "assistant" and "在。怎么了？" in str(item.get("content") or "")
                 for item in hot_messages
@@ -376,6 +376,7 @@ class PromptAppendOnlyTest(unittest.TestCase):
             self.assertTrue(graph.get_prompt_observability()["content_empty_with_reasoning"])
             self.assertEqual(graph.get_prompt_observability()["cached_tokens"], 64)
             self.assertEqual(graph.get_prompt_observability()["llm_response_meta"]["finish_reason"], "stop")
+            graph.commit_sent_items(first_ctx, decision_state["decision"].send_items())
 
             gate.state.msg_index_today = 2
             second_ctx = SimpleNamespace(
@@ -396,12 +397,12 @@ class PromptAppendOnlyTest(unittest.TestCase):
             second_state = await graph._build_context({"ctx": second_ctx})
             assistant_messages = [
                 item for item in second_state["messages"]
-                if item.get("role") == "assistant" and item.get("reasoning_content")
+                if item.get("role") == "assistant"
             ]
 
             self.assertEqual(len(assistant_messages), 1)
-            self.assertIsNone(assistant_messages[0].get("content"))
-            self.assertEqual(assistant_messages[0]["reasoning_content"], "我在呢")
+            self.assertEqual(assistant_messages[0].get("content"), "我在呢")
+            self.assertNotIn("reasoning_content", assistant_messages[0])
             self.assertTrue(graph.get_prompt_observability()["append_only_check"])
             serialized_messages = json.dumps(second_state["messages"], ensure_ascii=False)
             self.assertNotIn("prompt_tokens", serialized_messages)
@@ -601,12 +602,9 @@ class PromptAppendOnlyTest(unittest.TestCase):
             })
             repair_request = llm.requests[1]
             roles = [item.get("role") for item in repair_request]
-            self.assertIn("assistant", roles)
+            self.assertNotIn("assistant", roles)
             self.assertNotIn("tool", roles)
-            self.assertTrue(any(
-                item.get("role") == "assistant" and '"type":"search_meme"' in str(item.get("content") or "")
-                for item in repair_request
-            ))
+            self.assertIn("search_meme", json.dumps(repair_request, ensure_ascii=False))
             self.assertTrue(graph.get_prompt_observability()["append_only_check"])
 
         asyncio.run(scenario())
@@ -641,6 +639,49 @@ class PromptAppendOnlyTest(unittest.TestCase):
             self.assertEqual(resolved.type, SendItemType.MEME)
             self.assertEqual(resolved.harness_value(), "amused_laugh_001")
             self.assertEqual(llm.temperatures, [1.35])
+            transcript = graph._copy_prompt_transcript()
+            self.assertEqual(transcript, [
+                {"role": "system", "content": "base"},
+                {"role": "user", "content": "发个表情"},
+                {"role": "assistant", "content": "给你这个 &&amused:laugh&&"},
+            ])
+            self.assertFalse(any(":meme:" in str(item.get("content") or "") for item in transcript))
+            self.assertFalse(any("内部二轮选图" in str(item.get("content") or "") for item in transcript))
+
+        asyncio.run(scenario())
+
+    def test_main_raw_output_is_not_replayed_before_canonical_commit(self):
+        async def scenario():
+            llm = FakeRepairEnvelopeLLM()
+            graph = CompanionGraph(llm, FakeMemory(), FakeMemeCatalog())
+            graph._prompt_transcript = [
+                {"role": "system", "content": "base"},
+                {"role": "user", "content": "晚安"},
+                {"role": "system", "content": "只输出自然聊天内容"},
+            ]
+            ctx = SimpleNamespace(
+                snapshot=ConversationSnapshot(
+                    snapshot_id=1,
+                    buffer_version=1,
+                    status=ChatStatus.HOT,
+                    events=[{"event_id": "e1", "event_type": "message.text", "text": "晚安"}],
+                ),
+                nudge_triggered=False,
+            )
+            raw = await graph._call_llm_for_messages(
+                messages=graph._copy_prompt_transcript(),
+                temperature=0.7,
+                append_assistant_to_transcript=False,
+            )
+
+            self.assertIn('"action"', raw)
+            self.assertFalse(any(
+                item.get("role") == "assistant" and '"action"' in str(item.get("content") or "")
+                for item in graph._copy_prompt_transcript()
+            ))
+
+            graph.commit_sent_items(ctx, [SendItem(type=SendItemType.TEXT, content="晚安。")])
+            self.assertEqual(graph._copy_prompt_transcript()[-1], {"role": "assistant", "content": "晚安。"})
 
         asyncio.run(scenario())
 
@@ -1009,6 +1050,71 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertEqual(result.decision.action, Action.REPLY)
         self.assertTrue(any("轻量文本协议" in error for error in result.errors))
 
+    def test_main_harness_blocks_internal_sentinel_lines(self):
+        result = parse_and_validate_main_output("[[RECONNECTION_MEMORY_SILENCE_VIBE_CHECK_TRIGGER]] 🤢…")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "internal_protocol_leak")
+        self.assertTrue(any("内部协议" in error for error in result.errors))
+
+    def test_main_harness_blocks_tool_call_even_with_valid_meme_marker(self):
+        raw = """<tool_call>
+<tool_name>run_background_process</tool_name>
+<param>
+{"task_name": "vqa_analysis", "prompt": "Analyze the given meme sticker."}
+</param>
+</tool_call>
+好了好了
+&&amused:yummy&&
+{"message_type": "STICKER_PROCESSED_USER_INPUT"}
+"""
+        result = parse_and_validate_main_output(raw)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "internal_protocol_leak")
+
+    def test_provider_transcript_skips_internal_assistant_leak(self):
+        graph = CompanionGraph(FakeLLM(), FakeMemory(), FakeMemeCatalog())
+
+        graph._append_provider_assistant_message({
+            "role": "assistant",
+            "content": "<tool_call>\n{\"message_type\": \"STICKER_PROCESSED_USER_INPUT\"}",
+        })
+
+        self.assertEqual(graph._copy_prompt_transcript(), [])
+        self.assertEqual(
+            graph._last_prompt_observability["assistant_message_skipped_reason"],
+            "internal_visible_protocol_leak",
+        )
+
+    def test_conversation_context_skips_prior_internal_leaks(self):
+        graph = CompanionGraph(FakeLLM(), FakeMemory(), FakeMemeCatalog())
+        graph.load_conversation_context(
+            None,
+            [
+                {"role": "assistant", "text": "[[MEMORIZATION_INTENTS_START]] should not return"},
+                {"role": "assistant", "text": "confused:pout&&"},
+                {"role": "assistant", "text": "&&resting:zzz|||"},
+                {"role": "assistant", "text": "正常历史"},
+                {"role": "user", "text": "<tool_call>bad</tool_call>"},
+            ],
+        )
+
+        graph._initialize_prompt_transcript(ConversationSnapshot(
+            session_id="qq_private_10001",
+            snapshot_id=1,
+            buffer_version=1,
+            status=ChatStatus.COLD,
+            events=[],
+        ))
+        contents = [item["content"] for item in graph._copy_prompt_transcript()]
+
+        self.assertIn("正常历史", contents)
+        self.assertFalse(any("MEMORIZATION_INTENTS" in item for item in contents))
+        self.assertFalse(any("confused:pout" in item for item in contents))
+        self.assertFalse(any("resting:zzz" in item for item in contents))
+        self.assertFalse(any("tool_call" in item for item in contents))
+
     def test_main_harness_accepts_malformed_ampersand_meme_markers(self):
         cases = [
             "&amused:laugh&",
@@ -1029,6 +1135,15 @@ class PromptAppendOnlyTest(unittest.TestCase):
                 ])
                 self.assertEqual(items[1].harness_value(), "amused:laugh")
                 self.assertNotIn("&", "".join(item.harness_value() for item in items))
+
+    def test_main_harness_rejects_dangling_meme_markers(self):
+        for text in ("晚安 &&resting:zzz|||", "confused:pout&&"):
+            with self.subTest(text=text):
+                result = parse_and_validate_main_output(text)
+
+                self.assertFalse(result.ok)
+                self.assertEqual(result.status, "internal_protocol_leak")
+                self.assertTrue(any("畸形表情占位" in error for error in result.errors))
 
     def test_main_harness_strips_invalid_ampersand_tag_without_touching_normal_ampersands(self):
         result = parse_and_validate_main_output("笑死 &happy& 真的")

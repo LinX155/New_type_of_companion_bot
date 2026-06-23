@@ -132,6 +132,159 @@ class ContextCheckpointTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_scheduler_filters_internal_leaks_from_checkpoint_input_but_covers_boundary(self):
+        async def scenario():
+            db = self.Session()
+            try:
+                db.add_all([
+                    ConversationEvent(
+                        session_id="qq_private_903919427",
+                        event_type="user_text",
+                        text="我们刚才在聊考试压力和道歉。",
+                        is_visible=True,
+                    ),
+                    ConversationEvent(
+                        session_id="qq_private_903919427",
+                        event_type="assistant_text",
+                        text="<tool_call>\n<tool_name>run_background_process</tool_name>\n</tool_call>",
+                        is_visible=True,
+                    ),
+                    ConversationEvent(
+                        session_id="qq_private_903919427",
+                        event_type="user_text",
+                        text="[[RECONNECTION_MEMORY_SILENCE_VIBE_CHECK_TRIGGER]] 🤢",
+                        is_visible=True,
+                    ),
+                    ConversationEvent(
+                        session_id="qq_private_903919427",
+                        event_type="assistant_text",
+                        text="我记得你现在最在意的是别再忘掉关键上下文。",
+                        is_visible=True,
+                    ),
+                    ConversationEvent(
+                        session_id="qq_private_903919427",
+                        event_type="assistant_text",
+                        text="&&resting:zzz&& 🌙",
+                        is_visible=True,
+                    ),
+                    ConversationEvent(
+                        session_id="qq_private_903919427",
+                        event_type="assistant_text",
+                        text="confused:pout&&",
+                        is_visible=True,
+                    ),
+                    ConversationEvent(
+                        session_id="qq_private_903919427",
+                        event_type="assistant_text",
+                        text="&&resting:zzz|||",
+                        is_visible=True,
+                    ),
+                    RawChatLog(
+                        event_id="debug903",
+                        session_id="qq_private_903919427",
+                        event_type="prompt_cache_debug",
+                        raw_payload=json.dumps({
+                            "estimated_prompt_tokens": 610000,
+                            "llm_usage": {"prompt_tokens": 650000},
+                        }),
+                        status="debug",
+                    ),
+                ])
+                db.commit()
+                latest_event_id = (
+                    db.query(ConversationEvent.id)
+                    .filter(ConversationEvent.session_id == "qq_private_903919427")
+                    .order_by(ConversationEvent.id.desc())
+                    .first()[0]
+                )
+            finally:
+                db.close()
+
+            llm = FakeCheckpointLLM()
+            manager = SchedulerManager(memory_manager=FakeMemoryManager(), llm_client=llm)
+
+            ok, error = await manager._run_context_checkpoint_for_session("context_checkpoint_test", "qq_private_903919427")
+
+            self.assertTrue(ok, error)
+            self.assertEqual(len(llm.requests), 1)
+            payload = json.loads(llm.requests[0][1]["content"])
+            self.assertEqual(
+                [event["text"] for event in payload["visible_events"]],
+                [
+                    "我们刚才在聊考试压力和道歉。",
+                    "我记得你现在最在意的是别再忘掉关键上下文。",
+                ],
+            )
+
+            db = self.Session()
+            try:
+                checkpoint = db.query(ContextCheckpoint).one()
+                self.assertEqual(checkpoint.covered_until_event_id, latest_event_id)
+            finally:
+                db.close()
+
+        asyncio.run(scenario())
+
+    def test_loaded_post_checkpoint_history_filters_internal_leaks(self):
+        db = self.Session()
+        try:
+            db.add(ConversationEvent(
+                session_id="qq_private_903919427",
+                event_type="user_text",
+                text="checkpoint 之前的旧内容",
+                is_visible=True,
+            ))
+            db.flush()
+            covered_event_id = (
+                db.query(ConversationEvent.id)
+                .filter(ConversationEvent.session_id == "qq_private_903919427")
+                .order_by(ConversationEvent.id.desc())
+                .first()[0]
+            )
+            db.add(ContextCheckpoint(
+                session_id="qq_private_903919427",
+                checkpoint_text="压缩摘要：保留考试压力和关系修复上下文。",
+                covered_until_event_id=covered_event_id,
+                source_prompt_debug_id=1,
+            ))
+            db.add_all([
+                ConversationEvent(
+                    session_id="qq_private_903919427",
+                    event_type="assistant_text",
+                    text="[[MEMORIZATION_INTENTS_START]]",
+                    is_visible=True,
+                ),
+                ConversationEvent(
+                    session_id="qq_private_903919427",
+                    event_type="assistant_text",
+                    text="confused:pout&&",
+                    is_visible=True,
+                ),
+                ConversationEvent(
+                    session_id="qq_private_903919427",
+                    event_type="assistant_text",
+                    text="&&resting:zzz|||",
+                    is_visible=True,
+                ),
+                ConversationEvent(
+                    session_id="qq_private_903919427",
+                    event_type="assistant_text",
+                    text="checkpoint 之后应该保留的干净内容",
+                    is_visible=True,
+                ),
+            ])
+            db.commit()
+        finally:
+            db.close()
+
+        context = checkpoint_store.load_conversation_context("qq_private_903919427")
+
+        self.assertEqual(context["checkpoint_text"], "压缩摘要：保留考试压力和关系修复上下文。")
+        self.assertEqual(
+            context["history"],
+            [{"role": "assistant", "text": "checkpoint 之后应该保留的干净内容"}],
+        )
+
     def test_scheduler_skips_context_checkpoint_below_threshold(self):
         async def scenario():
             db = self.Session()

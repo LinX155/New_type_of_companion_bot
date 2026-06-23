@@ -12,6 +12,7 @@ class FakeGraph:
     def __init__(self, decision: ActionDecision):
         self.decision = decision
         self.committed = []
+        self.reset_reasons = []
 
     async def run(self, ctx):
         return self.decision
@@ -30,6 +31,9 @@ class FakeGraph:
 
     def commit_assistant_items(self, items):
         self.committed.append(("assistant", list(items)))
+
+    def reset_provider_transcript(self, reason="provider_transcript_reset"):
+        self.reset_reasons.append(reason)
 
 
 class FakeGate:
@@ -838,6 +842,91 @@ class SendGateTest(unittest.TestCase):
             self.assertEqual(graph.committed[0][0], "turn")
             self.assertEqual(len(graph.committed[0][1]), 1)
             self.assertEqual(graph.committed[0][1][0].content, original_text)
+
+        asyncio.run(scenario())
+
+    def test_internal_output_guard_drops_tool_payload_before_send(self):
+        async def scenario():
+            decision = ActionDecision(
+                action=Action.REPLY,
+                items=[
+                    SendItem(type=SendItemType.TEXT, content="<tool_call>"),
+                    SendItem(type=SendItemType.TEXT, content="<tool_name>run_background_process</tool_name>"),
+                    SendItem(type=SendItemType.TEXT, content='{"message_type": "STICKER_PROCESSED_USER_INPUT"}'),
+                    SendItem(type=SendItemType.TEXT, content="confused:pout&&"),
+                ],
+            )
+            graph = FakeGraph(decision)
+            gate = FakeGate()
+            emitted = []
+            guard_logs = []
+
+            originals = {
+                "companion_graph": routes.companion_graph,
+                "event_gate": routes.event_gate,
+                "_emit_llm_started": routes._emit_llm_started,
+                "_emit_llm_finished": routes._emit_llm_finished,
+                "_emit_message": routes._emit_message,
+                "_emit_state": routes._emit_state,
+                "_emit_conversation_changed": routes._emit_conversation_changed,
+                "_wait_until_user_not_composing": routes._wait_until_user_not_composing,
+                "_apply_recent_repetition_guard": routes._apply_recent_repetition_guard,
+                "_record_prompt_cache_debug": routes._record_prompt_cache_debug,
+                "_record_assistant_send": routes._record_assistant_send,
+                "_record_decision_drop": routes._record_decision_drop,
+                "_record_job_state": routes._record_job_state,
+                "_record_internal_output_guard_filter": routes._record_internal_output_guard_filter,
+            }
+
+            async def noop_async(*args, **kwargs):
+                pass
+
+            async def fake_emit_message(data):
+                emitted.append(data)
+
+            async def fake_wait(ctx, expected_buffer_version=None):
+                return True
+
+            try:
+                routes.companion_graph = graph
+                routes.event_gate = gate
+                routes._emit_llm_started = noop_async
+                routes._emit_llm_finished = noop_async
+                routes._emit_message = fake_emit_message
+                routes._emit_state = noop_async
+                routes._emit_conversation_changed = noop_async
+                routes._wait_until_user_not_composing = fake_wait
+                routes._apply_recent_repetition_guard = lambda ctx, decision: (decision, [])
+                routes._record_prompt_cache_debug = lambda *args, **kwargs: None
+                routes._record_assistant_send = lambda *args, **kwargs: None
+                routes._record_decision_drop = lambda *args, **kwargs: None
+                routes._record_job_state = lambda *args, **kwargs: None
+                routes._record_internal_output_guard_filter = (
+                    lambda ctx, decision, removed: guard_logs.append((decision, removed))
+                )
+
+                ctx = SimpleNamespace(
+                    gate=gate,
+                    job_id="job_internal_leak",
+                    snapshot=SimpleNamespace(
+                        session_id="default",
+                        snapshot_id=1,
+                        buffer_version=10,
+                        events=[{"text": "小夏"}],
+                    ),
+                )
+                await routes.on_decision(ctx)
+            finally:
+                for name, value in originals.items():
+                    setattr(routes, name, value)
+
+            assistant_messages = [item for item in emitted if item.get("type") == "assistant_message"]
+            self.assertEqual(assistant_messages, [])
+            self.assertEqual(graph.committed, [])
+            self.assertEqual(graph.reset_reasons, ["internal_output_guard_filtered"])
+            self.assertFalse(gate.sent)
+            self.assertEqual(guard_logs[0][0].action, Action.WAIT)
+            self.assertEqual(len(guard_logs[0][1]), 4)
 
         asyncio.run(scenario())
 

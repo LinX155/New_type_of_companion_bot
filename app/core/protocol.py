@@ -37,6 +37,42 @@ VALID_MEME_CATEGORIES = {
 PROTOCOL_PREFIXES = ("emoji:", "meme:", "search_meme:")
 HARNESS_ITEM_KEYS = ("text", "meme", "search_meme")
 MEME_MARKER_RE = re.compile(r"(?<!&)&{1,2}([^&\r\n]{1,120})&{1,2}(?!&)")
+MALFORMED_MEME_MARKER_RE = re.compile(
+    r"(?<!&)(?:"
+    r"&&\s*(?P<open_category>[A-Za-z_][A-Za-z0-9_]{1,32})\s*:[^&\r\n]{0,120}(?:\|\|\||$)"
+    r"|(?:^|[\s\[\(])(?P<close_category>[A-Za-z_][A-Za-z0-9_]{1,32})\s*:[^&\r\n]{0,120}&&"
+    r")(?!&)"
+)
+INTERNAL_SENTINEL_RE = re.compile(r"\[\[[A-Z][A-Z0-9_:\-]{2,}\]\]")
+INTERNAL_XML_TAG_RE = re.compile(
+    r"<\s*/?\s*(?:tool_call|tool_name|tool|json|name|param|parameter|function|function_call|output|assistant_message|messages)\b[^>]*>",
+    re.IGNORECASE,
+)
+INTERNAL_JSON_ROLE_RE = re.compile(r'"role"\s*:\s*"(?:system|assistant|user)"')
+INTERNAL_JSON_MESSAGES_RE = re.compile(r'"messages"\s*:\s*\[')
+INTERNAL_JSON_CONTENT_RE = re.compile(r'"content"\s*:\s*"')
+INTERNAL_JSON_KEY_RE = re.compile(
+    r'^\s*"(?:role|content|messages|message_type|task_name|task|prompt|text)"\s*:',
+    re.IGNORECASE,
+)
+INTERNAL_LINE_ONLY_RE = re.compile(r'^\s*(?:[{}\[\]],?|</?[^>]+>)\s*$')
+INTERNAL_MARKERS = (
+    "SYSTEM_REMINDER",
+    "FINAL_ACTION_OUTPUT_REMINDER",
+    "ActionDecision",
+    "runtime_context",
+    "prompt_cache",
+    "cached_tokens",
+    "prefix_rebuild",
+    "internal_only_not_visible",
+    "Current Chat context is:",
+    "[system]",
+    "STICKER_PROCESSED_USER_INPUT",
+    "SOUL_TASK_ANIMATION",
+    "MEMORIZATION_INTENTS",
+    "run_background_process",
+    "vqa_analysis",
+)
 
 
 @dataclass
@@ -143,6 +179,19 @@ def parse_and_validate_main_output(raw_output: str, is_cold_context: bool = Fals
         return ProtocolResult(
             status="strict_parse_error",
             errors=["模型输出为空，必须输出 WAIT、ENTER_CHAT: 文本或自然语言回复。"],
+        )
+
+    if contains_internal_visible_protocol(text):
+        return ProtocolResult(
+            status="internal_protocol_leak",
+            errors=["模型输出包含内部协议、调试结构或系统标记，不能作为用户可见聊天发送。"],
+            raw_data={"protocol": "lightweight_text", "raw_output": raw_output},
+        )
+    if contains_malformed_visible_meme_marker(text):
+        return ProtocolResult(
+            status="internal_protocol_leak",
+            errors=["模型输出包含畸形表情占位标记，不能作为用户可见聊天发送。"],
+            raw_data={"protocol": "lightweight_text", "raw_output": raw_output},
         )
 
     if _looks_like_json_output(text):
@@ -331,6 +380,12 @@ def validate_protocol(decision: ActionDecision) -> list[str]:
         if item.type == SendItemType.TEXT:
             if any(prefix in content for prefix in PROTOCOL_PREFIXES):
                 errors.append(f"第 {index + 1} 个 text item 不能包含内部协议串。")
+            if contains_internal_visible_protocol(content):
+                errors.append(f"第 {index + 1} 个 text item 不能包含内部协议、调试结构或系统标记。")
+            if contains_visible_meme_marker(content):
+                errors.append(f"第 {index + 1} 个 text item 不能残留表情占位标记。")
+            if contains_malformed_visible_meme_marker(content):
+                errors.append(f"第 {index + 1} 个 text item 不能残留畸形表情占位标记。")
             continue
 
         if item.type == SendItemType.MEME:
@@ -505,6 +560,12 @@ def _validate_raw_shape(data: dict):
             if item_key == "text":
                 if any(prefix in value for prefix in PROTOCOL_PREFIXES):
                     raise ValueError(f"items[{index}].text 不能包含内部协议串。")
+                if contains_internal_visible_protocol(value):
+                    raise ValueError(f"items[{index}].text 不能包含内部协议、调试结构或系统标记。")
+                if contains_visible_meme_marker(value):
+                    raise ValueError(f"items[{index}].text 不能残留表情占位标记。")
+                if contains_malformed_visible_meme_marker(value):
+                    raise ValueError(f"items[{index}].text 不能残留畸形表情占位标记。")
                 continue
 
             if item_key == "meme":
@@ -536,3 +597,46 @@ def _parse_search_meme_content(content: str) -> Optional[tuple[str, str]]:
 
 def _strip_optional_prefix(content: str, prefix: str) -> str:
     return content[len(prefix):].strip() if content.startswith(prefix) else content.strip()
+
+
+def contains_visible_meme_marker(text: str) -> bool:
+    for match in MEME_MARKER_RE.finditer(text or ""):
+        if _parse_marker_body(match.group(1)):
+            return True
+    return False
+
+
+def contains_malformed_visible_meme_marker(text: str) -> bool:
+    for match in MALFORMED_MEME_MARKER_RE.finditer(text or ""):
+        category = match.group("open_category") or match.group("close_category")
+        if category in VALID_MEME_CATEGORIES:
+            return True
+    return False
+
+
+def contains_internal_visible_protocol(text: str) -> bool:
+    content = text or ""
+    if not content.strip():
+        return False
+
+    if INTERNAL_SENTINEL_RE.search(content):
+        return True
+    if INTERNAL_XML_TAG_RE.search(content):
+        return True
+    if INTERNAL_JSON_MESSAGES_RE.search(content):
+        return True
+    if INTERNAL_JSON_ROLE_RE.search(content) and INTERNAL_JSON_CONTENT_RE.search(content):
+        return True
+    if INTERNAL_JSON_KEY_RE.search(content.strip()):
+        return True
+    if INTERNAL_LINE_ONLY_RE.match(content.strip()):
+        return True
+
+    for marker in INTERNAL_MARKERS:
+        if marker in content:
+            return True
+
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if lines and sum(1 for line in lines if INTERNAL_LINE_ONLY_RE.match(line)) >= 2:
+        return True
+    return False
