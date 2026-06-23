@@ -268,6 +268,8 @@ class PromptAppendOnlyTest(unittest.TestCase):
             self.assertEqual(reminder_payload["message_type"], "SYSTEM_REMINDER")
             self.assertEqual(reminder_payload["visibility"], "internal_only_not_visible_to_user")
             self.assertTrue(any("不要每轮都用问句结尾" in rule for rule in reminder_payload["rules"]))
+            self.assertTrue(any("有趣有网感" in rule for rule in reminder_payload["rules"]))
+            self.assertTrue(any("非必要不使用“😂”" in rule for rule in reminder_payload["rules"]))
             self.assertTrue(any("&&category:keywords&&" in rule for rule in reminder_payload["rules"]))
             self.assertTrue(any("不要输出 JSON" in rule for rule in reminder_payload["rules"]))
 
@@ -414,7 +416,7 @@ class PromptAppendOnlyTest(unittest.TestCase):
     def test_reasoning_content_rescue_blocks_obvious_cot_text(self):
         async def scenario():
             graph = CompanionGraph(
-                FakeReasoningEnvelopeLLM(raw="用户说在吗，我需要先判断是否回复。最终输出：我在呢"),
+                FakeReasoningEnvelopeLLM(raw="用户说在吗，我需要先判断是否回复。应该轻轻接住。"),
                 FakeMemory(),
                 FakeMemeCatalog(),
             )
@@ -439,6 +441,77 @@ class PromptAppendOnlyTest(unittest.TestCase):
             self.assertEqual(decision_state["decision"].action, Action.LIGHT_ACK)
             self.assertEqual(decision_state["decision"].text_bubbles(), ["嗯"])
             self.assertEqual(graph.get_prompt_observability()["raw_output_source"], "content_empty")
+
+        asyncio.run(scenario())
+
+    def test_reasoning_content_rescue_extracts_labeled_visible_output(self):
+        async def scenario():
+            graph = CompanionGraph(
+                FakeReasoningEnvelopeLLM(raw="用户说在吗，我需要先判断是否回复。最终输出：我在呢"),
+                FakeMemory(),
+                FakeMemeCatalog(),
+            )
+            ctx = SimpleNamespace(
+                gate=self._gate(msg_index=1, age="unknown"),
+                snapshot=ConversationSnapshot(
+                    snapshot_id=1,
+                    buffer_version=1,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e1",
+                            "event_type": "message.text",
+                            "text": "在吗",
+                        }
+                    ],
+                ),
+            )
+            state = await graph._build_context({"ctx": ctx})
+            decision_state = await graph._call_llm_for_decision(state)
+
+            self.assertEqual(decision_state["decision"].action, Action.REPLY)
+            self.assertEqual(decision_state["decision"].text_bubbles(), ["我在呢"])
+            self.assertEqual(graph.get_prompt_observability()["raw_output_source"], "reasoning_content_rescue")
+
+        asyncio.run(scenario())
+
+    def test_reasoning_content_rescue_extracts_visible_tail_with_meme_marker(self):
+        async def scenario():
+            graph = CompanionGraph(
+                FakeReasoningEnvelopeLLM(
+                    raw=(
+                        '用户问"你在干嘛呢"，这是一个简单的询问。我应该用轻松的方式回应。）\n\n'
+                        "在陪你聊天呀\n"
+                        "&&smiling:smile&&\n\n"
+                        "你呢 中午吃了什么<tool_call>>"
+                    )
+                ),
+                FakeMemory(),
+                FakeMemeCatalog(),
+            )
+            ctx = SimpleNamespace(
+                gate=self._gate(msg_index=1, age="unknown"),
+                snapshot=ConversationSnapshot(
+                    snapshot_id=1,
+                    buffer_version=1,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e1",
+                            "event_type": "message.text",
+                            "text": "你在干嘛呢",
+                        }
+                    ],
+                ),
+            )
+            state = await graph._build_context({"ctx": ctx})
+            decision_state = await graph._call_llm_for_decision(state)
+            decision = decision_state["decision"]
+
+            self.assertEqual(decision.action, Action.REACT)
+            self.assertEqual(decision.text_bubbles(), ["在陪你聊天呀", "你呢 中午吃了什么"])
+            self.assertEqual(decision.search_meme_items()[0].harness_value(), "smiling:smile")
+            self.assertEqual(graph.get_prompt_observability()["raw_output_source"], "reasoning_content_rescue")
 
         asyncio.run(scenario())
 
@@ -654,6 +727,19 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertNotEqual(client.cache_session_id, old_session_id)
         self.assertNotEqual(client.get_transcript_identity(), old_identity)
 
+    def test_llm_client_explicitly_disables_thinking_when_configured_off(self):
+        client = LLMClient(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            thinking_enabled=False,
+        )
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = client._build_kwargs(messages, temperature=1.5, max_tokens=None, stream=False)
+
+        self.assertEqual(kwargs["temperature"], 1.5)
+        self.assertEqual(kwargs["extra_body"]["thinking"], {"type": "disabled"})
+
     def test_repeated_buffer_event_is_not_duplicated(self):
         async def scenario():
             graph = CompanionGraph(FakeLLM(), FakeMemory(), FakeMemeCatalog())
@@ -755,6 +841,9 @@ class PromptAppendOnlyTest(unittest.TestCase):
             self.assertNotIn('"action": "WAIT"', messages[0]["content"])
             self.assertIn("不常见的陌生的名词", messages[0]["content"])
             self.assertIn("根据知识库分析一下用户为什么会提到这个陌生名词", messages[0]["content"])
+            self.assertIn("你是一个有趣、有网感的人", messages[0]["content"])
+            self.assertIn("也可以顺着联想、玩梗、轻轻岔开或发散接话", messages[0]["content"])
+            self.assertIn("非必要不使用“😂”", messages[0]["content"])
             self.assertEqual(self._count_content(messages, "早。"), 1)
             self.assertEqual(self._count_content(messages, "早"), 1)
 

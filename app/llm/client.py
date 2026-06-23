@@ -25,7 +25,7 @@ class LLMClient:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
-        thinking_enabled: bool = False,
+        thinking_enabled: bool = True,
         temperature: Optional[float] = None,
         cache_affinity_enabled: bool = True,
         cache_session_id: Optional[str] = None,
@@ -75,6 +75,7 @@ class LLMClient:
                 "reasoning_effort": "high",
             }
         else:
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
             kwargs["temperature"] = temperature
         if self.cache_affinity_enabled:
             kwargs["extra_headers"] = self._cache_affinity_headers()

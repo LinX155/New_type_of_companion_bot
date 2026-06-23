@@ -72,21 +72,85 @@ REASONING_RESCUE_BLOCKLIST = (
 )
 
 
-def _looks_like_rescuable_reasoning_output(raw_output: str) -> bool:
-    text = (raw_output or "").strip()
-    if not text or len(text) > 260:
-        return False
-    if text.count("\n") > 2:
-        return False
+REASONING_VISIBLE_OUTPUT_LABEL_RE = re.compile(
+    r"(?:最终输出|最终回复|正式回复|回复内容|可见回复|final\s*(?:answer|output|reply))\s*[:：]\s*",
+    re.IGNORECASE,
+)
 
-    compact_lower = re.sub(r"\s+", "", text.lower())
-    spaced_lower = text.lower()
+REASONING_TOOL_MARKER_RE = re.compile(r"</?tool_call[^>\n]*>+")
+
+
+def _clean_reasoning_rescue_text(raw_output: str) -> str:
+    text = (raw_output or "").replace("```", "").strip()
+    text = REASONING_TOOL_MARKER_RE.sub("", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _contains_reasoning_rescue_marker(text: str) -> bool:
+    compact_lower = re.sub(r"\s+", "", (text or "").lower())
+    spaced_lower = (text or "").lower()
     for marker in REASONING_RESCUE_BLOCKLIST:
         marker_lower = marker.lower()
         if marker_lower in compact_lower or marker_lower in spaced_lower:
-            return False
+            return True
+    return False
+
+
+def _looks_like_rescuable_reasoning_output(raw_output: str) -> bool:
+    text = _clean_reasoning_rescue_text(raw_output)
+    if not text or len(text) > 520:
+        return False
+    if text.count("\n") > 5:
+        return False
+
+    if _contains_reasoning_rescue_marker(text):
+        return False
 
     return True
+
+
+def _extract_rescuable_reasoning_output(raw_output: str) -> Optional[str]:
+    text = _clean_reasoning_rescue_text(raw_output)
+    if not text:
+        return None
+
+    candidates: list[str] = []
+
+    label_matches = list(REASONING_VISIBLE_OUTPUT_LABEL_RE.finditer(text))
+    if label_matches:
+        candidates.append(text[label_matches[-1].end():].strip())
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    visible_tail: list[str] = []
+    for line in reversed(lines):
+        labeled = REASONING_VISIBLE_OUTPUT_LABEL_RE.search(line)
+        if labeled:
+            suffix = line[labeled.end():].strip()
+            if suffix:
+                visible_tail.insert(0, suffix)
+            break
+        if _contains_reasoning_rescue_marker(line):
+            break
+        visible_tail.insert(0, line)
+        if len(visible_tail) >= 6:
+            break
+    if visible_tail:
+        candidates.append("\n".join(visible_tail))
+
+    candidates.append(text)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate = _clean_reasoning_rescue_text(candidate)
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        result = parse_and_validate_main_output(candidate)
+        if result.ok and _looks_like_rescuable_reasoning_output(candidate):
+            return candidate
+
+    return None
 
 
 class GraphState(TypedDict, total=False):
@@ -854,10 +918,9 @@ class CompanionGraph:
 
         reasoning_content = envelope.reasoning_content or ""
         if reasoning_content.strip():
-            result = parse_and_validate_main_output(reasoning_content)
-            if result.ok:
-                if _looks_like_rescuable_reasoning_output(reasoning_content):
-                    return reasoning_content, "reasoning_content_rescue"
+            rescued = _extract_rescuable_reasoning_output(reasoning_content)
+            if rescued:
+                return rescued, "reasoning_content_rescue"
 
         return content, "content_empty"
 

@@ -152,7 +152,7 @@ def _load_default_llm_config() -> dict:
         config["base_url"] = _persisted["base_url"]
     if _persisted.get("model"):
         config["model"] = _persisted["model"]
-    config["thinking_enabled"] = _persisted.get("thinking_enabled", False)
+    config["thinking_enabled"] = _persisted.get("thinking_enabled", True)
     if "temperature" in _persisted:
         config["temperature"] = _persisted.get("temperature")
     config["temperature"] = _normalize_temperature_for_provider(
@@ -196,7 +196,7 @@ class ApiConfig(BaseModel):
     api_key: str
     base_url: str
     model: str
-    thinking_enabled: bool = False
+    thinking_enabled: bool = True
     temperature: float = DEFAULT_TEMPERATURE
 
 

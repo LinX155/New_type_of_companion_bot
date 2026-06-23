@@ -16,7 +16,7 @@ _DEFAULTS = {
     "api_key": "",
     "base_url": "",
     "model": "",
-    "thinking_enabled": False,
+    "thinking_enabled": True,
     "hot_duration_minutes": 30,
     "memory_analysis_day": {"hour": 13, "minute": 0},
     "memory_analysis_night": {"hour": 19, "minute": 0},
