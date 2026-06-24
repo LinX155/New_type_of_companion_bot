@@ -30,6 +30,47 @@ class FakeLLM:
         return None
 
 
+class FakeCompletionEndpoint:
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if not self.outcomes:
+            raise AssertionError("unexpected LLM request")
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+class FakeOpenAIBackedLLMClient(LLMClient):
+    def __init__(self, endpoint, **kwargs):
+        self.endpoint = endpoint
+        self.get_client_calls = 0
+        super().__init__(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            **kwargs,
+        )
+
+    def _get_client(self):
+        self.get_client_calls += 1
+        return SimpleNamespace(chat=SimpleNamespace(completions=self.endpoint))
+
+
+class APIConnectionError(Exception):
+    pass
+
+
+class FakeStatusError(Exception):
+    def __init__(self, message, status_code):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class FailIfCalledLLM(FakeLLM):
     async def chat_completion(self, messages, temperature=0.7, stream=False):
         raise AssertionError("repair LLM should not be called for natural visible text")
@@ -791,6 +832,77 @@ class PromptAppendOnlyTest(unittest.TestCase):
         client.update_config(model="test-model-2")
         self.assertNotEqual(client.cache_session_id, old_session_id)
         self.assertNotEqual(client.get_transcript_identity(), old_identity)
+
+    def test_llm_client_retries_transient_connection_errors(self):
+        async def scenario():
+            endpoint = FakeCompletionEndpoint(APIConnectionError("Connection error."), "ok")
+            client = FakeOpenAIBackedLLMClient(
+                endpoint,
+                thinking_enabled=True,
+                transient_retry_delays=[0],
+            )
+
+            result = await client._create_chat_completion(
+                messages=[{"role": "user", "content": "hi"}],
+                temperature=0.7,
+                max_tokens=None,
+                stream=False,
+            )
+
+            self.assertEqual(result, "ok")
+            self.assertEqual(len(endpoint.calls), 2)
+            self.assertIn("prompt_cache_key", endpoint.calls[0])
+            self.assertIn("prompt_cache_key", endpoint.calls[1])
+            self.assertGreaterEqual(client.get_client_calls, 2)
+
+        asyncio.run(scenario())
+
+    def test_llm_client_does_not_retry_non_transient_bad_request(self):
+        async def scenario():
+            endpoint = FakeCompletionEndpoint(FakeStatusError("bad request", 400))
+            client = FakeOpenAIBackedLLMClient(
+                endpoint,
+                thinking_enabled=True,
+                transient_retry_delays=[0],
+            )
+
+            with self.assertRaises(FakeStatusError):
+                await client._create_chat_completion(
+                    messages=[{"role": "user", "content": "hi"}],
+                    temperature=0.7,
+                    max_tokens=None,
+                    stream=False,
+                )
+
+            self.assertEqual(len(endpoint.calls), 1)
+
+        asyncio.run(scenario())
+
+    def test_llm_client_reports_exhausted_transient_retries(self):
+        async def scenario():
+            endpoint = FakeCompletionEndpoint(
+                APIConnectionError("Connection error."),
+                APIConnectionError("Connection error."),
+            )
+            client = FakeOpenAIBackedLLMClient(
+                endpoint,
+                thinking_enabled=True,
+                transient_retry_delays=[0],
+            )
+
+            with self.assertRaises(RuntimeError) as raised:
+                await client._create_chat_completion(
+                    messages=[{"role": "user", "content": "hi"}],
+                    temperature=0.7,
+                    max_tokens=None,
+                    stream=False,
+                )
+
+            self.assertIn("Connection error.", str(raised.exception))
+            self.assertIn("after 2 attempts", str(raised.exception))
+            self.assertEqual(len(endpoint.calls), 2)
+
+        asyncio.run(scenario())
 
     def test_llm_client_explicitly_disables_thinking_when_configured_off(self):
         client = LLMClient(

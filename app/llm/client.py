@@ -1,15 +1,44 @@
+import asyncio
 import hashlib
 import json
 import os
 import uuid
 from dataclasses import dataclass
-from typing import Any, List, Dict, Optional, AsyncGenerator
+from typing import Any, List, Dict, Optional, AsyncGenerator, Sequence
 from openai import AsyncOpenAI
 
 from app.core.provider_identity import is_valid_provider_user_id, provider_user_id_hash
 
 
 DEFAULT_TEMPERATURE = 1.0
+DEFAULT_TRANSIENT_RETRY_DELAYS = (1.0, 3.0, 8.0)
+TRANSIENT_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504, 529}
+TRANSIENT_ERROR_CLASS_MARKERS = (
+    "apiconnectionerror",
+    "apitimeouterror",
+    "connectionerror",
+    "connecterror",
+    "connecttimeout",
+    "networkerror",
+    "pooltimeout",
+    "protocolerror",
+    "readtimeout",
+    "remoteprotocolerror",
+    "timeouterror",
+)
+TRANSIENT_ERROR_MESSAGE_MARKERS = (
+    "connection aborted",
+    "connection error",
+    "connection reset",
+    "connection refused",
+    "connection timeout",
+    "connect timeout",
+    "remote protocol error",
+    "server disconnected",
+    "temporarily unavailable",
+    "timed out",
+    "timeout",
+)
 
 
 @dataclass
@@ -32,6 +61,7 @@ class LLMClient:
         cache_affinity_enabled: bool = True,
         cache_session_id: Optional[str] = None,
         provider_user_id: Optional[str] = None,
+        transient_retry_delays: Optional[Sequence[float]] = None,
     ):
         self.api_key = api_key or os.getenv("LLM_API_KEY", "")
         self.base_url = base_url or os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
@@ -45,6 +75,7 @@ class LLMClient:
         self.provider_user_id = self._normalize_provider_user_id(
             provider_user_id if provider_user_id is not None else os.getenv("LLM_PROVIDER_USER_ID")
         )
+        self.transient_retry_delays = self._normalize_retry_delays(transient_retry_delays)
         self._prompt_cache_key_disabled_reason: Optional[str] = None
         self._client: Optional[AsyncOpenAI] = None
         self._last_usage: Optional[dict] = None
@@ -93,6 +124,25 @@ class LLMClient:
                 kwargs["prompt_cache_key"] = self._prompt_cache_key()
         return kwargs
 
+    async def _create_chat_completion_once(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float,
+        max_tokens: Optional[int],
+        stream: bool,
+        include_prompt_cache_key: bool,
+    ):
+        client = self._get_client()
+        return await client.chat.completions.create(
+            **self._build_kwargs(
+                messages,
+                temperature,
+                max_tokens,
+                stream,
+                include_prompt_cache_key=include_prompt_cache_key,
+            )
+        )
+
     async def _create_chat_completion(
         self,
         messages: List[Dict[str, Any]],
@@ -100,30 +150,103 @@ class LLMClient:
         max_tokens: Optional[int],
         stream: bool,
     ):
-        client = self._get_client()
-        try:
-            return await client.chat.completions.create(
-                **self._build_kwargs(
-                    messages,
-                    temperature,
-                    max_tokens,
-                    stream,
-                    include_prompt_cache_key=True,
-                )
-            )
-        except Exception as exc:
-            if not self._should_retry_without_prompt_cache_key(exc):
-                raise
-            self._prompt_cache_key_disabled_reason = str(exc)[:300]
-            return await client.chat.completions.create(
-                **self._build_kwargs(
-                    messages,
-                    temperature,
-                    max_tokens,
-                    stream,
-                    include_prompt_cache_key=False,
-                )
-            )
+        include_prompt_cache_key = True
+        failures = 0
+
+        while True:
+            try:
+                try:
+                    return await self._create_chat_completion_once(
+                        messages,
+                        temperature,
+                        max_tokens,
+                        stream,
+                        include_prompt_cache_key=include_prompt_cache_key,
+                    )
+                except Exception as exc:
+                    if not include_prompt_cache_key or not self._should_retry_without_prompt_cache_key(exc):
+                        raise
+                    self._prompt_cache_key_disabled_reason = str(exc)[:300]
+                    include_prompt_cache_key = False
+                    return await self._create_chat_completion_once(
+                        messages,
+                        temperature,
+                        max_tokens,
+                        stream,
+                        include_prompt_cache_key=False,
+                    )
+            except Exception as exc:
+                if not self._should_retry_transient_error(exc):
+                    raise
+
+                if failures >= len(self.transient_retry_delays):
+                    raise RuntimeError(
+                        self._transient_retry_exhausted_message(exc, failures + 1)
+                    ) from exc
+
+                delay = self.transient_retry_delays[failures]
+                failures += 1
+                self._client = None
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+    def _transient_retry_exhausted_message(self, exc: Exception, attempts: int) -> str:
+        message = str(exc).strip() or exc.__class__.__name__
+        return f"{message} (LLM transient retry exhausted after {attempts} attempts)"
+
+    def _normalize_retry_delays(self, value: Optional[Sequence[float]]) -> tuple[float, ...]:
+        source = value
+        if source is None:
+            raw = os.getenv("LLM_TRANSIENT_RETRY_DELAYS")
+            if raw:
+                source = [item.strip() for item in raw.split(",")]
+        if source is None:
+            return DEFAULT_TRANSIENT_RETRY_DELAYS
+
+        delays: list[float] = []
+        for item in source:
+            try:
+                delay = float(item)
+            except (TypeError, ValueError):
+                continue
+            if delay >= 0:
+                delays.append(delay)
+        return tuple(delays)
+
+    def _should_retry_transient_error(self, exc: Exception) -> bool:
+        status_code = self._status_code_from_exception(exc)
+        if status_code in TRANSIENT_STATUS_CODES:
+            return True
+        if status_code is not None and 400 <= status_code < 500:
+            return False
+
+        class_names = " ".join(self._exception_class_names(exc))
+        if any(marker in class_names for marker in TRANSIENT_ERROR_CLASS_MARKERS):
+            return True
+
+        message = str(exc).lower()
+        return any(marker in message for marker in TRANSIENT_ERROR_MESSAGE_MARKERS)
+
+    def _exception_class_names(self, exc: Exception) -> list[str]:
+        names: list[str] = []
+        seen: set[int] = set()
+        current: Optional[BaseException] = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            names.append(current.__class__.__name__.lower())
+            current = current.__cause__ or current.__context__
+        return names
+
+    def _status_code_from_exception(self, exc: Exception) -> Optional[int]:
+        for candidate in (exc, getattr(exc, "response", None)):
+            value = getattr(candidate, "status_code", None)
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return None
 
     async def chat_completion(
         self,
