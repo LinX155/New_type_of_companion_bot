@@ -311,6 +311,17 @@ class EventGate:
         self.state.buffer_version = version
         return not events and self.state.status == ChatStatus.COLD
 
+    async def record_non_chat_user_activity(self, event: ChatEvent) -> dict:
+        """Record a user-side non-chat action without buffering it for the main LLM."""
+        self.clear_user_composing(event, reason="non_chat_user_activity")
+        await self.maybe_exit_hot()
+        self.state.last_user_message_at = event.timestamp
+        async with self._pending_job_lock:
+            has_pending = self._pending_job_id is not None
+        if has_pending:
+            self._mark_current_job_stale()
+        return {"handled": True, "type": "non_chat_user_activity", "pending": has_pending}
+
     async def is_active_message_job_current(self, job_id: str) -> bool:
         if self.is_job_stale(job_id) or self.is_job_sent(job_id):
             return False

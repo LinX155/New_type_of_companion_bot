@@ -27,8 +27,7 @@ _DEFAULTS = {
         "hour": 10,
         "minute": 0,
         "daily_limit": 1,
-        "quiet_start_hour": 0,
-        "quiet_end_hour": 9,
+        "sessions": {},
     },
 }
 

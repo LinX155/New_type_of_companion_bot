@@ -20,6 +20,14 @@ from ..active.messages import (
     parse_active_decision,
     select_pending_candidate,
 )
+from ..active.settings import (
+    ACTIVE_SETTING_NONE,
+    fallback_active_message_setting_from_text,
+    format_active_message_setting_response,
+    looks_like_active_message_setting_request,
+    normalize_active_message_setting,
+    parse_active_message_setting_output,
+)
 from ..core.event_gate import EventGate, ProcessContext, USER_COMPOSING_MAX_BLOCK_SECONDS
 from ..core.events import ChatEvent, EventType
 from ..core.decisions import Action, ActionDecision, SendItem, SendItemType
@@ -48,8 +56,8 @@ from ..core.sessions import (
 from ..core.state import ChatStatus
 from ..core.settings import load_settings, save_settings
 from ..llm.client import LLMClient
-from ..llm.prompts import build_active_message_messages
-from ..memory.files import MemoryFileManager
+from ..llm.prompts import build_active_message_messages, build_active_message_setting_messages
+from ..memory.files import MemoryFileManager, TOMORROW_TOPICS_TEMPLATE
 from ..memes.catalog import MemeCatalog
 from ..memes.steal import MemeStealAnalyzer, MemeStealSaver
 from ..scheduler.jobs import SchedulerManager
@@ -200,8 +208,7 @@ ACTIVE_MESSAGE_DEFAULTS = {
     "hour": 10,
     "minute": 0,
     "daily_limit": 1,
-    "quiet_start_hour": 0,
-    "quiet_end_hour": 9,
+    "sessions": {},
 }
 
 
@@ -245,8 +252,7 @@ class ActiveMessageConfig(BaseModel):
     hour: int = 10
     minute: int = 0
     daily_limit: int = 1
-    quiet_start_hour: int = 0
-    quiet_end_hour: int = 9
+    sessions: Optional[dict] = None
 
 
 class ContextCheckpointConfig(BaseModel):
@@ -305,10 +311,10 @@ def init_gate():
             if isinstance(cfg, dict):
                 scheduler_manager.update_schedule(job_id, cfg.get("hour"), cfg.get("minute"))
         active_cfg = _normalize_active_message_config(_persisted.get("active_message"))
-        scheduler_manager.update_schedule("active_message", active_cfg["hour"], active_cfg["minute"])
-        scheduler_manager.set_active_message_callback(run_active_messages_for_all_sessions)
+        scheduler_manager.set_active_message_callback(run_scheduled_active_messages)
         scheduler_manager.set_session_ids_provider(_scheduler_session_ids)
         scheduler_manager.set_context_checkpoint_callback(_apply_context_checkpoint_to_runtime)
+        _refresh_active_message_jobs(active_cfg)
         scheduler_manager.start()
     elif media_job_queue:
         media_job_queue.start()
@@ -356,6 +362,17 @@ def _apply_context_checkpoint_to_runtime(session_id: str, checkpoint_text: str, 
     runtime.graph.load_conversation_context(checkpoint_text, history)
 
 
+def _refresh_active_message_jobs(config: Optional[dict] = None, persist: bool = True) -> dict:
+    normalized = _normalize_active_message_config(
+        config if config is not None else load_settings().get("active_message")
+    )
+    scheduler_manager.update_schedule("active_message", normalized["hour"], normalized["minute"])
+    refreshed, changed = scheduler_manager.refresh_active_message_jobs(normalized)
+    if changed and persist:
+        save_settings({"active_message": refreshed})
+    return refreshed
+
+
 def _session_id_from_query(session_id: Optional[str]) -> str:
     return webui_session_id(session_id)
 
@@ -388,6 +405,10 @@ def _list_sessions() -> list[dict]:
     if runtime_manager:
         for sid in runtime_manager.active_session_ids():
             add(sid, active_runtime=True)
+
+    active_cfg = _normalize_active_message_config(load_settings().get("active_message"))
+    for sid in (active_cfg.get("sessions") or {}):
+        add(sid)
 
     db = next(get_db())
     try:
@@ -1422,6 +1443,11 @@ async def send_message(msg: ChatMessage):
         raw={"source": "webui"},
     )
 
+    if event.event_type == EventType.TEXT:
+        active_setting_result = await _handle_active_message_setting_text_event(event)
+        if active_setting_result:
+            return active_setting_result
+
     _record_incoming_event(event)
     await _emit_conversation_changed("incoming_event", event)
 
@@ -1637,6 +1663,115 @@ def _safe_json_object(text: Optional[str]) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+async def _handle_active_message_setting_text_event(event: ChatEvent) -> Optional[dict]:
+    setting = await _extract_active_message_setting(event.text or "", event.session_id)
+    if setting["type"] == "none":
+        return None
+
+    runtime = _runtime_for_event(event)
+    await runtime.gate.record_non_chat_user_activity(event)
+    _record_active_message_setting_user_event(event)
+    await _emit_conversation_changed("incoming_event", event)
+
+    success, response_text = _apply_active_message_setting(event.session_id, setting)
+    runtime.gate.record_command("active_message.setting", "success" if success else "error")
+    await _record_command_response(event.session_id, "active_message.setting", response_text, success)
+    await _emit_message({
+        "type": "assistant_message",
+        "session_id": event.session_id,
+        "action": "ACTIVE_MESSAGE_SETTING",
+        "text": response_text,
+        "content": response_text,
+        "item_type": "text",
+        "visible": True,
+        "is_meme": False,
+        "meme_path": None,
+        **_message_target_from_event(event),
+    })
+    await _emit_conversation_changed("assistant_command_response", session_id=event.session_id)
+    return {
+        "handled": True,
+        "type": "active_message_setting",
+        "active_message_setting_updated": success,
+        "response": response_text,
+    }
+
+
+async def _extract_active_message_setting(text: str, session_id: str) -> dict:
+    now = datetime.now()
+    if not looks_like_active_message_setting_request(text):
+        return dict(ACTIVE_SETTING_NONE)
+
+    llm = _internal_llm_for_session(session_id)
+    if getattr(llm, "api_key", ""):
+        try:
+            messages = build_active_message_setting_messages(
+                content=text,
+                current_time=now.strftime("%Y-%m-%d %H:%M"),
+            )
+            raw = await llm.chat_completion(messages=messages, temperature=0.0)
+            setting = parse_active_message_setting_output(raw, now=now)
+            if setting["type"] != "none":
+                return setting
+        except Exception as exc:
+            print(f"[active-message-setting] LLM extraction failed, fallback to local parse: {exc}")
+
+    return fallback_active_message_setting_from_text(text, now=now)
+
+
+def _apply_active_message_setting(session_id: str, setting: dict) -> tuple[bool, str]:
+    normalized = normalize_active_message_setting(setting)
+    if normalized["type"] == "none":
+        return False, "这条我先不改主动消息时间。"
+
+    sid = normalize_session_id(session_id or DEFAULT_SESSION_ID)
+    config = _normalize_active_message_config(load_settings().get("active_message"))
+    sessions = dict(config.get("sessions") or {})
+    session_cfg = dict(sessions.get(sid) or {})
+    if normalized["type"] == "next":
+        session_cfg["next_active_at"] = normalized["time"]
+    elif normalized["type"] == "daily":
+        session_cfg["daily_time"] = normalized["time"]
+    sessions[sid] = session_cfg
+    config["sessions"] = sessions
+
+    if not save_settings({"active_message": config}):
+        return False, "主动消息时间保存失败。"
+    _refresh_active_message_jobs(config)
+    return True, format_active_message_setting_response(normalized)
+
+
+def _record_active_message_setting_user_event(event: ChatEvent):
+    db = next(get_db())
+    try:
+        session_id = normalize_session_id(event.session_id or DEFAULT_SESSION_ID)
+        conv = ConversationEvent(
+            session_id=session_id,
+            event_type="user_command",
+            text=event.text,
+            is_visible=True,
+            action="active_message.setting",
+        )
+        db.add(conv)
+        raw = RawChatLog(
+            event_id=event.event_id,
+            session_id=session_id,
+            event_type="active_message.setting_input",
+            platform=event.platform,
+            user_id=event.user_id,
+            input_text=event.text,
+            raw_payload=_json_dumps(_event_payload(event)),
+            action="active_message.setting",
+            status="received",
+        )
+        db.add(raw)
+        db.commit()
+    except Exception as e:
+        print(f"DB error: {e}")
+    finally:
+        db.close()
+
+
 async def handle_onebot_payload(payload: dict) -> None:
     event = parse_onebot_event(payload)
     if not event:
@@ -1649,6 +1784,11 @@ async def handle_onebot_payload(payload: dict) -> None:
         if event_type != event.event_type:
             event = event.model_copy(update={"event_type": event_type})
     runtime = _runtime_for_event(event)
+
+    if event.event_type == EventType.TEXT:
+        active_setting_result = await _handle_active_message_setting_text_event(event)
+        if active_setting_result:
+            return
 
     _record_incoming_event(event)
     await _emit_conversation_changed("incoming_event", event)
@@ -1676,7 +1816,14 @@ async def _handle_command_event(event: ChatEvent, result: Optional[dict] = None)
         action_key = "command.mem"
         command = "/mem"
         try:
-            success, response_text = await _run_mem_command(text, event.session_id, target)
+            active_setting = await _extract_active_message_setting(text, event.session_id)
+            if active_setting["type"] != "none":
+                success, response_text = _apply_active_message_setting(event.session_id, active_setting)
+                action = "ACTIVE_MESSAGE_SETTING"
+                action_key = "active_message.setting"
+                command = "active_message.setting"
+            else:
+                success, response_text = await _run_mem_command(text, event.session_id, target)
         except Exception:
             await _emit_llm_finished({**target, "session_id": event.session_id}, "command_error")
             raise
@@ -1694,7 +1841,7 @@ async def _handle_command_event(event: ChatEvent, result: Optional[dict] = None)
 
     runtime = _runtime_for_event(event)
     runtime.gate.record_command(command, "success" if success else "error")
-    if success and hasattr(runtime.graph, "reset_provider_transcript"):
+    if success and action_key == "command.mem" and hasattr(runtime.graph, "reset_provider_transcript"):
         runtime.graph.reset_provider_transcript(reason=f"{action_key}_memory_updated")
     await _record_command_response(event.session_id, action_key, response_text, success)
     await _emit_llm_finished({**target, "session_id": event.session_id}, "command_response")
@@ -1711,7 +1858,12 @@ async def _handle_command_event(event: ChatEvent, result: Optional[dict] = None)
         **_message_target_from_event(event),
     })
     await _emit_conversation_changed("assistant_command_response", session_id=event.session_id)
-    return {**(result or {}), "memory_updated": success, "response": response_text}
+    return {
+        **(result or {}),
+        "memory_updated": success and action_key == "command.mem",
+        "active_message_setting_updated": success and action_key == "active_message.setting",
+        "response": response_text,
+    }
 
 
 async def _run_mem_command(text: str, session_id: str, target: Optional[dict] = None) -> tuple[bool, str]:
@@ -2058,7 +2210,12 @@ def _record_assistant_send(
         db.close()
 
 
-async def run_active_message_once(manual: bool = False, session_id: Optional[str] = None) -> dict:
+async def run_active_message_once(
+    manual: bool = False,
+    session_id: Optional[str] = None,
+    scheduled_source: Optional[str] = None,
+    scheduled_time: Optional[str] = None,
+) -> dict:
     """执行一次主动消息检查。
 
     MVP 只做一次轻量开场：有 pending 候选、处于 COLD、无未处理输入、未超每日上限时才发送。
@@ -2075,8 +2232,18 @@ async def run_active_message_once(manual: bool = False, session_id: Optional[str
 
     if not config["enabled"]:
         return {"status": "skipped", "reason": "disabled"}
-    if not manual and _is_quiet_time(now, config):
-        return {"status": "skipped", "reason": "quiet_hours"}
+    due_status = {"due": True, "source": "manual", "time": now.strftime("%H:%M")}
+    if not manual:
+        due_status = _active_message_scheduled_status(
+            config=config,
+            session_id=sid,
+            source=scheduled_source or "global",
+            scheduled_time=scheduled_time,
+        )
+        if not due_status["due"]:
+            return {"status": "skipped", "reason": due_status["reason"], "schedule": due_status}
+        if due_status["source"] == "next" and not _clear_active_message_next_time(sid):
+            return {"status": "error", "reason": "failed_to_clear_next_active_time"}
     if _active_messages_sent_today(sid) >= config["daily_limit"]:
         return {"status": "skipped", "reason": "daily_limit"}
     if _has_unanswered_active_message(sid):
@@ -2096,6 +2263,34 @@ async def run_active_message_once(manual: bool = False, session_id: Optional[str
 
         candidate = select_pending_candidate(topics)
         if not candidate:
+            if due_status.get("source") == "next":
+                from ..core.router import ActionRouter
+                decision = ActionDecision(
+                    action=Action.REPLY,
+                    items=[SendItem(type=SendItemType.TEXT, content="到你说的时间了，我来找你一下。")],
+                )
+                routed = ActionRouter().route(decision)
+                active_items = list(routed.get("items") or [])
+                active_item = active_items[0] if active_items else None
+                _record_active_message(sid, job_id, "system:next_active_at_without_candidate", decision, routed)
+                gate.record_decision(decision)
+                await gate.finish_active_message_job(job_id, "sent")
+                if graph and routed["text"]:
+                    graph.commit_external_assistant_text(routed["text"])
+                await _emit_message({
+                    "type": "assistant_message",
+                    "session_id": sid,
+                    "action": decision.action.value,
+                    "text": routed["text"],
+                    "content": routed["text"],
+                    "item_type": active_item.type.value if active_item else "text",
+                    "visible": True,
+                    "is_meme": False,
+                    "meme_path": None,
+                    "source": "active_message",
+                    **target,
+                })
+                return {"status": "sent", "job_id": job_id, "action": decision.action.value, "schedule": due_status}
             await gate.finish_active_message_job(job_id, "dropped")
             return {"status": "skipped", "reason": "no_candidate"}
 
@@ -2170,6 +2365,7 @@ async def run_active_message_once(manual: bool = False, session_id: Optional[str
             "job_id": job_id,
             "action": decision.action.value,
             "candidate_section": candidate.section,
+            "schedule": due_status,
         }
     except Exception as e:
         await gate.finish_active_message_job(job_id, "dropped")
@@ -2179,11 +2375,50 @@ async def run_active_message_once(manual: bool = False, session_id: Optional[str
             await _emit_llm_finished(target, reason="active_message_finished")
 
 
-async def run_active_messages_for_all_sessions() -> dict:
+async def run_scheduled_active_messages(
+    session_id: Optional[str],
+    source: str,
+    scheduled_time: Optional[str],
+) -> dict:
+    if source == "global":
+        return await run_active_messages_for_global_default(scheduled_time)
+    if not session_id:
+        return {"status": "error", "reason": "missing_session_id", "source": source}
+    return await run_active_message_once(
+        manual=False,
+        session_id=session_id,
+        scheduled_source=source,
+        scheduled_time=scheduled_time,
+    )
+
+
+async def run_active_messages_for_global_default(scheduled_time: Optional[str] = None) -> dict:
+    config = _normalize_active_message_config(load_settings().get("active_message"))
     results = {}
     for sid in _scheduler_session_ids():
-        results[sid] = await run_active_message_once(manual=False, session_id=sid)
-    return {"status": "completed", "results": results}
+        if _active_message_has_user_override(config, sid):
+            results[sid] = {
+                "status": "skipped",
+                "reason": "user_override",
+                "schedule": _active_message_scheduled_status(
+                    config=config,
+                    session_id=sid,
+                    source="global",
+                    scheduled_time=scheduled_time,
+                ),
+            }
+            continue
+        results[sid] = await run_active_message_once(
+            manual=False,
+            session_id=sid,
+            scheduled_source="global",
+            scheduled_time=scheduled_time,
+        )
+    return {"status": "completed", "source": "global", "results": results}
+
+
+async def run_active_messages_for_all_sessions() -> dict:
+    return await run_active_messages_for_global_default()
 
 
 def _record_active_message(session_id: str, job_id: str, raw_output: str, decision, routed: dict):
@@ -2234,13 +2469,28 @@ def _normalize_active_message_config(config: Optional[dict]) -> dict:
         "hour": _clamp_int(merged.get("hour"), 0, 23, ACTIVE_MESSAGE_DEFAULTS["hour"]),
         "minute": _clamp_int(merged.get("minute"), 0, 59, ACTIVE_MESSAGE_DEFAULTS["minute"]),
         "daily_limit": _clamp_int(merged.get("daily_limit"), 1, 3, ACTIVE_MESSAGE_DEFAULTS["daily_limit"]),
-        "quiet_start_hour": _clamp_int(
-            merged.get("quiet_start_hour"), 0, 23, ACTIVE_MESSAGE_DEFAULTS["quiet_start_hour"]
-        ),
-        "quiet_end_hour": _clamp_int(
-            merged.get("quiet_end_hour"), 0, 23, ACTIVE_MESSAGE_DEFAULTS["quiet_end_hour"]
-        ),
+        "sessions": _normalize_active_message_sessions(merged.get("sessions")),
     }
+
+
+def _normalize_active_message_sessions(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    sessions = {}
+    for raw_sid, raw_cfg in value.items():
+        sid = normalize_session_id(str(raw_sid or ""))
+        if not sid or not isinstance(raw_cfg, dict):
+            continue
+        cfg = {}
+        daily_time = _normalize_hhmm(raw_cfg.get("daily_time"))
+        next_active_at = _normalize_active_datetime(raw_cfg.get("next_active_at"))
+        if daily_time:
+            cfg["daily_time"] = daily_time
+        if next_active_at:
+            cfg["next_active_at"] = next_active_at
+        if cfg:
+            sessions[sid] = cfg
+    return sessions
 
 
 def _clamp_int(value, min_value: int, max_value: int, default: int) -> int:
@@ -2251,15 +2501,211 @@ def _clamp_int(value, min_value: int, max_value: int, default: int) -> int:
     return max(min_value, min(max_value, parsed))
 
 
-def _is_quiet_time(now: datetime, config: dict) -> bool:
-    start = config["quiet_start_hour"]
-    end = config["quiet_end_hour"]
-    hour = now.hour
-    if start == end:
+def _normalize_hhmm(value) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value.strip())
+    if not match:
+        return None
+    return f"{int(match.group(1)):02d}:{int(match.group(2)):02d}"
+
+
+def _normalize_active_datetime(value) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def _normalize_topic_template_text(value: str) -> str:
+    return "\n".join(line.rstrip() for line in (value or "").strip().splitlines()).strip()
+
+
+def _is_non_initial_tomorrow_topics(markdown: str) -> bool:
+    normalized = _normalize_topic_template_text(markdown)
+    if not normalized:
         return False
-    if start < end:
-        return start <= hour < end
-    return hour >= start or hour < end
+    return normalized != _normalize_topic_template_text(TOMORROW_TOPICS_TEMPLATE)
+
+
+def _read_session_tomorrow_topics(session_id: str) -> str:
+    sid = normalize_session_id(session_id or DEFAULT_SESSION_ID)
+    path = Path(session_registry.session_dir(sid)) / "TOMORROW_TOPICS.md"
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception as exc:
+        print(f"[active-message-monitor] failed to read topics for {sid}: {exc}")
+        return ""
+
+
+def _active_message_next_activation_time(config: dict, session_id: str, now: datetime) -> str:
+    sid = normalize_session_id(session_id or DEFAULT_SESSION_ID)
+    session_cfg = _active_message_session_config(config, sid)
+    now_minute = now.replace(second=0, microsecond=0)
+
+    next_active_at = _normalize_active_datetime(session_cfg.get("next_active_at"))
+    if next_active_at:
+        next_dt = datetime.strptime(next_active_at, "%Y-%m-%d %H:%M")
+        if next_dt >= now_minute:
+            return next_dt.strftime("%Y-%m-%d %H:%M")
+
+    daily_time = _normalize_hhmm(session_cfg.get("daily_time")) or f"{config['hour']:02d}:{config['minute']:02d}"
+    hour, minute = [int(part) for part in daily_time.split(":", 1)]
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target < now_minute:
+        target += timedelta(days=1)
+    return target.strftime("%Y-%m-%d %H:%M")
+
+
+def _active_message_monitor_rows(config: dict, now: datetime) -> list[dict]:
+    if not config.get("enabled"):
+        return []
+
+    rows = []
+    for item in _list_sessions():
+        sid = normalize_session_id(item.get("session_id") or DEFAULT_SESSION_ID)
+        topics = _read_session_tomorrow_topics(sid)
+        if not _is_non_initial_tomorrow_topics(topics):
+            continue
+        rows.append({
+            "session_id": sid,
+            "next_time_to_activate": _active_message_next_activation_time(config, sid, now),
+        })
+    return sorted(rows, key=lambda row: row["session_id"])
+
+
+def _active_message_due_status(config: dict, session_id: str, now: datetime) -> dict:
+    sid = normalize_session_id(session_id or DEFAULT_SESSION_ID)
+    session_cfg = (config.get("sessions") or {}).get(sid) or {}
+    next_active_at = _normalize_active_datetime(session_cfg.get("next_active_at"))
+    if next_active_at:
+        due_at = datetime.strptime(next_active_at, "%Y-%m-%d %H:%M")
+        if now.replace(second=0, microsecond=0) >= due_at:
+            return {"due": True, "source": "next", "time": next_active_at}
+        return {"due": False, "reason": "not_due", "source": "next", "time": next_active_at}
+
+    daily_time = _normalize_hhmm(session_cfg.get("daily_time"))
+    source = "daily"
+    if not daily_time:
+        daily_time = f"{config['hour']:02d}:{config['minute']:02d}"
+        source = "global"
+    if now.strftime("%H:%M") == daily_time:
+        return {"due": True, "source": source, "time": daily_time}
+    return {"due": False, "reason": "not_due", "source": source, "time": daily_time}
+
+
+def _active_message_session_config(config: dict, session_id: str) -> dict:
+    sid = normalize_session_id(session_id or DEFAULT_SESSION_ID)
+    return dict((config.get("sessions") or {}).get(sid) or {})
+
+
+def _active_message_has_user_override(config: dict, session_id: str) -> bool:
+    session_cfg = _active_message_session_config(config, session_id)
+    return bool(
+        _normalize_hhmm(session_cfg.get("daily_time"))
+        or _normalize_active_datetime(session_cfg.get("next_active_at"))
+    )
+
+
+def _active_message_scheduled_status(
+    *,
+    config: dict,
+    session_id: str,
+    source: str,
+    scheduled_time: Optional[str],
+) -> dict:
+    sid = normalize_session_id(session_id or DEFAULT_SESSION_ID)
+    session_cfg = _active_message_session_config(config, sid)
+    source = source if source in {"global", "daily", "next"} else "global"
+
+    if source == "next":
+        expected_time = _normalize_active_datetime(scheduled_time)
+        configured_time = _normalize_active_datetime(session_cfg.get("next_active_at"))
+        if not expected_time or configured_time != expected_time:
+            return {
+                "due": False,
+                "reason": "stale_next_job",
+                "source": "next",
+                "time": expected_time,
+                "configured_time": configured_time,
+            }
+        return {"due": True, "source": "next", "time": expected_time}
+
+    next_active_at = _normalize_active_datetime(session_cfg.get("next_active_at"))
+    if source == "daily":
+        expected_time = _normalize_hhmm(scheduled_time)
+        configured_time = _normalize_hhmm(session_cfg.get("daily_time"))
+        if next_active_at:
+            return {
+                "due": False,
+                "reason": "next_active_time_pending",
+                "source": "daily",
+                "time": expected_time,
+                "next_active_at": next_active_at,
+            }
+        if not expected_time or configured_time != expected_time:
+            return {
+                "due": False,
+                "reason": "stale_daily_job",
+                "source": "daily",
+                "time": expected_time,
+                "configured_time": configured_time,
+            }
+        return {"due": True, "source": "daily", "time": expected_time}
+
+    configured_daily = _normalize_hhmm(session_cfg.get("daily_time"))
+    if next_active_at:
+        return {
+            "due": False,
+            "reason": "user_next_override",
+            "source": "global",
+            "time": scheduled_time,
+            "next_active_at": next_active_at,
+        }
+    if configured_daily:
+        return {
+            "due": False,
+            "reason": "user_daily_override",
+            "source": "global",
+            "time": scheduled_time,
+            "daily_time": configured_daily,
+        }
+
+    expected_time = _normalize_hhmm(scheduled_time) or f"{config['hour']:02d}:{config['minute']:02d}"
+    configured_time = f"{config['hour']:02d}:{config['minute']:02d}"
+    if expected_time != configured_time:
+        return {
+            "due": False,
+            "reason": "stale_global_job",
+            "source": "global",
+            "time": expected_time,
+            "configured_time": configured_time,
+        }
+    return {"due": True, "source": "global", "time": expected_time}
+
+
+def _clear_active_message_next_time(session_id: str) -> bool:
+    sid = normalize_session_id(session_id or DEFAULT_SESSION_ID)
+    config = _normalize_active_message_config(load_settings().get("active_message"))
+    sessions = dict(config.get("sessions") or {})
+    session_cfg = dict(sessions.get(sid) or {})
+    if "next_active_at" not in session_cfg:
+        return True
+    session_cfg.pop("next_active_at", None)
+    if session_cfg:
+        sessions[sid] = session_cfg
+    else:
+        sessions.pop(sid, None)
+    config["sessions"] = sessions
+    if not save_settings({"active_message": config}):
+        return False
+    _refresh_active_message_jobs(config)
+    return True
 
 
 def _active_messages_sent_today(session_id: str = DEFAULT_SESSION_ID) -> int:
@@ -2366,13 +2812,29 @@ async def get_active_message_config():
     return _normalize_active_message_config(load_settings().get("active_message"))
 
 
+@router.get("/api/active-message/monitor")
+async def get_active_message_monitor():
+    now = datetime.now()
+    config = _normalize_active_message_config(load_settings().get("active_message"))
+    return {
+        "enabled": config["enabled"],
+        "generated_at": now.strftime("%Y-%m-%d %H:%M"),
+        "rows": _active_message_monitor_rows(config, now),
+    }
+
+
 @router.post("/api/active-message/config")
 async def update_active_message_config(config: ActiveMessageConfig):
     init_gate()
-    normalized = _normalize_active_message_config(config.model_dump())
-    scheduler_manager.update_schedule("active_message", normalized["hour"], normalized["minute"])
-    save_settings({"active_message": normalized})
-    return {"status": "ok", "config": normalized}
+    current = _normalize_active_message_config(load_settings().get("active_message"))
+    payload = config.model_dump(exclude_none=True)
+    if "sessions" not in payload:
+        payload["sessions"] = current.get("sessions", {})
+    normalized = _normalize_active_message_config(payload)
+    if not save_settings({"active_message": normalized}):
+        return {"status": "error", "reason": "failed_to_save_settings", "config": normalized}
+    refreshed = _refresh_active_message_jobs(normalized)
+    return {"status": "ok", "config": refreshed}
 
 
 @router.get("/api/active-message/status")
@@ -2380,9 +2842,11 @@ async def get_active_message_status(session_id: Optional[str] = Query(None)):
     sid = _session_id_from_query(session_id)
     runtime = _runtime_for_session(sid)
     topics = runtime.memory.read_tomorrow_topics()
+    config = _normalize_active_message_config(load_settings().get("active_message"))
     return {
         "session_id": sid,
-        "config": _normalize_active_message_config(load_settings().get("active_message")),
+        "config": config,
+        "schedule": _active_message_due_status(config, sid, datetime.now()),
         "sent_today": _active_messages_sent_today(sid),
         "has_unanswered_active_message": _has_unanswered_active_message(sid),
         "candidates": count_candidates_by_status(topics),

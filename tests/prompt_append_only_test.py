@@ -154,6 +154,18 @@ class FakeEmptyEnvelopeLLM(FakeLLM):
         )
 
 
+class FakeSequentialEnvelopeLLM(FakeLLM):
+    def __init__(self, *envelopes):
+        self.envelopes = list(envelopes)
+        self.calls = 0
+
+    async def chat_completion_envelope(self, messages, temperature=0.7):
+        self.calls += 1
+        if not self.envelopes:
+            raise AssertionError("unexpected LLM request")
+        return self.envelopes.pop(0)
+
+
 class FakeIdentityEnvelopeLLM(FakeLLM):
     def __init__(self, identity="model-a"):
         self.identity = identity
@@ -480,6 +492,92 @@ class PromptAppendOnlyTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_empty_provider_output_retries_and_uses_retry_response(self):
+        async def scenario():
+            llm = FakeSequentialEnvelopeLLM(
+                LLMResponseEnvelope(
+                    assistant_message={"role": "assistant", "content": None},
+                    content=None,
+                    reasoning_content=None,
+                ),
+                LLMResponseEnvelope(
+                    assistant_message={"role": "assistant", "content": "我在呢"},
+                    content="我在呢",
+                    reasoning_content=None,
+                ),
+            )
+            graph = CompanionGraph(llm, FakeMemory(), FakeMemeCatalog())
+            ctx = SimpleNamespace(
+                gate=self._gate(msg_index=1, age="unknown"),
+                snapshot=ConversationSnapshot(
+                    snapshot_id=1,
+                    buffer_version=1,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e1",
+                            "event_type": "message.text",
+                            "text": "在吗",
+                        }
+                    ],
+                ),
+            )
+            state = await graph._build_context({"ctx": ctx})
+            decision_state = await graph._call_llm_for_decision(state)
+
+            self.assertEqual(llm.calls, 2)
+            self.assertEqual(decision_state["decision"].action, Action.REPLY)
+            self.assertEqual(decision_state["decision"].text_bubbles(), ["我在呢"])
+            self.assertEqual(graph.get_prompt_observability()["content_empty_retry_count"], 1)
+            self.assertEqual(graph.get_prompt_observability()["raw_output_source"], "content")
+
+        asyncio.run(scenario())
+
+    def test_empty_provider_output_retries_once_then_waits(self):
+        async def scenario():
+            llm = FakeSequentialEnvelopeLLM(
+                LLMResponseEnvelope(
+                    assistant_message={"role": "assistant", "content": None},
+                    content=None,
+                    reasoning_content=None,
+                ),
+                LLMResponseEnvelope(
+                    assistant_message={"role": "assistant", "content": None},
+                    content=None,
+                    reasoning_content=None,
+                ),
+            )
+            graph = CompanionGraph(llm, FakeMemory(), FakeMemeCatalog())
+            ctx = SimpleNamespace(
+                gate=self._gate(msg_index=1, age="unknown"),
+                snapshot=ConversationSnapshot(
+                    snapshot_id=1,
+                    buffer_version=1,
+                    status=ChatStatus.HOT,
+                    events=[
+                        {
+                            "event_id": "e1",
+                            "event_type": "message.text",
+                            "text": "在吗",
+                        }
+                    ],
+                ),
+            )
+            state = await graph._build_context({"ctx": ctx})
+            decision_state = await graph._call_llm_for_decision(state)
+
+            self.assertEqual(llm.calls, 2)
+            self.assertEqual(decision_state["decision"].action, Action.WAIT)
+            self.assertEqual(decision_state["decision"].send_items(), [])
+            self.assertEqual(graph.get_last_parsed_decision()["parse_status"], "empty_output_wait")
+            self.assertEqual(graph.get_prompt_observability()["content_empty_retry_count"], 1)
+            self.assertEqual(
+                graph.get_prompt_observability()["raw_output_source"],
+                "content_empty_after_retry",
+            )
+
+        asyncio.run(scenario())
+
     def test_reasoning_content_rescue_blocks_obvious_cot_text(self):
         async def scenario():
             graph = CompanionGraph(
@@ -505,9 +603,12 @@ class PromptAppendOnlyTest(unittest.TestCase):
             state = await graph._build_context({"ctx": ctx})
             decision_state = await graph._call_llm_for_decision(state)
 
-            self.assertEqual(decision_state["decision"].action, Action.LIGHT_ACK)
-            self.assertEqual(decision_state["decision"].text_bubbles(), ["嗯"])
-            self.assertEqual(graph.get_prompt_observability()["raw_output_source"], "content_empty")
+            self.assertEqual(decision_state["decision"].action, Action.WAIT)
+            self.assertEqual(decision_state["decision"].send_items(), [])
+            self.assertEqual(
+                graph.get_prompt_observability()["raw_output_source"],
+                "content_empty_after_retry",
+            )
 
         asyncio.run(scenario())
 
@@ -607,9 +708,12 @@ class PromptAppendOnlyTest(unittest.TestCase):
             state = await graph._build_context({"ctx": ctx})
             decision_state = await graph._call_llm_for_decision(state)
 
-            self.assertEqual(decision_state["decision"].action, Action.LIGHT_ACK)
-            self.assertEqual(decision_state["decision"].text_bubbles(), ["嗯"])
-            self.assertEqual(graph.get_prompt_observability()["raw_output_source"], "content_empty")
+            self.assertEqual(decision_state["decision"].action, Action.WAIT)
+            self.assertEqual(decision_state["decision"].send_items(), [])
+            self.assertEqual(
+                graph.get_prompt_observability()["raw_output_source"],
+                "content_empty_after_retry",
+            )
 
         asyncio.run(scenario())
 

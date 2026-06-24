@@ -3,7 +3,9 @@ from datetime import datetime, timedelta
 from typing import Awaitable, Callable, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.jobstores.base import JobLookupError
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
 from ..llm.client import LLMClient
 from ..core.settings import load_settings
@@ -34,6 +36,8 @@ MEMORY_ANALYSIS_EVENT_ROLES = {
     "assistant_text": "assistant",
     "assistant_react": "assistant",
 }
+ACTIVE_DAILY_JOB_PREFIX = "active_daily:"
+ACTIVE_NEXT_JOB_PREFIX = "active_next:"
 
 
 class SchedulerManager:
@@ -42,7 +46,7 @@ class SchedulerManager:
         self.memory = memory_manager or MemoryFileManager()
         self.llm = llm_client
         self.llm_client_factory: Optional[Callable[[str], LLMClient]] = None
-        self.active_message_callback: Optional[Callable[[], Awaitable[dict]]] = None
+        self.active_message_callback: Optional[Callable[[Optional[str], str, Optional[str]], Awaitable[dict]]] = None
         self.session_ids_provider: Optional[Callable[[], list[str]]] = None
         self.context_checkpoint_callback: Optional[Callable[[str, str, list[dict]], None]] = None
         self._job_configs = {
@@ -74,7 +78,7 @@ class SchedulerManager:
         for job_id, config in self._job_configs.items():
             self.scheduler.add_job(
                 config["func"],
-                trigger=CronTrigger(hour=config["hour"], minute=config["minute"]),
+                trigger=self._trigger_for_job(job_id, config),
                 id=job_id,
                 replace_existing=True,
             )
@@ -91,10 +95,13 @@ class SchedulerManager:
             if self.scheduler.running:
                 self.scheduler.reschedule_job(
                     job_id,
-                    trigger=CronTrigger(hour=hour, minute=minute),
+                    trigger=self._trigger_for_job(job_id, self._job_configs[job_id]),
                 )
             return True
         return False
+
+    def _trigger_for_job(self, job_id: str, config: dict):
+        return CronTrigger(hour=config["hour"], minute=config["minute"])
 
     def get_schedules(self) -> dict:
         return {
@@ -102,8 +109,102 @@ class SchedulerManager:
             for k, v in self._job_configs.items()
         }
 
-    def set_active_message_callback(self, callback: Callable[[], Awaitable[dict]]):
+    def set_active_message_callback(self, callback: Callable[[Optional[str], str, Optional[str]], Awaitable[dict]]):
         self.active_message_callback = callback
+
+    def refresh_active_message_jobs(self, config: dict) -> tuple[dict, bool]:
+        """Rebuild per-session active message jobs from persisted config."""
+        normalized = dict(config or {})
+        sessions = dict(normalized.get("sessions") or {})
+        cleaned_sessions = {}
+        changed = False
+
+        self._remove_active_message_session_jobs()
+
+        now_minute = datetime.now().replace(second=0, microsecond=0)
+        for session_id, raw_session_cfg in sessions.items():
+            session_cfg = dict(raw_session_cfg or {})
+            cleaned_cfg = {}
+
+            daily_time = self._normalize_hhmm(session_cfg.get("daily_time"))
+            next_active_at = self._normalize_active_datetime(session_cfg.get("next_active_at"))
+            next_run_at = None
+            if next_active_at:
+                parsed_next_run_at = datetime.strptime(next_active_at, "%Y-%m-%d %H:%M")
+                if parsed_next_run_at >= now_minute:
+                    next_run_at = parsed_next_run_at
+                    cleaned_cfg["next_active_at"] = next_active_at
+                else:
+                    changed = True
+
+            if daily_time:
+                cleaned_cfg["daily_time"] = daily_time
+                if normalized.get("enabled") and next_run_at is None:
+                    self._schedule_active_daily_job(session_id, daily_time)
+
+            if normalized.get("enabled") and next_run_at is not None:
+                self._schedule_active_next_job(session_id, next_active_at, next_run_at)
+
+            if cleaned_cfg:
+                cleaned_sessions[session_id] = cleaned_cfg
+            elif session_cfg:
+                changed = True
+
+        normalized["sessions"] = cleaned_sessions
+        if cleaned_sessions != sessions:
+            changed = True
+        return normalized, changed
+
+    def _remove_active_message_session_jobs(self):
+        for job in list(self.scheduler.get_jobs()):
+            if job.id.startswith(ACTIVE_DAILY_JOB_PREFIX) or job.id.startswith(ACTIVE_NEXT_JOB_PREFIX):
+                try:
+                    self.scheduler.remove_job(job.id)
+                except JobLookupError:
+                    pass
+
+    def _schedule_active_daily_job(self, session_id: str, daily_time: str):
+        hour, minute = self._parse_hhmm(daily_time)
+        self.scheduler.add_job(
+            self._run_active_message_for_session,
+            trigger=CronTrigger(hour=hour, minute=minute),
+            id=f"{ACTIVE_DAILY_JOB_PREFIX}{session_id}",
+            args=[session_id, "daily", daily_time],
+            replace_existing=True,
+        )
+
+    def _schedule_active_next_job(self, session_id: str, next_active_at: str, run_at: datetime):
+        self.scheduler.add_job(
+            self._run_active_message_for_session,
+            trigger=DateTrigger(run_date=run_at),
+            id=f"{ACTIVE_NEXT_JOB_PREFIX}{session_id}",
+            args=[session_id, "next", next_active_at],
+            replace_existing=True,
+        )
+
+    def _parse_hhmm(self, value: str) -> tuple[int, int]:
+        hour, minute = value.split(":", 1)
+        return int(hour), int(minute)
+
+    def _normalize_hhmm(self, value) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        try:
+            hour, minute = self._parse_hhmm(value.strip())
+        except (ValueError, AttributeError):
+            return None
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None
+        return f"{hour:02d}:{minute:02d}"
+
+    def _normalize_active_datetime(self, value) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M")
+        except ValueError:
+            return None
+        return parsed.strftime("%Y-%m-%d %H:%M")
 
     def set_session_ids_provider(self, callback: Callable[[], list[str]]):
         self.session_ids_provider = callback
@@ -395,12 +496,22 @@ class SchedulerManager:
             db.close()
 
     async def _run_active_message(self):
-        job_id = f"active_message_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        log_id = self._start_job(job_id, "active_message")
+        cfg = self._job_configs["active_message"]
+        expected_time = f"{cfg['hour']:02d}:{cfg['minute']:02d}"
+        await self._run_active_message_job("global", None, expected_time)
+
+    async def _run_active_message_for_session(self, session_id: str, source: str, expected_time: str):
+        await self._run_active_message_job(source, session_id, expected_time)
+
+    async def _run_active_message_job(self, source: str, session_id: Optional[str], expected_time: Optional[str]):
+        suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_part = f"_{session_id}" if session_id else ""
+        job_id = f"active_message_{source}{session_part}_{suffix}"
+        log_id = self._start_job(job_id, "active_message", session_id=session_id or "default")
         try:
             if self.active_message_callback is None:
                 raise RuntimeError("active message callback is not configured")
-            result = await self.active_message_callback()
+            result = await self.active_message_callback(session_id, source, expected_time)
             note = json.dumps(result, ensure_ascii=False)[:1000]
             status = "failed" if result.get("status") == "error" else "completed"
             self._finish_job(log_id, status, note)

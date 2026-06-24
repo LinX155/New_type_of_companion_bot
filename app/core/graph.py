@@ -308,6 +308,9 @@ class CompanionGraph:
         if result.ok and result.decision:
             return result.decision, result.status
 
+        if result.status == "strict_parse_error" and not (raw_output or "").strip():
+            return ActionDecision(action=Action.WAIT, items=None), "empty_output_wait"
+
         should_repair = self._should_attempt_json_repair(raw_output, result)
         if not should_repair:
             relaxed = self._relaxed_visible_decision(raw_output, ctx)
@@ -910,6 +913,13 @@ class CompanionGraph:
     ) -> str:
         envelope = await self._request_llm_envelope(messages, temperature)
         raw_output, raw_source = self._raw_output_from_envelope(envelope)
+        if raw_source == "content_empty":
+            retry_envelope = await self._request_llm_envelope(messages, temperature)
+            retry_output, retry_source = self._raw_output_from_envelope(retry_envelope)
+            self._last_prompt_observability["content_empty_retry_count"] = 1
+            envelope = retry_envelope
+            raw_output = retry_output
+            raw_source = retry_source if retry_source != "content_empty" else "content_empty_after_retry"
         if record_prompt_usage:
             self._record_prompt_usage(envelope=envelope, raw_output_source=raw_source)
         self._record_llm_raw_output(raw_output)
