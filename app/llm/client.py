@@ -105,14 +105,8 @@ class LLMClient:
         }
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
-        if self.thinking_enabled:
-            # 思考模式：reasoning 模型通常要求省略 temperature，并用 thinking 字段开启
-            extra_body = {
-                "thinking": {"type": "enabled"},
-                "reasoning_effort": "high",
-            }
-        else:
-            extra_body = {"thinking": {"type": "disabled"}}
+        extra_body = self._thinking_extra_body()
+        if not self.thinking_enabled:
             kwargs["temperature"] = temperature
         provider_user_id = self._provider_user_id_for_request()
         if provider_user_id:
@@ -544,7 +538,27 @@ class LLMClient:
     def _provider_user_id_for_request(self) -> Optional[str]:
         if not self.provider_user_id:
             return None
+        if self._is_minimax_provider():
+            return None
         return self.provider_user_id
+
+    def _thinking_extra_body(self) -> dict:
+        if self.thinking_enabled:
+            if self._is_minimax_provider():
+                return {
+                    "thinking": {"type": "adaptive"},
+                    "reasoning_split": True,
+                }
+            # 思考模式：reasoning 模型通常要求省略 temperature，并用 thinking 字段开启
+            return {
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": "high",
+            }
+        return {"thinking": {"type": "disabled"}}
+
+    def _is_minimax_provider(self) -> bool:
+        identity = f"{self.base_url or ''} {self.model or ''}".lower()
+        return "minimax" in identity or "minimaxi" in identity
 
 
 def json_dumps_stable(payload: dict) -> str:

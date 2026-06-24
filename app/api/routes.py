@@ -71,6 +71,7 @@ DEFAULT_SESSION_ID = WEBUI_DEFAULT_SESSION_ID
 TEMPERATURE_MIN = 0.0
 DEEPSEEK_TEMPERATURE_MAX = 2.0
 MIMO_TEMPERATURE_MAX = 1.5
+MINIMAX_TEMPERATURE_MAX = 2.0
 DEFAULT_TEMPERATURE = 1.0
 DISPLAY_SPLIT_DISABLE_ITEM_COUNT = 4
 
@@ -91,6 +92,8 @@ def _env_float(name: str, default: float) -> float:
 
 def _temperature_max_for_provider(base_url: str, model: str) -> float:
     identity = f"{base_url or ''} {model or ''}".lower()
+    if "minimax" in identity or "minimaxi" in identity:
+        return MINIMAX_TEMPERATURE_MAX
     if "xiaomimimo" in identity or "mimo" in identity:
         return MIMO_TEMPERATURE_MAX
     if "deepseek" in identity:

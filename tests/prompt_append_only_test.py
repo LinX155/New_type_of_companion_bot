@@ -13,6 +13,7 @@ from app.core.protocol import (
     parse_meme_selection_output,
 )
 from app.core.state import ChatStatus, ColdStartMeta, ConversationSnapshot
+from app.api.routes import _normalize_temperature_for_provider, _temperature_max_for_provider
 from app.llm.client import LLMClient, LLMResponseEnvelope
 from app.llm.prompts import (
     build_context_checkpoint_messages,
@@ -916,6 +917,32 @@ class PromptAppendOnlyTest(unittest.TestCase):
 
         self.assertEqual(kwargs["temperature"], 1.5)
         self.assertEqual(kwargs["extra_body"]["thinking"], {"type": "disabled"})
+
+    def test_llm_client_uses_minimax_m3_openai_compatible_thinking_shape(self):
+        client = LLMClient(
+            api_key="test-key",
+            base_url="https://api.minimax.io/v1",
+            model="MiniMax-M3",
+            provider_user_id="u_0123456789abcdef0123456789abcdef",
+            thinking_enabled=True,
+        )
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = client._build_kwargs(messages, temperature=1.8, max_tokens=None, stream=False)
+
+        self.assertNotIn("temperature", kwargs)
+        self.assertEqual(kwargs["extra_body"]["thinking"], {"type": "adaptive"})
+        self.assertTrue(kwargs["extra_body"]["reasoning_split"])
+        self.assertNotIn("reasoning_effort", kwargs["extra_body"])
+        self.assertNotIn("user_id", kwargs["extra_body"])
+        self.assertFalse(client.get_cache_debug()["provider_user_id_sent"])
+
+    def test_minimax_m3_temperature_range_matches_official_openai_compatible_range(self):
+        self.assertEqual(_temperature_max_for_provider("https://api.minimax.io/v1", "MiniMax-M3"), 2.0)
+        self.assertEqual(_temperature_max_for_provider("https://api.minimaxi.com/v1", "MiniMax-M3"), 2.0)
+        self.assertEqual(
+            _normalize_temperature_for_provider(3.0, "https://api.minimax.io/v1", "MiniMax-M3"),
+            2.0,
+        )
 
     def test_llm_client_sends_deepseek_provider_user_id_outside_messages(self):
         client = LLMClient(
