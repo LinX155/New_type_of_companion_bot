@@ -154,6 +154,12 @@ class OneBotConnectionManager:
             params={"file": file},
         )
 
+    async def get_record(self, file: str, out_format: str = "mp3") -> dict:
+        return await self.request(
+            action="get_record",
+            params={"file": file, "out_format": out_format},
+        )
+
     async def get_file(self, file_id: str) -> dict:
         return await self.request(
             action="get_file",

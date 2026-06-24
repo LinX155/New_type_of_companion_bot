@@ -114,8 +114,12 @@ def _parse_private_message(payload: dict) -> ChatEvent:
     has_user_text = False
     has_image = False
     has_sticker = False
+    has_audio = False
+    has_video = False
     reply_to_message_id = None
     media_refs: list[dict] = []
+    audio_refs: list[dict] = []
+    video_refs: list[dict] = []
 
     for segment_index, segment in enumerate(segments):
         if not isinstance(segment, dict):
@@ -169,6 +173,30 @@ def _parse_private_message(payload: dict) -> ChatEvent:
             })
             continue
 
+        if seg_type == "record":
+            has_audio = True
+            text_parts.append("[语音]")
+            audio_refs.append(_media_segment_ref(
+                data=data,
+                user_id=user_id,
+                message_id=message_id,
+                segment_index=segment_index,
+                segment_type=seg_type,
+            ))
+            continue
+
+        if seg_type == "video":
+            has_video = True
+            text_parts.append("[视频]")
+            video_refs.append(_media_segment_ref(
+                data=data,
+                user_id=user_id,
+                message_id=message_id,
+                segment_index=segment_index,
+                segment_type=seg_type,
+            ))
+            continue
+
         if seg_type:
             text_parts.append(f"[{seg_type}]")
 
@@ -179,6 +207,10 @@ def _parse_private_message(payload: dict) -> ChatEvent:
         event_type = EventType.STICKER
     elif has_image:
         event_type = EventType.IMAGE
+    elif has_video:
+        event_type = EventType.VIDEO
+    elif has_audio:
+        event_type = EventType.AUDIO
     else:
         event_type = EventType.TEXT
         text = text or str(payload.get("raw_message") or "")
@@ -198,6 +230,8 @@ def _parse_private_message(payload: dict) -> ChatEvent:
             "reply_to_message_id": reply_to_message_id,
             "message_segments": segments,
             "media_refs": media_refs,
+            "audio_refs": audio_refs,
+            "video_refs": video_refs,
             "onebot": payload,
         },
     )
@@ -222,6 +256,31 @@ def _is_sticker_image(seg_type: str, data: dict) -> bool:
     sub_type = str(data.get("sub_type") or "")
     file_name = str(data.get("file") or "").strip().lower()
     return sub_type == "1" or "表情" in summary or file_name == "marketface"
+
+
+def _media_segment_ref(
+    data: dict,
+    user_id: str,
+    message_id: str,
+    segment_index: int,
+    segment_type: str,
+) -> dict:
+    return {
+        "source": "qq",
+        "qq_user_id": user_id,
+        "onebot_message_id": message_id,
+        "segment_index": segment_index,
+        "segment_type": segment_type,
+        "file": data.get("file"),
+        "file_id": data.get("file_id"),
+        "file_unique": data.get("file_unique") or data.get("file_unique_id"),
+        "url": data.get("url"),
+        "path": data.get("path"),
+        "file_size": data.get("file_size"),
+        "sha256": None,
+        "prepare_status": None,
+        "prepare_error": None,
+    }
 
 
 def _string_id(value) -> str:

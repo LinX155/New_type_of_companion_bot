@@ -170,11 +170,23 @@ class SendGateTest(unittest.TestCase):
         )
         self.assertEqual(
             routes._split_text_for_display("今天真的好烦，想睡觉"),
-            ["今天真的好烦，", "想睡觉"],
+            ["今天真的好烦，想睡觉"],
         )
         self.assertEqual(
             routes._split_text_for_display("刚在阳台给花浇水呢，晚霞好漂亮，今天风也很温柔，想叫你来看"),
-            ["刚在阳台给花浇水呢，", "晚霞好漂亮，今天风也很温柔，", "想叫你来看"],
+            ["刚在阳台给花浇水呢，", "晚霞好漂亮，今天风也很温柔，想叫你来看"],
+        )
+        self.assertEqual(
+            routes._split_text_for_display("这件事情真的离谱...但是我先缓一下"),
+            ["这件事情真的离谱...", "但是我先缓一下"],
+        )
+        self.assertEqual(
+            routes._split_text_for_display("我现在其实有点想笑——但还是先忍住"),
+            ["我现在其实有点想笑——", "但还是先忍住"],
+        )
+        self.assertEqual(
+            routes._split_text_for_display("你今天怎么这么可爱？我有点受不了"),
+            ["你今天怎么这么可爱？", "我有点受不了"],
         )
 
     def test_text_display_split_is_disabled_when_model_already_outputs_four_items(self):

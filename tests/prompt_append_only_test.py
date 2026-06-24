@@ -1,7 +1,9 @@
 import asyncio
 import json
+import tempfile
 import unittest
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 from app.core.decisions import Action, ActionDecision, SendItem, SendItemType
@@ -107,6 +109,38 @@ class FakeReasoningEnvelopeLLM(FakeLLM):
             },
             raw_response_meta={"finish_reason": "stop", "model": "fake-reasoning"},
         )
+
+
+class FakeDirectAVLLM(FakeLLM):
+    def __init__(self, base_url="https://api.xiaomimimo.com/v1", model="mimo-v2.5", fail_first=False):
+        self.base_url = base_url
+        self.model = model
+        self.temperature = 1.0
+        self.fail_first = fail_first
+        self.requests = []
+
+    async def chat_completion_envelope(self, messages, temperature=0.7):
+        self.requests.append(copy_messages(messages))
+        if self.fail_first and len(self.requests) == 1:
+            raise RuntimeError("multimodal rejected")
+        return LLMResponseEnvelope(
+            assistant_message={"role": "assistant", "content": "我看到了"},
+            content="我看到了",
+        )
+
+
+class FakeRecordManager:
+    def __init__(self, path: str):
+        self.path = path
+        self.calls = []
+
+    async def get_record(self, file: str, out_format: str = "mp3"):
+        self.calls.append((file, out_format))
+        return {"status": "ok", "retcode": 0, "data": {"path": self.path}}
+
+
+def copy_messages(messages):
+    return [dict(item) for item in messages]
 
 
 class FakeRepairEnvelopeLLM(FakeLLM):
@@ -220,6 +254,165 @@ class FakeMemoryWithTomorrow(FakeMemory):
 
 
 class PromptAppendOnlyTest(unittest.TestCase):
+    def test_mimo_audio_event_uses_input_audio_for_current_request_only(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                audio_path = Path(tmp_dir) / "voice.mp3"
+                audio_path.write_bytes(b"ID3fake-audio")
+                llm = FakeDirectAVLLM()
+                manager = FakeRecordManager(str(audio_path))
+                queue = SimpleNamespace(
+                    media_downloader=SimpleNamespace(
+                        onebot_manager=manager,
+                        root_dir=Path(tmp_dir),
+                    )
+                )
+                graph = CompanionGraph(llm, FakeMemory(), FakeMemeCatalog(), media_job_queue=queue)
+                ctx = SimpleNamespace(
+                    gate=self._gate(msg_index=1, age="unknown"),
+                    snapshot=ConversationSnapshot(
+                        snapshot_id=1,
+                        buffer_version=1,
+                        status=ChatStatus.HOT,
+                        events=[{
+                            "event_id": "voice-1",
+                            "event_type": "message.audio",
+                            "text": "[语音]",
+                            "raw": {
+                                "audio_refs": [{
+                                    "segment_index": 0,
+                                    "segment_type": "record",
+                                    "file": "voice.amr",
+                                }]
+                            },
+                        }],
+                    ),
+                )
+
+                state = await graph._build_context({"ctx": ctx})
+                user_messages = [item for item in state["messages"] if item.get("role") == "user"]
+                content = user_messages[-1]["content"]
+
+                self.assertIsInstance(content, list)
+                self.assertEqual(content[0], {"type": "text", "text": "[语音]"})
+                self.assertEqual(content[1]["type"], "input_audio")
+                self.assertTrue(content[1]["input_audio"]["data"].startswith("data:audio/mpeg;base64,"))
+                self.assertEqual(manager.calls, [("voice.amr", "mp3")])
+                transcript_users = [
+                    item for item in graph._copy_prompt_transcript() if item.get("role") == "user"
+                ]
+                self.assertEqual(transcript_users[-1], {"role": "user", "content": "[语音]"})
+                self.assertNotIn("data:audio", json.dumps(graph.get_prompt_observability(), ensure_ascii=False))
+                self.assertEqual(graph.get_prompt_observability()["multimodal"][0]["status"], "ready")
+
+        asyncio.run(scenario())
+
+    def test_mimo_video_event_uses_video_url_for_current_request_only(self):
+        async def scenario():
+            graph = CompanionGraph(FakeDirectAVLLM(), FakeMemory(), FakeMemeCatalog())
+            ctx = SimpleNamespace(
+                gate=self._gate(msg_index=1, age="unknown"),
+                snapshot=ConversationSnapshot(
+                    snapshot_id=1,
+                    buffer_version=1,
+                    status=ChatStatus.HOT,
+                    events=[{
+                        "event_id": "video-1",
+                        "event_type": "message.video",
+                        "text": "[视频]",
+                        "raw": {
+                            "video_refs": [{
+                                "segment_index": 0,
+                                "segment_type": "video",
+                                "file": "clip.mp4",
+                                "url": "https://example.invalid/clip.mp4?token=secret",
+                            }]
+                        },
+                    }],
+                ),
+            )
+
+            state = await graph._build_context({"ctx": ctx})
+            user_messages = [item for item in state["messages"] if item.get("role") == "user"]
+            content = user_messages[-1]["content"]
+
+            self.assertIsInstance(content, list)
+            self.assertEqual(content[0], {"type": "text", "text": "[视频]"})
+            self.assertEqual(content[1], {
+                "type": "video_url",
+                "video_url": {"url": "https://example.invalid/clip.mp4?token=secret"},
+            })
+            transcript_users = [
+                item for item in graph._copy_prompt_transcript() if item.get("role") == "user"
+            ]
+            self.assertEqual(transcript_users[-1], {"role": "user", "content": "[视频]"})
+            self.assertEqual(
+                graph.get_prompt_observability()["multimodal"][0]["url"],
+                "https://example.invalid/clip.mp4?...",
+            )
+
+        asyncio.run(scenario())
+
+    def test_non_mimo_provider_keeps_audio_and_video_text_only(self):
+        async def scenario():
+            graph = CompanionGraph(
+                FakeDirectAVLLM(base_url="https://api.deepseek.com", model="deepseek-chat"),
+                FakeMemory(),
+                FakeMemeCatalog(),
+            )
+            ctx = SimpleNamespace(
+                gate=self._gate(msg_index=1, age="unknown"),
+                snapshot=ConversationSnapshot(
+                    snapshot_id=1,
+                    buffer_version=1,
+                    status=ChatStatus.HOT,
+                    events=[{
+                        "event_id": "mixed-1",
+                        "event_type": "message.video",
+                        "text": "[语音][视频]",
+                        "raw": {
+                            "audio_refs": [{"segment_type": "record", "file": "voice.amr"}],
+                            "video_refs": [{"segment_type": "video", "url": "https://example.invalid/clip.mp4"}],
+                        },
+                    }],
+                ),
+            )
+
+            state = await graph._build_context({"ctx": ctx})
+            user_messages = [item for item in state["messages"] if item.get("role") == "user"]
+
+            self.assertEqual(user_messages[-1]["content"], "[语音][视频]")
+            self.assertNotIn("multimodal", graph.get_prompt_observability())
+
+        asyncio.run(scenario())
+
+    def test_multimodal_request_error_retries_text_only(self):
+        async def scenario():
+            llm = FakeDirectAVLLM(fail_first=True)
+            graph = CompanionGraph(llm, FakeMemory(), FakeMemeCatalog())
+            raw = await graph._call_llm_for_messages(
+                messages=[
+                    {"role": "system", "content": "base"},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "[语音]"},
+                            {"type": "input_audio", "input_audio": {"data": "data:audio/mpeg;base64,abc"}},
+                        ],
+                    },
+                ],
+                temperature=0.7,
+                append_assistant_to_transcript=False,
+            )
+
+            self.assertEqual(raw, "我看到了")
+            self.assertEqual(len(llm.requests), 2)
+            self.assertIsInstance(llm.requests[0][1]["content"], list)
+            self.assertEqual(llm.requests[1][1]["content"], "[语音]")
+            self.assertTrue(graph.get_prompt_observability()["multimodal_text_only_retry"])
+
+        asyncio.run(scenario())
+
     def test_context_checkpoint_is_system_context_before_post_checkpoint_history(self):
         graph = CompanionGraph(FakeLLM(), FakeMemory(), FakeMemeCatalog())
         graph.load_conversation_context(

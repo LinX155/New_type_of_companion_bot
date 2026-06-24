@@ -68,6 +68,77 @@ class OneBotAdapterTest(unittest.TestCase):
         self.assertEqual(media_ref["segment_index"], 0)
         self.assertIn("local_path", media_ref)
 
+    def test_private_record_parses_to_audio_event(self):
+        event = parse_onebot_event({
+            "post_type": "message",
+            "message_type": "private",
+            "message_id": 306163478,
+            "user_id": 550808201,
+            "message": [
+                {
+                    "type": "record",
+                    "data": {
+                        "file": "voice.amr",
+                        "path": "D:\\QQ\\Ptt\\voice.amr",
+                        "url": "https://example.invalid/voice.amr?token=secret",
+                        "file_size": "3463",
+                    },
+                }
+            ],
+        })
+
+        self.assertEqual(event.event_type, EventType.AUDIO)
+        self.assertEqual(event.text, "[语音]")
+        self.assertEqual(event.raw["media_refs"], [])
+        audio_ref = event.raw["audio_refs"][0]
+        self.assertEqual(audio_ref["segment_type"], "record")
+        self.assertEqual(audio_ref["file"], "voice.amr")
+        self.assertEqual(audio_ref["url"], "https://example.invalid/voice.amr?token=secret")
+
+    def test_private_video_parses_to_video_event(self):
+        event = parse_onebot_event({
+            "post_type": "message",
+            "message_type": "private",
+            "message_id": 306163479,
+            "user_id": 550808201,
+            "message": [
+                {
+                    "type": "video",
+                    "data": {
+                        "file": "clip.mp4",
+                        "url": "https://example.invalid/clip.mp4?token=secret",
+                        "file_size": "2048",
+                    },
+                }
+            ],
+        })
+
+        self.assertEqual(event.event_type, EventType.VIDEO)
+        self.assertEqual(event.text, "[视频]")
+        self.assertEqual(event.raw["media_refs"], [])
+        video_ref = event.raw["video_refs"][0]
+        self.assertEqual(video_ref["segment_type"], "video")
+        self.assertEqual(video_ref["file"], "clip.mp4")
+        self.assertEqual(video_ref["url"], "https://example.invalid/clip.mp4?token=secret")
+
+    def test_text_mixed_with_record_and_video_stays_text_with_refs(self):
+        event = parse_onebot_event({
+            "post_type": "message",
+            "message_type": "private",
+            "message_id": 306163480,
+            "user_id": 550808201,
+            "message": [
+                {"type": "text", "data": {"text": "你听这个"}},
+                {"type": "record", "data": {"file": "voice.amr"}},
+                {"type": "video", "data": {"file": "clip.mp4", "url": "https://example.invalid/clip.mp4"}},
+            ],
+        })
+
+        self.assertEqual(event.event_type, EventType.TEXT)
+        self.assertEqual(event.text, "你听这个[语音][视频]")
+        self.assertEqual(event.raw["audio_refs"][0]["file"], "voice.amr")
+        self.assertEqual(event.raw["video_refs"][0]["file"], "clip.mp4")
+
     def test_subtype_one_image_parses_as_sticker(self):
         event = parse_onebot_event({
             "post_type": "message",
@@ -404,6 +475,30 @@ class OneBotAdapterTest(unittest.TestCase):
             })
             response = await task
             self.assertEqual(response["retcode"], 0)
+
+        asyncio.run(scenario())
+
+    def test_connection_manager_get_record_action(self):
+        async def scenario():
+            manager = OneBotConnectionManager()
+            websocket = FakeWebSocket()
+            manager._websocket = websocket
+
+            task = asyncio.create_task(manager.get_record("voice.amr", out_format="mp3"))
+            await asyncio.sleep(0)
+
+            action = websocket.sent[0]
+            self.assertEqual(action["action"], "get_record")
+            self.assertEqual(action["params"], {"file": "voice.amr", "out_format": "mp3"})
+
+            manager._resolve_action_response({
+                "status": "ok",
+                "retcode": 0,
+                "data": {"path": "voice.mp3"},
+                "echo": action["echo"],
+            })
+            response = await task
+            self.assertEqual(response["data"]["path"], "voice.mp3")
 
         asyncio.run(scenario())
 

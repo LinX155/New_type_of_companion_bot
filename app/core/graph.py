@@ -1,9 +1,14 @@
+import base64
 import hashlib
 import json
 import copy
+import mimetypes
 import re
+from pathlib import Path
 from typing import Optional, TypedDict
+from urllib.parse import unquote, urlparse
 
+import httpx
 from langgraph.graph import END, StateGraph
 
 from .event_gate import ProcessContext
@@ -41,6 +46,9 @@ PROMPT_VIEW_LIMITS = {
     "today_memory": 4000,
     "tomorrow_topics": 4000,
 }
+
+MIMO_DIRECT_AV_MODELS = {"mimo-v2.5", "mimo-v2-omni"}
+MAX_DIRECT_AUDIO_BYTES = 12 * 1024 * 1024
 
 REASONING_RESCUE_BLOCKLIST = (
     "用户说",
@@ -199,6 +207,8 @@ class CompanionGraph:
         self._last_search_meme: Optional[str] = None
         self._last_render_status: Optional[str] = None
         self._last_media_debug: list[dict] = []
+        self._last_multimodal_debug: list[dict] = []
+        self._last_llm_request_messages: list[dict] = []
 
     def _record_llm_raw_output(self, raw_output: str):
         self._last_llm_raw_output = raw_output
@@ -267,12 +277,13 @@ class CompanionGraph:
 
         self._last_hot_turn_reminder_hash = None
         self._append_runtime_context(ctx)
-        self._append_snapshot_events(snapshot.events)
+        multimodal_replacements = await self._append_snapshot_events(snapshot.events)
         self._append_media_pending_payloads_and_enqueue_jobs(ctx)
         self._append_hot_turn_system_reminder(snapshot)
         self._prompt_transcript.append({"role": "system", "content": FINAL_ACTION_OUTPUT_REMINDER})
 
-        messages = [dict(item) for item in self._prompt_transcript]
+        messages = self._copy_prompt_transcript()
+        self._apply_multimodal_replacements(messages, multimodal_replacements)
         self._record_prompt_observability(messages)
         return {**state, "messages": messages}
 
@@ -282,9 +293,12 @@ class CompanionGraph:
             temperature=self._main_chat_temperature(),
             append_assistant_to_transcript=False,
         )
+        base_messages = self._messages_without_direct_multimodal(
+            self._last_llm_request_messages or state["messages"]
+        )
         decision, parse_status = await self._parse_decision_with_harness(
             ctx=state["ctx"],
-            base_messages=state["messages"],
+            base_messages=base_messages,
             raw_output=raw_output,
             repair=True,
         )
@@ -911,10 +925,20 @@ class CompanionGraph:
         append_assistant_to_transcript: bool,
         record_prompt_usage: bool = True,
     ) -> str:
-        envelope = await self._request_llm_envelope(messages, temperature)
+        effective_messages = messages
+        try:
+            envelope = await self._request_llm_envelope(effective_messages, temperature)
+        except Exception as exc:
+            if not self._messages_have_direct_multimodal(effective_messages):
+                raise
+            self._last_prompt_observability["multimodal_text_only_retry"] = True
+            self._last_prompt_observability["multimodal_retry_error"] = str(exc)[:300]
+            effective_messages = self._messages_without_direct_multimodal(effective_messages)
+            envelope = await self._request_llm_envelope(effective_messages, temperature)
+        self._last_llm_request_messages = copy.deepcopy(effective_messages)
         raw_output, raw_source = self._raw_output_from_envelope(envelope)
         if raw_source == "content_empty":
-            retry_envelope = await self._request_llm_envelope(messages, temperature)
+            retry_envelope = await self._request_llm_envelope(effective_messages, temperature)
             retry_output, retry_source = self._raw_output_from_envelope(retry_envelope)
             self._last_prompt_observability["content_empty_retry_count"] = 1
             envelope = retry_envelope
@@ -1330,7 +1354,9 @@ class CompanionGraph:
             lines.append(f"user: {current}")
         return "\n".join(lines)
 
-    def _append_snapshot_events(self, events: list[dict]):
+    async def _append_snapshot_events(self, events: list[dict]) -> list[tuple[int, list[dict]]]:
+        replacements: list[tuple[int, list[dict]]] = []
+        self._last_multimodal_debug = []
         for evt in events:
             event_id = self._event_get(evt, "event_id") or self._event_get(evt, "id")
             if event_id and event_id in self._prompt_event_ids:
@@ -1340,9 +1366,205 @@ class CompanionGraph:
             if not text:
                 continue
 
+            transcript_index = len(self._prompt_transcript)
             self._prompt_transcript.append({"role": "user", "content": text})
+            multimodal_content = await self._build_direct_multimodal_content(evt, text)
+            if multimodal_content:
+                replacements.append((transcript_index, multimodal_content))
             if event_id:
                 self._prompt_event_ids.add(event_id)
+        return replacements
+
+    def _apply_multimodal_replacements(self, messages: list[dict], replacements: list[tuple[int, list[dict]]]):
+        for index, content in replacements:
+            if 0 <= index < len(messages) and messages[index].get("role") == "user":
+                messages[index]["content"] = copy.deepcopy(content)
+
+    async def _build_direct_multimodal_content(self, evt: dict, text: str) -> Optional[list[dict]]:
+        if not self._supports_direct_mimo_av():
+            return None
+        audio_refs = self._event_media_refs(evt, "audio_refs")
+        video_refs = self._event_media_refs(evt, "video_refs")
+        if not audio_refs and not video_refs:
+            return None
+
+        content: list[dict] = [{"type": "text", "text": text or self._media_placeholder_from_refs(audio_refs, video_refs)}]
+
+        for index, audio_ref in enumerate(audio_refs):
+            audio_part = await self._build_input_audio_part(audio_ref, index)
+            if audio_part:
+                content.append(audio_part)
+
+        for index, video_ref in enumerate(video_refs):
+            video_part = self._build_video_url_part(video_ref, index)
+            if video_part:
+                content.append(video_part)
+
+        return content if len(content) > 1 else None
+
+    def _supports_direct_mimo_av(self) -> bool:
+        base_url = str(getattr(self.llm, "base_url", "") or "").lower()
+        model = str(getattr(self.llm, "model", "") or "").lower()
+        return "xiaomimimo.com" in base_url and model in MIMO_DIRECT_AV_MODELS
+
+    def _event_media_refs(self, evt: dict, key: str) -> list[dict]:
+        raw = self._event_get(evt, "raw") or {}
+        refs = raw.get(key) if isinstance(raw, dict) else None
+        if not isinstance(refs, list):
+            return []
+        return [ref for ref in refs if isinstance(ref, dict)]
+
+    def _media_placeholder_from_refs(self, audio_refs: list[dict], video_refs: list[dict]) -> str:
+        if video_refs:
+            return "[视频]"
+        if audio_refs:
+            return "[语音]"
+        return ""
+
+    async def _build_input_audio_part(self, audio_ref: dict, index: int) -> Optional[dict]:
+        debug = self._base_multimodal_debug("audio", audio_ref, index)
+        try:
+            prepared_ref = await self._prepare_audio_ref_via_onebot(audio_ref)
+            audio_bytes, source_field, source_value = await self._bytes_from_audio_ref(prepared_ref)
+            if not audio_bytes:
+                raise ValueError("audio has no downloadable data")
+            if len(audio_bytes) > MAX_DIRECT_AUDIO_BYTES:
+                raise ValueError(f"audio is too large: {len(audio_bytes)} bytes")
+            sha256 = hashlib.sha256(audio_bytes).hexdigest()
+            mime = self._audio_mime_from_ref(prepared_ref, source_value)
+            data = base64.b64encode(audio_bytes).decode("ascii")
+            debug.update({
+                "status": "ready",
+                "sha256": sha256,
+                "bytes": len(audio_bytes),
+                "mime": mime,
+                "source_field": source_field,
+            })
+            self._last_multimodal_debug.append(debug)
+            return {
+                "type": "input_audio",
+                "input_audio": {"data": f"data:{mime};base64,{data}"},
+            }
+        except Exception as exc:  # noqa: BLE001
+            debug.update({"status": "fallback_text", "error": str(exc)[:300]})
+            self._last_multimodal_debug.append(debug)
+            return None
+
+    async def _prepare_audio_ref_via_onebot(self, audio_ref: dict) -> dict:
+        manager = self._onebot_manager_for_direct_media()
+        if not manager or not hasattr(manager, "get_record"):
+            raise RuntimeError("OneBot get_record is not available")
+        file_value = str(audio_ref.get("file") or "").strip()
+        if not file_value:
+            raise ValueError("record segment has no file")
+        response = await manager.get_record(file_value, out_format="mp3")
+        data = response.get("data") if isinstance(response, dict) else None
+        if not isinstance(data, dict):
+            data = {}
+        prepared = dict(audio_ref)
+        for key in ("path", "url", "file", "file_id", "file_unique", "file_size"):
+            if data.get(key) is not None:
+                prepared[key] = data.get(key)
+        prepared["converted_format"] = "mp3"
+        return prepared
+
+    def _onebot_manager_for_direct_media(self):
+        queue = self.media_job_queue
+        downloader = getattr(queue, "media_downloader", None) if queue else None
+        return getattr(downloader, "onebot_manager", None) if downloader else None
+
+    async def _bytes_from_audio_ref(self, audio_ref: dict) -> tuple[bytes, str, str]:
+        for key in ("path", "file", "local_path"):
+            path = self._local_existing_audio_path(audio_ref.get(key))
+            if path:
+                return path.read_bytes(), key, str(path)
+
+        url = str(audio_ref.get("url") or "").strip()
+        if url:
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                return response.content, "url", url
+
+        return b"", "", ""
+
+    def _local_existing_audio_path(self, value) -> Optional[Path]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if text.startswith("file:///"):
+            parsed = urlparse(text)
+            text = unquote(parsed.path or "")
+            if len(text) > 2 and text[0] == "/" and text[2] == ":":
+                text = text[1:]
+        path = Path(text)
+        if not path.is_absolute():
+            root_dir = self._media_root_dir()
+            if root_dir:
+                path = root_dir / path
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return None
+        return resolved if resolved.is_file() else None
+
+    def _media_root_dir(self) -> Optional[Path]:
+        queue = self.media_job_queue
+        downloader = getattr(queue, "media_downloader", None) if queue else None
+        root_dir = getattr(downloader, "root_dir", None) if downloader else None
+        if isinstance(root_dir, Path):
+            return root_dir
+        if root_dir:
+            return Path(root_dir)
+        return None
+
+    def _audio_mime_from_ref(self, audio_ref: dict, source_value: str) -> str:
+        ext = Path(str(source_value or audio_ref.get("file") or "")).suffix.lower()
+        mapping = {
+            ".mp3": "audio/mpeg",
+            ".wav": "audio/wav",
+            ".flac": "audio/flac",
+            ".m4a": "audio/mp4",
+            ".amr": "audio/amr",
+            ".ogg": "audio/ogg",
+        }
+        if ext in mapping:
+            return mapping[ext]
+        guessed = mimetypes.guess_type(str(source_value or ""))[0]
+        if guessed and guessed.startswith("audio/"):
+            return guessed
+        return "audio/mpeg"
+
+    def _build_video_url_part(self, video_ref: dict, index: int) -> Optional[dict]:
+        debug = self._base_multimodal_debug("video", video_ref, index)
+        url = str(video_ref.get("url") or "").strip()
+        if not url:
+            debug.update({"status": "fallback_text", "error": "video has no url"})
+            self._last_multimodal_debug.append(debug)
+            return None
+        debug.update({"status": "ready", "url": self._redact_url(url)})
+        self._last_multimodal_debug.append(debug)
+        return {
+            "type": "video_url",
+            "video_url": {"url": url},
+        }
+
+    def _base_multimodal_debug(self, media_type: str, ref: dict, index: int) -> dict:
+        return {
+            "media_type": media_type,
+            "segment_index": ref.get("segment_index", index),
+            "segment_type": ref.get("segment_type"),
+            "file": ref.get("file"),
+            "file_id": ref.get("file_id"),
+            "file_unique": ref.get("file_unique"),
+            "file_size": ref.get("file_size"),
+        }
+
+    def _redact_url(self, url: str) -> str:
+        parsed = urlparse(str(url or ""))
+        if not parsed.query:
+            return str(url or "")
+        return parsed._replace(query="...").geturl()
 
     def _prompt_text_for_event(self, evt: dict) -> str:
         text = self._event_get(evt, "text")
@@ -1359,6 +1581,10 @@ class CompanionGraph:
             text = "[图片]"
         if not text and event_type.endswith("sticker"):
             text = "[表情]"
+        if not text and event_type.endswith("audio"):
+            text = "[语音]"
+        if not text and event_type.endswith("video"):
+            text = "[视频]"
         text = text or ""
 
         raw = self._event_get(evt, "raw") or {}
@@ -1473,7 +1699,7 @@ class CompanionGraph:
         return safe_messages
 
     def _record_prompt_observability(self, messages: list[dict]):
-        safe_messages = self._provider_safe_messages(messages)
+        safe_messages = self._messages_for_observability(self._provider_safe_messages(messages))
         previous_messages = copy.deepcopy(self._last_prompt_messages)
         messages = safe_messages
         append_only = self._is_messages_prefix(previous_messages, messages) if previous_messages else True
@@ -1498,12 +1724,54 @@ class CompanionGraph:
         cache_debug = self.llm.get_cache_debug() if hasattr(self.llm, "get_cache_debug") else None
         if cache_debug:
             observability["cache_affinity"] = cache_debug
+        if self._last_multimodal_debug:
+            observability["multimodal"] = copy.deepcopy(self._last_multimodal_debug)
         if append_only and self._prefix_rebuild_reason:
             observability["prefix_rebuild_reason"] = self._prefix_rebuild_reason
         self._prefix_rebuild_reason = None
         self._last_prompt_messages = copy.deepcopy(messages)
         self._last_prompt_observability = observability
         print(f"[prompt_cache_debug] {json.dumps(observability, ensure_ascii=False)}")
+
+    def _messages_for_observability(self, messages: list[dict]) -> list[dict]:
+        result = []
+        for message in messages:
+            item = copy.deepcopy(message)
+            content = item.get("content")
+            if isinstance(content, list):
+                text_parts = [
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ]
+                item["content"] = "\n".join(part for part in text_parts if part).strip()
+            result.append(item)
+        return result
+
+    def _messages_have_direct_multimodal(self, messages: list[dict]) -> bool:
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in {"input_audio", "video_url"}:
+                    return True
+        return False
+
+    def _messages_without_direct_multimodal(self, messages: list[dict]) -> list[dict]:
+        result = []
+        for message in messages:
+            item = copy.deepcopy(message)
+            content = item.get("content")
+            if isinstance(content, list):
+                text_parts = [
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ]
+                item["content"] = "\n".join(part for part in text_parts if part).strip()
+            result.append(item)
+        return result
 
     def _record_prompt_usage(
         self,

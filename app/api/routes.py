@@ -82,6 +82,8 @@ MIMO_TEMPERATURE_MAX = 1.5
 MINIMAX_TEMPERATURE_MAX = 2.0
 DEFAULT_TEMPERATURE = 1.0
 DISPLAY_SPLIT_DISABLE_ITEM_COUNT = 4
+DISPLAY_SPLIT_MIN_CHINESE_CHARS = 8
+DISPLAY_SPLIT_TRIGGERS = ("...", "——", "？", "，", ",")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -931,22 +933,36 @@ def _split_text_for_display(text: str) -> list[str]:
 
     parts: list[str] = []
     current: list[str] = []
-    chinese_count_after_comma = 0
+    chinese_count_after_trigger = 0
+    index = 0
 
-    for char in text:
-        current.append(char)
-        if _is_chinese_char(char):
-            chinese_count_after_comma += 1
-
-        if char in ("，", ","):
-            if chinese_count_after_comma > 5:
+    while index < len(text):
+        trigger = _display_split_trigger_at(text, index)
+        if trigger:
+            current.append(trigger)
+            if chinese_count_after_trigger >= DISPLAY_SPLIT_MIN_CHINESE_CHARS:
                 parts.append("".join(current))
                 current = []
-            chinese_count_after_comma = 0
+            chinese_count_after_trigger = 0
+            index += len(trigger)
+            continue
+
+        char = text[index]
+        current.append(char)
+        if _is_chinese_char(char):
+            chinese_count_after_trigger += 1
+        index += 1
 
     if current:
         parts.append("".join(current))
     return parts or [text]
+
+
+def _display_split_trigger_at(text: str, index: int) -> Optional[str]:
+    for trigger in DISPLAY_SPLIT_TRIGGERS:
+        if text.startswith(trigger, index):
+            return trigger
+    return None
 
 
 def _is_chinese_char(char: str) -> bool:
@@ -1904,6 +1920,10 @@ def _record_incoming_event(event: ChatEvent):
             event_type = "user_image"
         elif event.event_type == EventType.STICKER:
             event_type = "user_sticker"
+        elif event.event_type == EventType.AUDIO:
+            event_type = "user_audio"
+        elif event.event_type == EventType.VIDEO:
+            event_type = "user_video"
         elif event.event_type == EventType.USER_COMPOSING:
             event_type = "user_composing"
 

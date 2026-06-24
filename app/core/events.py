@@ -8,6 +8,8 @@ class EventType(str, Enum):
     TEXT = "message.text"
     IMAGE = "message.image"
     STICKER = "message.sticker"
+    AUDIO = "message.audio"
+    VIDEO = "message.video"
     USER_COMPOSING = "user.composing"
     NUDGE = "nudge"
     RECALL = "recall"

@@ -66,7 +66,13 @@ class EventGate:
             return await self._handle_nudge(event)
 
         # 普通消息
-        if event.event_type in (EventType.TEXT, EventType.IMAGE, EventType.STICKER):
+        if event.event_type in (
+            EventType.TEXT,
+            EventType.IMAGE,
+            EventType.STICKER,
+            EventType.AUDIO,
+            EventType.VIDEO,
+        ):
             return await self._handle_chat_message(event)
 
         return {"handled": False, "type": "unknown"}
