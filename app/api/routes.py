@@ -314,6 +314,7 @@ def init_gate():
                 scheduler_manager.update_schedule(job_id, cfg.get("hour"), cfg.get("minute"))
         active_cfg = _normalize_active_message_config(_persisted.get("active_message"))
         scheduler_manager.set_active_message_callback(run_scheduled_active_messages)
+        scheduler_manager.set_active_message_setting_callback(_apply_active_message_setting)
         scheduler_manager.set_session_ids_provider(_scheduler_session_ids)
         scheduler_manager.set_context_checkpoint_callback(_apply_context_checkpoint_to_runtime)
         _refresh_active_message_jobs(active_cfg)

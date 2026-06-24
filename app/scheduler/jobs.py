@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime, timedelta
 from typing import Awaitable, Callable, Optional
 
@@ -7,6 +8,7 @@ from apscheduler.jobstores.base import JobLookupError
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
+from ..active.settings import ACTIVE_SETTING_NONE, normalize_active_message_setting
 from ..llm.client import LLMClient
 from ..core.settings import load_settings
 from ..llm.prompts import (
@@ -38,6 +40,12 @@ MEMORY_ANALYSIS_EVENT_ROLES = {
 }
 ACTIVE_DAILY_JOB_PREFIX = "active_daily:"
 ACTIVE_NEXT_JOB_PREFIX = "active_next:"
+ACTIVE_MESSAGE_TOPIC_TIME_RE = re.compile(
+    r"([01]?\d|2[0-3])\s*[:：]\s*[0-5]?\d|"
+    r"([01]?\d|2[0-3])\s*点|"
+    r"[零〇一二两三四五六七八九十]{1,3}\s*点|"
+    r"(早上|上午|中午|下午|晚上|今晚|明早|明晚|凌晨|明天|今天)"
+)
 
 
 class SchedulerManager:
@@ -47,6 +55,7 @@ class SchedulerManager:
         self.llm = llm_client
         self.llm_client_factory: Optional[Callable[[str], LLMClient]] = None
         self.active_message_callback: Optional[Callable[[Optional[str], str, Optional[str]], Awaitable[dict]]] = None
+        self.active_message_setting_callback: Optional[Callable[[str, dict], tuple[bool, str]]] = None
         self.session_ids_provider: Optional[Callable[[], list[str]]] = None
         self.context_checkpoint_callback: Optional[Callable[[str, str, list[dict]], None]] = None
         self._job_configs = {
@@ -111,6 +120,9 @@ class SchedulerManager:
 
     def set_active_message_callback(self, callback: Callable[[Optional[str], str, Optional[str]], Awaitable[dict]]):
         self.active_message_callback = callback
+
+    def set_active_message_setting_callback(self, callback: Callable[[str, dict], tuple[bool, str]]):
+        self.active_message_setting_callback = callback
 
     def refresh_active_message_jobs(self, config: dict) -> tuple[dict, bool]:
         """Rebuild per-session active message jobs from persisted config."""
@@ -264,6 +276,11 @@ class SchedulerManager:
             tomorrow_topics = data.get("tomorrow_topics_md")
             if not today_memory or not tomorrow_topics:
                 raise RuntimeError("memory analysis response missing required markdown fields")
+            active_message_setting = self._normalize_memory_active_message_setting(
+                data.get("active_message_setting")
+            )
+            if active_message_setting["type"] != "none":
+                today_memory = self._strip_active_message_setting_lines(today_memory)
 
             if not memory.write_today_memory(today_memory):
                 raise RuntimeError("failed to write today's dm file")
@@ -272,8 +289,12 @@ class SchedulerManager:
                 proposed=tomorrow_topics,
                 owned_sections=MEMORY_ANALYSIS_TOMORROW_SECTIONS,
             )
+            if active_message_setting["type"] != "none":
+                scoped_tomorrow_topics = self._strip_active_message_setting_lines(scoped_tomorrow_topics)
             if not memory.write_tomorrow_topics(scoped_tomorrow_topics):
                 raise RuntimeError("failed to write TOMORROW_TOPICS.md")
+            if active_message_setting["type"] != "none":
+                self._apply_memory_active_message_setting(session_id, active_message_setting)
 
             self._finish_job(log_id, "completed")
             return True, None
@@ -615,6 +636,46 @@ class SchedulerManager:
         while end > start and not lines[end - 1].strip():
             end -= 1
         return lines[start:end]
+
+    def _normalize_memory_active_message_setting(self, value) -> dict:
+        if not isinstance(value, dict):
+            return dict(ACTIVE_SETTING_NONE)
+        return normalize_active_message_setting(value, now=datetime.now())
+
+    def _apply_memory_active_message_setting(self, session_id: str, setting: dict):
+        if self.active_message_setting_callback is None:
+            return
+        success, response = self.active_message_setting_callback(session_id, setting)
+        if not success:
+            raise RuntimeError(response or "failed to apply active message setting")
+
+    def _strip_active_message_setting_lines(self, markdown: str) -> str:
+        lines = []
+        for line in (markdown or "").splitlines():
+            if self._looks_like_active_message_setting_topic_line(line):
+                continue
+            lines.append(line)
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _looks_like_active_message_setting_topic_line(self, line: str) -> bool:
+        text = (line or "").strip()
+        if not text.startswith("-"):
+            return False
+        if not ACTIVE_MESSAGE_TOPIC_TIME_RE.search(text):
+            return False
+        action_hints = (
+            "主动消息",
+            "主动找",
+            "主动来",
+            "发消息",
+            "提醒",
+            "叫",
+            "喊",
+            "来找",
+            "联系",
+        )
+        request_hints = ("用户请求", "用户要求", "用户希望", "用户想让", "用户让")
+        return any(hint in text for hint in action_hints) and any(hint in text for hint in request_hints)
 
     def _parse_json_object(self, raw_output: str) -> dict:
         text = (raw_output or "").strip()

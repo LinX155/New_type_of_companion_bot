@@ -1991,6 +1991,11 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertIn("状态只能是 pending、used、expired、blocked", system_prompt)
         self.assertIn("不要把它们重置为 pending", system_prompt)
         self.assertIn("只允许你维护“未闭合话题”部分", system_prompt)
+        self.assertIn('"active_message_setting": {"type":"none","time":null}', system_prompt)
+        self.assertIn('{"type":"next","time":"2026-06-25 10:00"}', system_prompt)
+        self.assertIn('{"type":"daily","time":"07:45"}', system_prompt)
+        self.assertIn("不要写入 dm 或 TOMORROW_TOPICS.md", system_prompt)
+        self.assertIn("不支持取消、清空、查看或解释主动消息设置", system_prompt)
         self.assertIn("今天下班路上看到这个晚霞", payload["visible_conversation_events"])
 
     def test_memory_analysis_prompt_uses_visible_assistant_as_context_only(self):

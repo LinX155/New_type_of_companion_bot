@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from datetime import datetime, timedelta
 
@@ -222,6 +223,92 @@ class ActiveMessageSettingsTest(unittest.TestCase):
         job_ids = sorted(job.id for job in manager.scheduler.get_jobs())
         self.assertIn(f"{ACTIVE_NEXT_JOB_PREFIX}qq_private_1", job_ids)
         self.assertNotIn(f"{ACTIVE_DAILY_JOB_PREFIX}qq_private_1", job_ids)
+
+    def test_memory_analysis_side_channel_applies_active_message_setting_and_removes_topic(self):
+        class FakeMemory:
+            def __init__(self):
+                self.today_memory = "# 每日记忆\n"
+                self.tomorrow_topics = routes.TOMORROW_TOPICS_TEMPLATE
+
+            def read_today_memory(self):
+                return self.today_memory
+
+            def read_tomorrow_topics(self):
+                return self.tomorrow_topics
+
+            def write_today_memory(self, content):
+                self.today_memory = content
+                return True
+
+            def write_tomorrow_topics(self, content):
+                self.tomorrow_topics = content
+                return True
+
+        class FakeMemoryManager:
+            def __init__(self, memory):
+                self.memory = memory
+
+            def for_session(self, _session_id):
+                return self.memory
+
+        class FakeLLM:
+            def __init__(self, response):
+                self.response = response
+
+            async def chat_completion(self, **_kwargs):
+                return self.response
+
+        future = (datetime.now() + timedelta(days=1)).replace(second=0, microsecond=0)
+        future_text = future.strftime("%Y-%m-%d %H:%M")
+        proposed_topics = (
+            "# 明日话题\n\n"
+            "## 未闭合话题\n"
+            "- [pending] [2026-06-24]: 用户请求明早8点发消息。\n"
+            "- [pending] [2026-06-24]: 用户还没吃晚饭，后续可自然关心。\n\n"
+            "## 昨日记忆\n\n"
+            "## 生活感消息备选\n"
+        )
+        response = json.dumps(
+            {
+                "today_memory_md": (
+                    "# 每日记忆\n"
+                    "- 用户请求明早8点发消息。\n"
+                    "- 用户今天还在干活。\n"
+                ),
+                "tomorrow_topics_md": proposed_topics,
+                "active_message_setting": {"type": "next", "time": future_text},
+            },
+            ensure_ascii=False,
+        )
+        fake_memory = FakeMemory()
+        manager = SchedulerManager(
+            memory_manager=FakeMemoryManager(fake_memory),
+            llm_client=FakeLLM(response),
+        )
+        manager._start_job = lambda *_args, **_kwargs: 1
+        manager._finish_job = lambda *_args, **_kwargs: None
+        manager._load_transcript_for_date = lambda *_args, **_kwargs: [
+            {
+                "created_at": "2026-06-24T18:11:24",
+                "role": "user",
+                "text": "明天早上八点给我发消息好吗",
+            }
+        ]
+        applied = []
+        manager.set_active_message_setting_callback(
+            lambda session_id, setting: applied.append((session_id, setting)) or (True, "ok")
+        )
+
+        ok, error = asyncio.run(
+            manager._run_memory_analysis_for_session("memory_analysis_20990624_190000", "qq_private_1")
+        )
+
+        self.assertTrue(ok, error)
+        self.assertEqual(applied, [("qq_private_1", {"type": "next", "time": future_text})])
+        self.assertNotIn("用户请求明早8点发消息", fake_memory.today_memory)
+        self.assertIn("用户今天还在干活", fake_memory.today_memory)
+        self.assertNotIn("用户请求明早8点发消息", fake_memory.tomorrow_topics)
+        self.assertIn("用户还没吃晚饭", fake_memory.tomorrow_topics)
 
     def test_active_message_monitor_filters_initial_topics_and_formats_next_time(self):
         config = routes._normalize_active_message_config({

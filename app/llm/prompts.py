@@ -659,7 +659,8 @@ visible_conversation_events 按时间记录可见对话，每行都带 role:user
 JSON schema:
 {
   "today_memory_md": "完整的 dm/YYYY-MM-DD.md 内容",
-  "tomorrow_topics_md": "完整的 TOMORROW_TOPICS.md 内容"
+  "tomorrow_topics_md": "完整的 TOMORROW_TOPICS.md 内容",
+  "active_message_setting": {"type":"none","time":null}
 }
 
 规则:
@@ -677,6 +678,17 @@ JSON schema:
 - TOMORROW_TOPICS.md 只允许你维护“未闭合话题”部分；“昨日记忆”和“生活感消息备选”不是你的职责，必须原样保留。
 - TOMORROW_TOPICS.md 的未闭合话题只保留未来还可能自然续上的事项。
 - 不生成“昨日记忆”，那是凌晨整理线程职责。
+- 用户要求我在某个时间主动找他、发消息、提醒他、叫他、联系他时，不要写入 dm 或 TOMORROW_TOPICS.md；这不是记忆或话题，而是 active_message_setting。
+- active_message_setting 只允许三种输出，不要输出 Markdown、解释、用户原话或提醒事项正文:
+  {"type":"none","time":null}
+  {"type":"next","time":"2026-06-25 10:00"}
+  {"type":"daily","time":"07:45"}
+- type=next: 用户表达“下次 / 明天 / 明早 / 今晚 / 今天 / 等会儿 / 待会儿 / 稍后 某个时间 找我、提醒我、叫我、发消息、联系我”，time 必须基于 date 和 visible_conversation_events 中的本地时间换算成绝对时间 YYYY-MM-DD HH:mm。
+- type=daily: 用户表达“以后 / 每天 / 每日 / 固定 / 每次 / 天天 某个时间 找我、提醒我、叫我、发消息、联系我”，time 必须是每日时间 HH:mm。
+- type=none: 没有明确主动消息时间设置。time=null 只允许在 type=none 时出现。
+- 不支持取消、清空、查看或解释主动消息设置；遇到这类请求输出 {"type":"none","time":null}。
+- 如果用户说“明天 10 点提醒我吃药”，active_message_setting 只输出 {"type":"next","time":"YYYY-MM-DD 10:00"}，不要输出“吃药”，也不要把“吃药提醒”写入 TOMORROW_TOPICS.md。
+- 如果同一天有多个主动消息时间设置，以 visible_conversation_events 中最后一个明确设置为准。
 """
     system += "\n" + TOMORROW_TOPICS_FORMAT_RULES
     user = {
