@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import asyncio
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -185,6 +186,63 @@ class SessionIsolationTest(unittest.TestCase):
 
                 self.assertRegex(runtime.graph.llm.provider_user_id, r"^u_[0-9a-f]{32}$")
                 self.assertTrue(runtime.graph.llm.get_cache_debug()["provider_user_id_sent"])
+
+        asyncio.run(scenario())
+
+    def test_runtime_manager_internal_llm_omits_provider_identity_and_cache_affinity(self):
+        async def scenario():
+            async def noop_on_decision(_ctx):
+                return None
+
+            old_env_user_id = os.environ.get("LLM_PROVIDER_USER_ID")
+            os.environ["LLM_PROVIDER_USER_ID"] = "u_ffffffffffffffffffffffffffffffff"
+            try:
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    manager = SessionRuntimeManager(
+                        root_dir=tmp_dir,
+                        base_llm_client=LLMClient(
+                            api_key="test-key",
+                            base_url="https://api.deepseek.com",
+                            model="deepseek-chat",
+                            provider_user_id="u_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                        ),
+                        base_memory_manager=MemoryFileManager(tmp_dir),
+                        meme_catalog=MemeCatalog(str(Path(tmp_dir) / "memes")),
+                        media_job_queue=None,
+                        on_decision=noop_on_decision,
+                        hot_duration_minutes=30,
+                    )
+
+                    session_id = qq_private_session_id("10001")
+                    main_llm = manager.get(session_id).graph.llm
+                    internal_llm = manager.make_internal_llm_for_session(session_id)
+
+                    self.assertRegex(main_llm.provider_user_id, r"^u_[0-9a-f]{32}$")
+                    self.assertTrue(main_llm.get_cache_debug()["cache_affinity_enabled"])
+                    self.assertTrue(main_llm.get_cache_debug()["provider_user_id_sent"])
+
+                    self.assertIsNone(internal_llm.provider_user_id)
+                    internal_debug = internal_llm.get_cache_debug()
+                    self.assertFalse(internal_debug["cache_affinity_enabled"])
+                    self.assertFalse(internal_debug["provider_user_id_configured"])
+                    self.assertFalse(internal_debug["provider_user_id_sent"])
+                    self.assertIsNone(internal_debug["cache_session_id"])
+                    self.assertIsNone(internal_debug["prompt_cache_key"])
+
+                    kwargs = internal_llm._build_kwargs(
+                        messages=[{"role": "user", "content": "ping"}],
+                        temperature=0.2,
+                        max_tokens=None,
+                        stream=False,
+                    )
+                    self.assertNotIn("extra_headers", kwargs)
+                    self.assertNotIn("prompt_cache_key", kwargs)
+                    self.assertNotIn("user_id", kwargs["extra_body"])
+            finally:
+                if old_env_user_id is None:
+                    os.environ.pop("LLM_PROVIDER_USER_ID", None)
+                else:
+                    os.environ["LLM_PROVIDER_USER_ID"] = old_env_user_id
 
         asyncio.run(scenario())
 

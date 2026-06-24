@@ -95,6 +95,9 @@ class SessionRuntimeManager:
     def make_llm_for_session(self, session_id: str) -> LLMClient:
         return self._make_session_llm(normalize_session_id(session_id))
 
+    def make_internal_llm_for_session(self, session_id: str) -> LLMClient:
+        return self._make_internal_llm(normalize_session_id(session_id))
+
     async def clear_session(self, session_id: str):
         sid = normalize_session_id(session_id)
         runtime = self.get(sid)
@@ -134,6 +137,18 @@ class SessionRuntimeManager:
             cache_affinity_enabled=base.cache_affinity_enabled,
             cache_session_id=self._cache_session_id(session_id),
             provider_user_id=self.registry.provider_user_id(session_id),
+        )
+
+    def _make_internal_llm(self, session_id: str) -> LLMClient:
+        base = self.base_llm_client
+        return LLMClient(
+            api_key=base.api_key,
+            base_url=base.base_url,
+            model=base.model,
+            thinking_enabled=base.thinking_enabled,
+            temperature=base.temperature,
+            cache_affinity_enabled=False,
+            provider_user_id="",
         )
 
     def _cache_session_id(self, session_id: str) -> str:

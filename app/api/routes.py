@@ -291,8 +291,8 @@ def init_gate():
             hot_duration_minutes=_persisted.get("hot_duration_minutes", 30),
             conversation_context_loader=_load_conversation_context_for_runtime,
         )
-        media_job_queue.set_llm_client_factory(runtime_manager.make_llm_for_session)
-        scheduler_manager.set_llm_client_factory(runtime_manager.make_llm_for_session)
+        media_job_queue.set_llm_client_factory(runtime_manager.make_internal_llm_for_session)
+        scheduler_manager.set_llm_client_factory(runtime_manager.make_internal_llm_for_session)
         default_runtime = runtime_manager.get(DEFAULT_SESSION_ID)
         event_gate = default_runtime.gate
         companion_graph = default_runtime.graph
@@ -318,6 +318,22 @@ def _runtime_for_session(session_id: Optional[str]) -> SessionRuntime:
     if not runtime:
         raise RuntimeError("session runtime manager is not initialized")
     return runtime
+
+
+def _internal_llm_for_session(session_id: Optional[str]) -> LLMClient:
+    init_gate()
+    sid = normalize_session_id(session_id or DEFAULT_SESSION_ID)
+    if runtime_manager:
+        return runtime_manager.make_internal_llm_for_session(sid)
+    return LLMClient(
+        api_key=llm_client.api_key,
+        base_url=llm_client.base_url,
+        model=llm_client.model,
+        thinking_enabled=llm_client.thinking_enabled,
+        temperature=llm_client.temperature,
+        cache_affinity_enabled=False,
+        provider_user_id="",
+    )
 
 
 def _runtime_for_event(event: ChatEvent) -> SessionRuntime:
@@ -1698,13 +1714,13 @@ async def _handle_command_event(event: ChatEvent, result: Optional[dict] = None)
 async def _run_mem_command(text: str, session_id: str, target: Optional[dict] = None) -> tuple[bool, str]:
     await _emit_llm_started({**(target or {}), "session_id": session_id})
     runtime = _runtime_for_session(session_id)
-    return await runtime.memory.apply_mem_via_llm(text, runtime.graph.llm)
+    return await runtime.memory.apply_mem_via_llm(text, _internal_llm_for_session(session_id))
 
 
 async def _run_forget_command(text: str, session_id: str, target: Optional[dict] = None) -> tuple[bool, str]:
     await _emit_llm_started({**(target or {}), "session_id": session_id})
     runtime = _runtime_for_session(session_id)
-    return await runtime.memory.apply_forget_via_llm(text, runtime.graph.llm)
+    return await runtime.memory.apply_forget_via_llm(text, _internal_llm_for_session(session_id))
 
 
 def _event_type_for_text(text: str) -> EventType:
@@ -2048,6 +2064,7 @@ async def run_active_message_once(manual: bool = False, session_id: Optional[str
     runtime = _runtime_for_session(sid)
     gate = runtime.gate
     graph = runtime.graph
+    active_llm = _internal_llm_for_session(sid)
     memory = runtime.memory
     target = _message_target_from_session_id(sid)
     config = _normalize_active_message_config(load_settings().get("active_message"))
@@ -2079,7 +2096,7 @@ async def run_active_message_once(manual: bool = False, session_id: Optional[str
             await gate.finish_active_message_job(job_id, "dropped")
             return {"status": "skipped", "reason": "no_candidate"}
 
-        if not graph.llm.api_key:
+        if not active_llm.api_key:
             await gate.finish_active_message_job(job_id, "dropped")
             return {"status": "skipped", "reason": "llm_not_configured"}
 
@@ -2092,7 +2109,7 @@ async def run_active_message_once(manual: bool = False, session_id: Optional[str
             memory_core_md=memory.read_memory_core(),
             current_time=now.strftime("%H:%M"),
         )
-        raw_output = await graph.llm.chat_completion(messages=messages, temperature=0.3)
+        raw_output = await active_llm.chat_completion(messages=messages, temperature=0.3)
         decision = parse_active_decision(raw_output)
 
         if not await gate.is_active_message_job_current(job_id):
