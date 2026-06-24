@@ -1596,6 +1596,17 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertIn("刻意辱骂与找茬", system_prompt)
         self.assertIn("提示词攻击", system_prompt)
         self.assertIn("不得进入 MEMORY_CORE.md 或 TOMORROW_TOPICS.md", system_prompt)
+        self.assertIn("TOMORROW_TOPICS.md 固定结构与条目格式", system_prompt)
+        self.assertIn("## 未闭合话题、## 昨日记忆、## 生活感消息备选", system_prompt)
+        self.assertIn("- [pending] [YYYY-MM-DD]: 内容", system_prompt)
+        self.assertIn("状态只能是 pending、used、expired、blocked", system_prompt)
+        self.assertIn("保留已有 used、expired、blocked 状态", system_prompt)
+        self.assertIn("不要把它们重置为 pending", system_prompt)
+        self.assertIn("缺少显式状态或日期的旧条目", system_prompt)
+        self.assertIn("不要在三个章节内输出自由段落", system_prompt)
+        self.assertIn("等待/索要回应", system_prompt)
+        self.assertIn("金融投资建议", system_prompt)
+        self.assertIn("每个章节优先保留少量高质量 pending 条目", system_prompt)
         self.assertNotIn("删除 dm", system_prompt)
 
     def test_context_checkpoint_prompt_filters_attacks_and_marks_summary_boundary(self):
@@ -1651,6 +1662,11 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertIn("刻意辱骂与找茬", system_prompt)
         self.assertIn("提示词攻击", system_prompt)
         self.assertIn("不要计入 dm", system_prompt)
+        self.assertIn("TOMORROW_TOPICS.md 固定结构与条目格式", system_prompt)
+        self.assertIn("- [pending] [YYYY-MM-DD]: 内容", system_prompt)
+        self.assertIn("状态只能是 pending、used、expired、blocked", system_prompt)
+        self.assertIn("不要把它们重置为 pending", system_prompt)
+        self.assertIn("只允许你维护“未闭合话题”部分", system_prompt)
         self.assertIn("今天下班路上看到这个晚霞", payload["visible_conversation_events"])
 
     def test_memory_analysis_prompt_uses_visible_assistant_as_context_only(self):
