@@ -1,10 +1,11 @@
 import asyncio
+import copy
 import hashlib
 import json
 import os
 import uuid
 from dataclasses import dataclass
-from typing import Any, List, Dict, Optional, AsyncGenerator, Sequence
+from typing import Any, List, Dict, Optional, AsyncGenerator, Callable, Sequence
 from openai import AsyncOpenAI
 
 from app.core.provider_identity import is_valid_provider_user_id, provider_user_id_hash
@@ -74,6 +75,11 @@ class LLMClient:
         cache_session_id: Optional[str] = None,
         provider_user_id: Optional[str] = None,
         transient_retry_delays: Optional[Sequence[float]] = None,
+        runtime_id: Optional[str] = None,
+        client_scope: str = "standalone",
+        provider_config_hash: Optional[str] = None,
+        shared_client_getter: Optional[Callable[[], AsyncOpenAI]] = None,
+        shared_client_reset: Optional[Callable[[], None]] = None,
     ):
         self.api_key = api_key or os.getenv("LLM_API_KEY", "")
         self.base_url = base_url or os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
@@ -88,19 +94,33 @@ class LLMClient:
             provider_user_id if provider_user_id is not None else os.getenv("LLM_PROVIDER_USER_ID")
         )
         self.transient_retry_delays = self._normalize_retry_delays(transient_retry_delays)
+        self.llm_runtime_id = runtime_id or "standalone"
+        self.client_scope = client_scope or "standalone"
+        self.provider_config_hash = provider_config_hash
+        self._shared_client_getter = shared_client_getter
+        self._shared_client_reset = shared_client_reset
         self._prompt_cache_key_disabled_reason: Optional[str] = None
         self._client: Optional[AsyncOpenAI] = None
         self._last_usage: Optional[dict] = None
         self._last_reasoning_content: Optional[str] = None
         self._last_assistant_message: Optional[dict] = None
+        self._last_call_debug: Optional[dict] = None
 
     def _get_client(self) -> AsyncOpenAI:
+        if self._shared_client_getter is not None:
+            return self._shared_client_getter()
         if self._client is None:
             self._client = AsyncOpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
             )
         return self._client
+
+    def _reset_transport_client(self):
+        if self._shared_client_reset is not None:
+            self._shared_client_reset()
+            return
+        self._client = None
 
     def _build_kwargs(
         self,
@@ -158,43 +178,102 @@ class LLMClient:
     ):
         include_prompt_cache_key = True
         failures = 0
+        call_debug = self._new_call_debug(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=stream,
+        )
+        self._last_call_debug = call_debug
 
         while True:
             try:
                 try:
-                    return await self._create_chat_completion_once(
+                    call_debug["request_attempts"] += 1
+                    response = await self._create_chat_completion_once(
                         messages,
                         temperature,
                         max_tokens,
                         stream,
                         include_prompt_cache_key=include_prompt_cache_key,
                     )
+                    call_debug["status"] = "ok"
+                    call_debug["prompt_cache_key_included_final"] = include_prompt_cache_key
+                    return response
                 except Exception as exc:
                     if not include_prompt_cache_key or not self._should_retry_without_prompt_cache_key(exc):
                         raise
                     self._prompt_cache_key_disabled_reason = str(exc)[:300]
+                    call_debug["prompt_cache_key_disabled_reason"] = self._prompt_cache_key_disabled_reason
+                    call_debug["prompt_cache_key_retry"] = True
                     include_prompt_cache_key = False
-                    return await self._create_chat_completion_once(
+                    call_debug["request_attempts"] += 1
+                    response = await self._create_chat_completion_once(
                         messages,
                         temperature,
                         max_tokens,
                         stream,
                         include_prompt_cache_key=False,
                     )
+                    call_debug["status"] = "ok"
+                    call_debug["prompt_cache_key_included_final"] = False
+                    return response
             except Exception as exc:
+                call_debug["transient_error_class"] = exc.__class__.__name__
+                call_debug["status_code"] = self._status_code_from_exception(exc)
                 if not self._should_retry_transient_error(exc):
+                    call_debug["status"] = "error"
                     raise
 
                 if failures >= len(self.transient_retry_delays):
+                    call_debug["status"] = "transient_retry_exhausted"
                     raise RuntimeError(
                         self._transient_retry_exhausted_message(exc, failures + 1)
                     ) from exc
 
                 delay = self.transient_retry_delays[failures]
                 failures += 1
-                self._client = None
+                call_debug["retry_attempts"] = failures
+                call_debug["retry_delays"].append(delay)
+                call_debug["status"] = "retrying"
+                self._reset_transport_client()
                 if delay > 0:
                     await asyncio.sleep(delay)
+
+    def _new_call_debug(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        temperature: float,
+        max_tokens: Optional[int],
+        stream: bool,
+    ) -> dict:
+        provider_user_id = self._provider_user_id_for_request()
+        disabled_reason = self._prompt_cache_key_disabled_reason
+        if not self.cache_affinity_enabled:
+            disabled_reason = "cache_affinity_disabled"
+        return {
+            "llm_runtime_id": self.llm_runtime_id,
+            "client_scope": self.client_scope,
+            "provider_config_hash": self.provider_config_hash,
+            "model": self.model,
+            "thinking_enabled": self.thinking_enabled,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": stream,
+            "message_count": len(messages or []),
+            "request_attempts": 0,
+            "retry_attempts": 0,
+            "retry_delays": [],
+            "transient_error_class": None,
+            "status_code": None,
+            "status": "pending",
+            "cache_affinity_enabled": self.cache_affinity_enabled,
+            "prompt_cache_key_disabled_reason": disabled_reason,
+            "prompt_cache_key_retry": False,
+            "prompt_cache_key_included_final": None,
+            "provider_user_id_sent": bool(provider_user_id),
+        }
 
     def _transient_retry_exhausted_message(self, exc: Exception, attempts: int) -> str:
         message = str(exc).strip() or exc.__class__.__name__
@@ -323,6 +402,9 @@ class LLMClient:
 
     def get_last_assistant_message(self) -> Optional[dict]:
         return self._last_assistant_message
+
+    def get_last_call_debug(self) -> dict:
+        return copy.deepcopy(self._last_call_debug) if self._last_call_debug else {}
 
     def _serialize_usage(self, usage: Any) -> Optional[dict]:
         if usage is None:
@@ -459,6 +541,9 @@ class LLMClient:
     def get_cache_debug(self) -> dict:
         provider_user_id = self._provider_user_id_for_request()
         return {
+            "llm_runtime_id": self.llm_runtime_id,
+            "client_scope": self.client_scope,
+            "provider_config_hash": self.provider_config_hash,
             "cache_affinity_enabled": self.cache_affinity_enabled,
             "cache_session_id": self.cache_session_id if self.cache_affinity_enabled else None,
             "prompt_cache_key": self._prompt_cache_key() if self.cache_affinity_enabled else None,
@@ -529,7 +614,7 @@ class LLMClient:
         if provider_user_id is not None:
             self.provider_user_id = self._normalize_provider_user_id(provider_user_id)
         # Reset client to use new config
-        self._client = None
+        self._reset_transport_client()
         self.reset_cache_session()
 
     def _normalize_temperature(self, value: Any) -> float:

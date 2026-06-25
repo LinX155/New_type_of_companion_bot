@@ -216,18 +216,34 @@ class SessionIsolationTest(unittest.TestCase):
                     session_id = qq_private_session_id("10001")
                     main_llm = manager.get(session_id).graph.llm
                     internal_llm = manager.make_internal_llm_for_session(session_id)
+                    repeated_internal_llm = manager.make_internal_llm_for_session(session_id)
+                    background_llm = manager.make_background_llm_for_session(session_id)
+                    repeated_background_llm = manager.make_background_llm_for_session(session_id)
 
+                    self.assertIs(internal_llm, repeated_internal_llm)
+                    self.assertIs(background_llm, repeated_background_llm)
                     self.assertRegex(main_llm.provider_user_id, r"^u_[0-9a-f]{32}$")
-                    self.assertTrue(main_llm.get_cache_debug()["cache_affinity_enabled"])
-                    self.assertTrue(main_llm.get_cache_debug()["provider_user_id_sent"])
+                    main_debug = main_llm.get_cache_debug()
+                    self.assertEqual(main_debug["client_scope"], "chat_session")
+                    self.assertTrue(main_debug["cache_affinity_enabled"])
+                    self.assertTrue(main_debug["provider_user_id_sent"])
 
                     self.assertIsNone(internal_llm.provider_user_id)
                     internal_debug = internal_llm.get_cache_debug()
+                    self.assertEqual(internal_debug["client_scope"], "internal_session")
                     self.assertFalse(internal_debug["cache_affinity_enabled"])
                     self.assertFalse(internal_debug["provider_user_id_configured"])
                     self.assertFalse(internal_debug["provider_user_id_sent"])
                     self.assertIsNone(internal_debug["cache_session_id"])
                     self.assertIsNone(internal_debug["prompt_cache_key"])
+
+                    background_debug = background_llm.get_cache_debug()
+                    self.assertEqual(background_debug["client_scope"], "background_batch")
+                    self.assertFalse(background_debug["cache_affinity_enabled"])
+                    self.assertFalse(background_debug["provider_user_id_configured"])
+                    self.assertFalse(background_debug["provider_user_id_sent"])
+                    self.assertIsNone(background_debug["cache_session_id"])
+                    self.assertIsNone(background_debug["prompt_cache_key"])
 
                     kwargs = internal_llm._build_kwargs(
                         messages=[{"role": "user", "content": "ping"}],
@@ -243,6 +259,49 @@ class SessionIsolationTest(unittest.TestCase):
                     os.environ.pop("LLM_PROVIDER_USER_ID", None)
                 else:
                     os.environ["LLM_PROVIDER_USER_ID"] = old_env_user_id
+
+        asyncio.run(scenario())
+
+    def test_runtime_manager_rebuilds_runtime_clients_after_llm_config_change(self):
+        async def scenario():
+            async def noop_on_decision(_ctx):
+                return None
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                manager = SessionRuntimeManager(
+                    root_dir=tmp_dir,
+                    base_llm_client=LLMClient(
+                        api_key="test-key",
+                        base_url="https://api.deepseek.com",
+                        model="deepseek-chat",
+                    ),
+                    base_memory_manager=MemoryFileManager(tmp_dir),
+                    meme_catalog=MemeCatalog(str(Path(tmp_dir) / "memes")),
+                    media_job_queue=None,
+                    on_decision=noop_on_decision,
+                    hot_duration_minutes=30,
+                )
+
+                session_id = qq_private_session_id("10001")
+                runtime = manager.get(session_id)
+                old_main_llm = runtime.graph.llm
+                old_internal_llm = manager.make_internal_llm_for_session(session_id)
+                old_background_llm = manager.make_background_llm_for_session(session_id)
+                old_runtime_id = old_main_llm.get_cache_debug()["llm_runtime_id"]
+
+                manager.base_llm_client.update_config(model="deepseek-chat-v2")
+                manager.reconfigure_llm_clients(reason="test_llm_config_changed")
+
+                new_main_llm = runtime.graph.llm
+                new_internal_llm = manager.make_internal_llm_for_session(session_id)
+                new_background_llm = manager.make_background_llm_for_session(session_id)
+
+                self.assertIsNot(new_main_llm, old_main_llm)
+                self.assertIsNot(new_internal_llm, old_internal_llm)
+                self.assertIsNot(new_background_llm, old_background_llm)
+                self.assertEqual(new_main_llm.model, "deepseek-chat-v2")
+                self.assertNotEqual(new_main_llm.get_cache_debug()["llm_runtime_id"], old_runtime_id)
+                self.assertEqual(runtime.graph._prefix_rebuild_reason, "test_llm_config_changed")
 
         asyncio.run(scenario())
 

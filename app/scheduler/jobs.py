@@ -238,6 +238,27 @@ class SchedulerManager:
             return self.llm_client_factory(session_id)
         return self.llm
 
+    def _llm_call_debug(self, llm: Optional[LLMClient]) -> Optional[dict]:
+        if llm is None or not hasattr(llm, "get_last_call_debug"):
+            return None
+        debug = llm.get_last_call_debug()
+        return debug if debug else None
+
+    def _job_note(
+        self,
+        *,
+        error: Optional[str] = None,
+        llm: Optional[LLMClient] = None,
+        llm_debug: Optional[dict] = None,
+    ) -> Optional[str]:
+        debug = llm_debug or self._llm_call_debug(llm)
+        if not debug:
+            return error
+        payload = {"llm_call_debug": debug}
+        if error:
+            payload["error"] = error
+        return json.dumps(payload, ensure_ascii=False)[:4000]
+
     async def _run_memory_analysis(self):
         base_job_id = f"memory_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         failures = []
@@ -250,6 +271,7 @@ class SchedulerManager:
     async def _run_memory_analysis_for_session(self, base_job_id: str, session_id: str):
         job_id = f"{base_job_id}_{session_id}"
         log_id = self._start_job(job_id, "memory_analysis", session_id=session_id)
+        llm = None
         try:
             llm = self._llm_for_session(session_id)
             if llm is None:
@@ -296,10 +318,10 @@ class SchedulerManager:
             if active_message_setting["type"] != "none":
                 self._apply_memory_active_message_setting(session_id, active_message_setting)
 
-            self._finish_job(log_id, "completed")
+            self._finish_job(log_id, "completed", self._job_note(llm=llm))
             return True, None
         except Exception as e:
-            self._finish_job(log_id, "failed", str(e))
+            self._finish_job(log_id, "failed", self._job_note(error=str(e), llm=llm))
             return False, str(e)
 
     async def _run_midnight_cleanup(self):
@@ -318,6 +340,7 @@ class SchedulerManager:
     async def _run_midnight_cleanup_for_session(self, base_job_id: str, session_id: str):
         job_id = f"{base_job_id}_{session_id}"
         log_id = self._start_job(job_id, "midnight_cleanup", session_id=session_id)
+        llm = None
         try:
             llm = self._llm_for_session(session_id)
             if llm is None:
@@ -347,10 +370,10 @@ class SchedulerManager:
                 if not memory.write_tomorrow_topics(tomorrow_topics):
                     raise RuntimeError("failed to write TOMORROW_TOPICS.md")
 
-            self._finish_job(log_id, "completed")
+            self._finish_job(log_id, "completed", self._job_note(llm=llm))
             return True, None
         except Exception as e:
-            self._finish_job(log_id, "failed", str(e))
+            self._finish_job(log_id, "failed", self._job_note(error=str(e), llm=llm))
             return False, str(e)
 
     async def _run_context_checkpoint_for_session(self, base_job_id: str, session_id: str):
@@ -359,12 +382,15 @@ class SchedulerManager:
         try:
             result = await self._maybe_create_context_checkpoint(job_id, session_id)
             self._record_context_checkpoint_audit(session_id, job_id, result, "completed")
-            self._finish_job(log_id, "completed")
+            self._finish_job(log_id, "completed", self._job_note(llm_debug=result.get("llm_call_debug")))
             return True, None
         except Exception as e:
+            llm_debug = getattr(e, "_llm_call_debug", None)
             result = {"status": "failed", "error": str(e)}
+            if llm_debug:
+                result["llm_call_debug"] = llm_debug
             self._record_context_checkpoint_audit(session_id, job_id, result, "failed")
-            self._finish_job(log_id, "failed", str(e))
+            self._finish_job(log_id, "failed", self._job_note(error=str(e), llm_debug=llm_debug))
             return False, str(e)
 
     async def _maybe_create_context_checkpoint(self, job_id: str, session_id: str) -> dict:
@@ -443,11 +469,24 @@ class SchedulerManager:
             tomorrow_topics_md=memory.read_tomorrow_topics(),
             estimated_tokens_before=current_tokens,
         )
-        raw_output = await llm.chat_completion(messages=messages, temperature=0.2)
-        data = self._parse_json_object(raw_output)
+        try:
+            raw_output = await llm.chat_completion(messages=messages, temperature=0.2)
+            data = self._parse_json_object(raw_output)
+        except Exception as exc:
+            try:
+                setattr(exc, "_llm_call_debug", self._llm_call_debug(llm))
+            except Exception:
+                pass
+            raise
+        llm_debug = self._llm_call_debug(llm)
         checkpoint_text = (data.get("checkpoint_text") or "").strip()
         if not checkpoint_text:
-            raise RuntimeError("context checkpoint response missing checkpoint_text")
+            exc = RuntimeError("context checkpoint response missing checkpoint_text")
+            try:
+                setattr(exc, "_llm_call_debug", llm_debug)
+            except Exception:
+                pass
+            raise exc
 
         checkpoint_id = self._write_context_checkpoint(
             session_id=session_id,
@@ -464,7 +503,7 @@ class SchedulerManager:
                 context.get("checkpoint_text") or checkpoint_text,
                 context.get("history") or [],
             )
-        return {
+        result = {
             "status": "created",
             "context_checkpoint_id": checkpoint_id,
             "covered_until_event_id": through_event_id,
@@ -473,6 +512,9 @@ class SchedulerManager:
             "threshold_tokens": threshold_tokens,
             "compressed_event_count": len(visible_events),
         }
+        if llm_debug:
+            result["llm_call_debug"] = llm_debug
+        return result
 
     def _write_context_checkpoint(
         self,

@@ -1956,6 +1956,9 @@ class CompanionGraph:
         envelope: Optional[LLMResponseEnvelope] = None,
         normalized_output: Optional[NormalizedLLMOutput] = None,
     ):
+        call_debug = self.llm.get_last_call_debug() if hasattr(self.llm, "get_last_call_debug") else None
+        if call_debug:
+            self._last_prompt_observability["llm_call_debug"] = call_debug
         usage = envelope.usage if envelope else (
             self.llm.get_last_usage() if hasattr(self.llm, "get_last_usage") else None
         )

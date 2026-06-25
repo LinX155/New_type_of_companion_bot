@@ -15,3 +15,8 @@ harness_real_endpoint_test_report.md
 # 用户配置持久化（含明文 API key）
 data/user_settings.json
 data/provider_identity_secret.json
+
+# 运行期会话、数据和媒体产物
+memory/sessions/
+data/
+_codex_video_review/

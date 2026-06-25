@@ -88,6 +88,9 @@ class ActiveMessageSettingsTest(unittest.TestCase):
         )
 
     def test_scheduled_status_enforces_priority_and_stale_jobs(self):
+        next_time = (datetime.now() + timedelta(days=1)).replace(hour=9, minute=30, second=0, microsecond=0)
+        next_time_text = next_time.strftime("%Y-%m-%d %H:%M")
+        stale_next_time_text = (next_time + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M")
         config = routes._normalize_active_message_config({
             "enabled": True,
             "hour": 10,
@@ -96,7 +99,7 @@ class ActiveMessageSettingsTest(unittest.TestCase):
             "sessions": {
                 "qq_private_1": {
                     "daily_time": "07:45",
-                    "next_active_at": "2026-06-25 09:30",
+                    "next_active_at": next_time_text,
                 },
                 "qq_private_2": {"daily_time": "08:15"},
             },
@@ -116,16 +119,16 @@ class ActiveMessageSettingsTest(unittest.TestCase):
                 config=config,
                 session_id="qq_private_1",
                 source="next",
-                scheduled_time="2026-06-25 09:30",
+                scheduled_time=next_time_text,
             ),
-            {"due": True, "source": "next", "time": "2026-06-25 09:30"},
+            {"due": True, "source": "next", "time": next_time_text},
         )
         self.assertEqual(
             routes._active_message_scheduled_status(
                 config=config,
                 session_id="qq_private_1",
                 source="next",
-                scheduled_time="2026-06-25 10:00",
+                scheduled_time=stale_next_time_text,
             )["reason"],
             "stale_next_job",
         )
@@ -142,6 +145,28 @@ class ActiveMessageSettingsTest(unittest.TestCase):
             routes._active_message_scheduled_status(
                 config=config,
                 session_id="qq_private_3",
+                source="global",
+                scheduled_time="10:00",
+            ),
+            {"due": True, "source": "global", "time": "10:00"},
+        )
+
+        expired_config = routes._normalize_active_message_config({
+            "enabled": True,
+            "hour": 10,
+            "minute": 0,
+            "daily_limit": 1,
+            "sessions": {
+                "qq_private_4": {
+                    "next_active_at": (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M"),
+                },
+            },
+        })
+        self.assertFalse(routes._active_message_has_user_override(expired_config, "qq_private_4"))
+        self.assertEqual(
+            routes._active_message_scheduled_status(
+                config=expired_config,
+                session_id="qq_private_4",
                 source="global",
                 scheduled_time="10:00",
             ),
@@ -431,6 +456,167 @@ class ActiveMessageSettingsTest(unittest.TestCase):
             routes.load_settings = original_load_settings
             routes.save_settings = original_save_settings
             routes._refresh_active_message_jobs = original_refresh_jobs
+
+    def test_next_active_message_retries_llm_then_falls_back_and_clears_after_send(self):
+        class FakeGate:
+            def __init__(self):
+                self.finished = []
+                self.decisions = []
+
+            async def reserve_active_message_job(self):
+                return "active_test"
+
+            async def finish_active_message_job(self, job_id, result):
+                self.finished.append((job_id, result))
+
+            async def is_active_message_job_current(self, _job_id):
+                return True
+
+            async def dispatch_latest_after_stale(self, _job_id):
+                raise AssertionError("job should not go stale")
+
+            def mark_job_stale_dropped(self, _job_id):
+                raise AssertionError("job should not go stale")
+
+            def record_decision(self, decision):
+                self.decisions.append(decision)
+
+        class FakeGraph:
+            def __init__(self):
+                self.committed = []
+
+            def commit_external_assistant_text(self, text):
+                self.committed.append(text)
+
+        class FakeMemory:
+            def __init__(self):
+                self.tomorrow_topics = (
+                    "# 明日话题\n\n"
+                    "## 未闭合话题\n"
+                    "- [pending] [2026-06-24]: 用户期待我写卡片。\n\n"
+                    "## 昨日记忆\n\n"
+                    "## 生活感消息备选\n"
+                )
+
+            def read_tomorrow_topics(self):
+                return self.tomorrow_topics
+
+            def write_tomorrow_topics(self, content):
+                self.tomorrow_topics = content
+                return True
+
+            def read_soul(self):
+                return ""
+
+            def read_memory_core(self):
+                return ""
+
+        class FakeRuntime:
+            def __init__(self, gate, graph, memory):
+                self.gate = gate
+                self.graph = graph
+                self.memory = memory
+
+        class FailingLLM:
+            api_key = "test-key"
+
+            def __init__(self):
+                self.calls = 0
+
+            async def chat_completion(self, **_kwargs):
+                self.calls += 1
+                raise RuntimeError("Connection error")
+
+        store = {
+            "active_message": {
+                "enabled": True,
+                "hour": 10,
+                "minute": 0,
+                "daily_limit": 1,
+                "sessions": {
+                    "qq_private_1": {"next_active_at": "2026-06-25 08:00"},
+                },
+            }
+        }
+        gate = FakeGate()
+        graph = FakeGraph()
+        memory = FakeMemory()
+        llm = FailingLLM()
+        emitted = []
+        records = []
+        sleeps = []
+        refreshed = []
+
+        original_runtime = routes._runtime_for_session
+        original_internal_llm = routes._internal_llm_for_session
+        original_load_settings = routes.load_settings
+        original_save_settings = routes.save_settings
+        original_refresh_jobs = routes._refresh_active_message_jobs
+        original_sent_today = routes._active_messages_sent_today
+        original_unanswered = routes._has_unanswered_active_message
+        original_emit_started = routes._emit_llm_started
+        original_emit_finished = routes._emit_llm_finished
+        original_emit_message = routes._emit_message
+        original_record_active = routes._record_active_message
+        original_retry_sleep = routes._active_message_next_retry_sleep
+        original_retry_count = routes.ACTIVE_MESSAGE_NEXT_LLM_RETRY_COUNT
+
+        def fake_save_settings(updates):
+            store.update(updates)
+            return True
+
+        async def fake_retry_sleep():
+            sleeps.append("sleep")
+
+        routes._runtime_for_session = lambda _sid: FakeRuntime(gate, graph, memory)
+        routes._internal_llm_for_session = lambda _sid: llm
+        routes.load_settings = lambda: dict(store)
+        routes.save_settings = fake_save_settings
+        routes._refresh_active_message_jobs = lambda config=None, persist=True: refreshed.append(config) or config
+        routes._active_messages_sent_today = lambda _sid: 0
+        routes._has_unanswered_active_message = lambda _sid: False
+        routes._emit_llm_started = lambda *_args, **_kwargs: asyncio.sleep(0)
+        routes._emit_llm_finished = lambda *_args, **_kwargs: asyncio.sleep(0)
+        routes._emit_message = lambda data: emitted.append(data) or asyncio.sleep(0)
+        routes._record_active_message = lambda sid, job_id, raw, decision, routed: records.append(
+            (sid, job_id, raw, decision.action.value, routed.get("text"))
+        )
+        routes._active_message_next_retry_sleep = fake_retry_sleep
+        routes.ACTIVE_MESSAGE_NEXT_LLM_RETRY_COUNT = 5
+        try:
+            result = asyncio.run(
+                routes.run_active_message_once(
+                    session_id="qq_private_1",
+                    scheduled_source="next",
+                    scheduled_time="2026-06-25 08:00",
+                )
+            )
+
+            self.assertEqual(result["status"], "sent")
+            self.assertEqual(result["fallback_reason"], "llm_retry_exhausted")
+            self.assertEqual(result["llm_attempts"], 6)
+            self.assertEqual(llm.calls, 6)
+            self.assertEqual(len(sleeps), 5)
+            self.assertEqual(emitted[-1]["text"], routes.ACTIVE_MESSAGE_NEXT_FALLBACK_TEXT)
+            self.assertEqual(graph.committed, [routes.ACTIVE_MESSAGE_NEXT_FALLBACK_TEXT])
+            self.assertEqual(gate.finished, [("active_test", "sent")])
+            self.assertNotIn("qq_private_1", store["active_message"]["sessions"])
+            self.assertEqual(refreshed[-1]["sessions"], {})
+            self.assertIn("system:next_active_at_llm_retry_exhausted:Connection error", records[-1][2])
+        finally:
+            routes._runtime_for_session = original_runtime
+            routes._internal_llm_for_session = original_internal_llm
+            routes.load_settings = original_load_settings
+            routes.save_settings = original_save_settings
+            routes._refresh_active_message_jobs = original_refresh_jobs
+            routes._active_messages_sent_today = original_sent_today
+            routes._has_unanswered_active_message = original_unanswered
+            routes._emit_llm_started = original_emit_started
+            routes._emit_llm_finished = original_emit_finished
+            routes._emit_message = original_emit_message
+            routes._record_active_message = original_record_active
+            routes._active_message_next_retry_sleep = original_retry_sleep
+            routes.ACTIVE_MESSAGE_NEXT_LLM_RETRY_COUNT = original_retry_count
 
     def test_mem_active_message_setting_does_not_run_memory_write_path(self):
         calls = {"mem_command": 0, "graph_reset": 0}

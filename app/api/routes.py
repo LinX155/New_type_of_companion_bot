@@ -210,6 +210,15 @@ ACTIVE_MESSAGE_DEFAULTS = {
     "daily_limit": 1,
     "sessions": {},
 }
+ACTIVE_MESSAGE_NEXT_FALLBACK_TEXT = "到你说的时间了，我来找你一下。"
+ACTIVE_MESSAGE_NEXT_RETRY_DELAY_SECONDS = max(
+    0.0,
+    _env_float("ACTIVE_MESSAGE_NEXT_RETRY_DELAY_SECONDS", 180.0),
+)
+ACTIVE_MESSAGE_NEXT_LLM_RETRY_COUNT = max(
+    0,
+    _env_int("ACTIVE_MESSAGE_NEXT_LLM_RETRY_COUNT", 5),
+)
 
 
 class ApiConfig(BaseModel):
@@ -301,7 +310,7 @@ def init_gate():
             conversation_context_loader=_load_conversation_context_for_runtime,
         )
         media_job_queue.set_llm_client_factory(runtime_manager.make_internal_llm_for_session)
-        scheduler_manager.set_llm_client_factory(runtime_manager.make_internal_llm_for_session)
+        scheduler_manager.set_llm_client_factory(runtime_manager.make_background_llm_for_session)
         default_runtime = runtime_manager.get(DEFAULT_SESSION_ID)
         event_gate = default_runtime.gate
         companion_graph = default_runtime.graph
@@ -2262,6 +2271,67 @@ def _record_assistant_send(
         db.close()
 
 
+async def _active_message_next_retry_sleep():
+    if ACTIVE_MESSAGE_NEXT_RETRY_DELAY_SECONDS > 0:
+        await asyncio.sleep(ACTIVE_MESSAGE_NEXT_RETRY_DELAY_SECONDS)
+
+
+async def _send_active_message_fixed_text(
+    *,
+    sid: str,
+    target: dict,
+    gate,
+    graph,
+    job_id: str,
+    text: str,
+    raw_output: str,
+    due_status: dict,
+    clear_next: bool = False,
+    extra_result: Optional[dict] = None,
+) -> dict:
+    from ..core.router import ActionRouter
+
+    decision = ActionDecision(
+        action=Action.REPLY,
+        items=[SendItem(type=SendItemType.TEXT, content=text)],
+    )
+    routed = ActionRouter().route(decision)
+    active_items = list(routed.get("items") or [])
+    active_item = active_items[0] if active_items else None
+    _record_active_message(sid, job_id, raw_output, decision, routed)
+    gate.record_decision(decision)
+    await gate.finish_active_message_job(job_id, "sent")
+    if graph and routed["text"]:
+        graph.commit_external_assistant_text(routed["text"])
+    await _emit_message({
+        "type": "assistant_message",
+        "session_id": sid,
+        "action": decision.action.value,
+        "text": routed["text"],
+        "content": routed["text"],
+        "item_type": active_item.type.value if active_item else "text",
+        "visible": True,
+        "is_meme": False,
+        "meme_path": None,
+        "source": "active_message",
+        **target,
+    })
+    next_cleared = True
+    if clear_next:
+        next_cleared = _clear_active_message_next_time(sid)
+    result = {
+        "status": "sent",
+        "job_id": job_id,
+        "action": decision.action.value,
+        "schedule": due_status,
+    }
+    if extra_result:
+        result.update(extra_result)
+    if not next_cleared:
+        result["next_clear_error"] = "failed_to_clear_next_active_time"
+    return result
+
+
 async def run_active_message_once(
     manual: bool = False,
     session_id: Optional[str] = None,
@@ -2294,8 +2364,6 @@ async def run_active_message_once(
         )
         if not due_status["due"]:
             return {"status": "skipped", "reason": due_status["reason"], "schedule": due_status}
-        if due_status["source"] == "next" and not _clear_active_message_next_time(sid):
-            return {"status": "error", "reason": "failed_to_clear_next_active_time"}
     if _active_messages_sent_today(sid) >= config["daily_limit"]:
         return {"status": "skipped", "reason": "daily_limit"}
     if _has_unanswered_active_message(sid):
@@ -2316,33 +2384,18 @@ async def run_active_message_once(
         candidate = select_pending_candidate(topics)
         if not candidate:
             if due_status.get("source") == "next":
-                from ..core.router import ActionRouter
-                decision = ActionDecision(
-                    action=Action.REPLY,
-                    items=[SendItem(type=SendItemType.TEXT, content="到你说的时间了，我来找你一下。")],
+                return await _send_active_message_fixed_text(
+                    sid=sid,
+                    target=target,
+                    gate=gate,
+                    graph=graph,
+                    job_id=job_id,
+                    text=ACTIVE_MESSAGE_NEXT_FALLBACK_TEXT,
+                    raw_output="system:next_active_at_without_candidate",
+                    due_status=due_status,
+                    clear_next=True,
+                    extra_result={"fallback_reason": "no_candidate"},
                 )
-                routed = ActionRouter().route(decision)
-                active_items = list(routed.get("items") or [])
-                active_item = active_items[0] if active_items else None
-                _record_active_message(sid, job_id, "system:next_active_at_without_candidate", decision, routed)
-                gate.record_decision(decision)
-                await gate.finish_active_message_job(job_id, "sent")
-                if graph and routed["text"]:
-                    graph.commit_external_assistant_text(routed["text"])
-                await _emit_message({
-                    "type": "assistant_message",
-                    "session_id": sid,
-                    "action": decision.action.value,
-                    "text": routed["text"],
-                    "content": routed["text"],
-                    "item_type": active_item.type.value if active_item else "text",
-                    "visible": True,
-                    "is_meme": False,
-                    "meme_path": None,
-                    "source": "active_message",
-                    **target,
-                })
-                return {"status": "sent", "job_id": job_id, "action": decision.action.value, "schedule": due_status}
             await gate.finish_active_message_job(job_id, "dropped")
             return {"status": "skipped", "reason": "no_candidate"}
 
@@ -2359,7 +2412,59 @@ async def run_active_message_once(
             memory_core_md=memory.read_memory_core(),
             current_time=now.strftime("%H:%M"),
         )
-        raw_output = await active_llm.chat_completion(messages=messages, temperature=0.3)
+        is_next_schedule = due_status.get("source") == "next"
+        max_llm_attempts = 1 + (ACTIVE_MESSAGE_NEXT_LLM_RETRY_COUNT if is_next_schedule else 0)
+        last_llm_error = None
+        raw_output = None
+        for attempt_index in range(max_llm_attempts):
+            if attempt_index > 0:
+                await _active_message_next_retry_sleep()
+                if not await gate.is_active_message_job_current(job_id):
+                    gate.mark_job_stale_dropped(job_id)
+                    await gate.dispatch_latest_after_stale(job_id)
+                    return {
+                        "status": "skipped",
+                        "reason": "stale_dropped",
+                        "schedule": due_status,
+                        "llm_attempts": attempt_index,
+                    }
+            try:
+                raw_output = await active_llm.chat_completion(messages=messages, temperature=0.3)
+                break
+            except Exception as exc:
+                last_llm_error = exc
+                if not is_next_schedule:
+                    raise
+
+        if raw_output is None:
+            if is_next_schedule:
+                if not await gate.is_active_message_job_current(job_id):
+                    gate.mark_job_stale_dropped(job_id)
+                    await gate.dispatch_latest_after_stale(job_id)
+                    return {
+                        "status": "skipped",
+                        "reason": "stale_dropped",
+                        "schedule": due_status,
+                        "llm_attempts": max_llm_attempts,
+                    }
+                error_summary = str(last_llm_error) if last_llm_error else "unknown error"
+                return await _send_active_message_fixed_text(
+                    sid=sid,
+                    target=target,
+                    gate=gate,
+                    graph=graph,
+                    job_id=job_id,
+                    text=ACTIVE_MESSAGE_NEXT_FALLBACK_TEXT,
+                    raw_output=f"system:next_active_at_llm_retry_exhausted:{error_summary}",
+                    due_status=due_status,
+                    clear_next=True,
+                    extra_result={
+                        "fallback_reason": "llm_retry_exhausted",
+                        "llm_attempts": max_llm_attempts,
+                    },
+                )
+            raise last_llm_error or RuntimeError("active message LLM call failed")
+
         decision = parse_active_decision(raw_output)
 
         if not await gate.is_active_message_job_current(job_id):
@@ -2412,13 +2517,16 @@ async def run_active_message_once(
             "source": "active_message",
             **target,
         })
-        return {
+        result = {
             "status": "sent",
             "job_id": job_id,
             "action": decision.action.value,
             "candidate_section": candidate.section,
             "schedule": due_status,
         }
+        if due_status.get("source") == "next" and not _clear_active_message_next_time(sid):
+            result["next_clear_error"] = "failed_to_clear_next_active_time"
+        return result
     except Exception as e:
         await gate.finish_active_message_job(job_id, "dropped")
         return {"status": "error", "reason": str(e)}
@@ -2656,11 +2764,22 @@ def _active_message_session_config(config: dict, session_id: str) -> dict:
     return dict((config.get("sessions") or {}).get(sid) or {})
 
 
+def _active_message_pending_next_time(session_cfg: dict, now: Optional[datetime] = None) -> Optional[str]:
+    next_active_at = _normalize_active_datetime(session_cfg.get("next_active_at"))
+    if not next_active_at:
+        return None
+    now = now or datetime.now()
+    due_at = datetime.strptime(next_active_at, "%Y-%m-%d %H:%M")
+    if now.replace(second=0, microsecond=0) <= due_at:
+        return next_active_at
+    return None
+
+
 def _active_message_has_user_override(config: dict, session_id: str) -> bool:
     session_cfg = _active_message_session_config(config, session_id)
     return bool(
         _normalize_hhmm(session_cfg.get("daily_time"))
-        or _normalize_active_datetime(session_cfg.get("next_active_at"))
+        or _active_message_pending_next_time(session_cfg)
     )
 
 
@@ -2688,17 +2807,17 @@ def _active_message_scheduled_status(
             }
         return {"due": True, "source": "next", "time": expected_time}
 
-    next_active_at = _normalize_active_datetime(session_cfg.get("next_active_at"))
+    pending_next_active_at = _active_message_pending_next_time(session_cfg)
     if source == "daily":
         expected_time = _normalize_hhmm(scheduled_time)
         configured_time = _normalize_hhmm(session_cfg.get("daily_time"))
-        if next_active_at:
+        if pending_next_active_at:
             return {
                 "due": False,
                 "reason": "next_active_time_pending",
                 "source": "daily",
                 "time": expected_time,
-                "next_active_at": next_active_at,
+                "next_active_at": pending_next_active_at,
             }
         if not expected_time or configured_time != expected_time:
             return {
@@ -2711,13 +2830,13 @@ def _active_message_scheduled_status(
         return {"due": True, "source": "daily", "time": expected_time}
 
     configured_daily = _normalize_hhmm(session_cfg.get("daily_time"))
-    if next_active_at:
+    if pending_next_active_at:
         return {
             "due": False,
             "reason": "user_next_override",
             "source": "global",
             "time": scheduled_time,
-            "next_active_at": next_active_at,
+            "next_active_at": pending_next_active_at,
         }
     if configured_daily:
         return {

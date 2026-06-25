@@ -263,6 +263,7 @@ class MediaJobQueue:
                 "instruction": self._image_harness_failure_instruction(job.is_sticker),
             }
 
+        llm = None
         try:
             image_url = self.meme_steal_analyzer.to_model_image_url(local_path)
             messages = build_image_understanding_messages(
@@ -271,7 +272,8 @@ class MediaJobQueue:
                 event_text=job.event_text,
                 context_text=job.context_text,
             )
-            raw_output = await self._llm_for_job(job).chat_completion(messages=messages, temperature=0.2)
+            llm = self._llm_for_job(job)
+            raw_output = await llm.chat_completion(messages=messages, temperature=0.2)
             parsed = self._parse_internal_json_object(raw_output)
             return {
                 **base,
@@ -285,6 +287,7 @@ class MediaJobQueue:
                 **base,
                 "status": "failed",
                 "error": str(exc),
+                "llm_call_debug": self._llm_call_debug(llm),
                 "instruction": self._image_harness_failure_instruction(job.is_sticker),
             }
 
@@ -312,14 +315,21 @@ class MediaJobQueue:
         if not self.meme_steal_analyzer:
             return {**base, "status": "skipped", "reason": "meme_steal_analyzer is not configured"}
 
+        llm = None
         try:
+            llm = self._llm_for_job(job)
             analysis = await self.meme_steal_analyzer.analyze(
                 image_ref=local_path,
-                llm_client=self._llm_for_job(job),
+                llm_client=llm,
                 context_text=self._meme_intake_context_text(job.context_text, image_understanding),
             )
         except Exception as exc:  # noqa: BLE001
-            return {**base, "status": "failed", "error": str(exc)}
+            return {
+                **base,
+                "status": "failed",
+                "error": str(exc),
+                "llm_call_debug": self._llm_call_debug(llm),
+            }
 
         save_result = None
         if analysis.should_steal and self.meme_steal_saver:
@@ -434,7 +444,7 @@ class MediaJobQueue:
             if isinstance(value, dict):
                 result = {}
                 for key, item in value.items():
-                    if key in {"raw_output", "local_path", "file_path", "matched_file"}:
+                    if key in {"raw_output", "local_path", "file_path", "matched_file", "llm_call_debug"}:
                         continue
                     result[key] = sanitize(item)
                 return result
@@ -455,6 +465,12 @@ class MediaJobQueue:
         if self.llm_client_factory:
             return self.llm_client_factory(job.session_id)
         return self.llm
+
+    def _llm_call_debug(self, llm: Optional[LLMClient]) -> Optional[dict]:
+        if llm is None or not hasattr(llm, "get_last_call_debug"):
+            return None
+        debug = llm.get_last_call_debug()
+        return debug if debug else None
 
     def _meme_intake_context_text(self, context_text: str, image_understanding: dict) -> str:
         result = image_understanding.get("result") if isinstance(image_understanding, dict) else None

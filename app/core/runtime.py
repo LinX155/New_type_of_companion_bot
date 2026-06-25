@@ -9,6 +9,7 @@ from .media_jobs import MediaJobQueue
 from .sessions import SessionRegistry, normalize_session_id
 from .state import ChatStatus
 from ..llm.client import LLMClient
+from ..llm.runtime import ProviderRuntime
 from ..memory.files import MemoryFileManager
 from ..memes.catalog import MemeCatalog
 
@@ -43,7 +44,10 @@ class SessionRuntimeManager:
         self.hot_duration_minutes = hot_duration_minutes
         self.conversation_context_loader = conversation_context_loader
         self.registry = SessionRegistry(root_dir)
+        self.provider_runtime = ProviderRuntime.from_llm_client(base_llm_client)
         self._runtimes: dict[str, SessionRuntime] = {}
+        self._internal_llms: dict[str, LLMClient] = {}
+        self._background_llms: dict[str, LLMClient] = {}
 
     def get(self, session_id: str) -> SessionRuntime:
         sid = normalize_session_id(session_id)
@@ -88,6 +92,9 @@ class SessionRuntimeManager:
             runtime.gate.update_hot_duration(self.hot_duration_minutes)
 
     def reconfigure_llm_clients(self, reason: str = "llm_config_changed"):
+        self.provider_runtime = ProviderRuntime.from_llm_client(self.base_llm_client)
+        self._internal_llms.clear()
+        self._background_llms.clear()
         for sid, runtime in self._runtimes.items():
             runtime.graph.llm = self._make_session_llm(sid)
             runtime.graph.reset_provider_transcript(reason=reason)
@@ -96,7 +103,16 @@ class SessionRuntimeManager:
         return self._make_session_llm(normalize_session_id(session_id))
 
     def make_internal_llm_for_session(self, session_id: str) -> LLMClient:
-        return self._make_internal_llm(normalize_session_id(session_id))
+        sid = normalize_session_id(session_id)
+        if sid not in self._internal_llms:
+            self._internal_llms[sid] = self._make_internal_llm(sid)
+        return self._internal_llms[sid]
+
+    def make_background_llm_for_session(self, session_id: str) -> LLMClient:
+        sid = normalize_session_id(session_id)
+        if sid not in self._background_llms:
+            self._background_llms[sid] = self._make_background_llm(sid)
+        return self._background_llms[sid]
 
     async def clear_session(self, session_id: str):
         sid = normalize_session_id(session_id)
@@ -124,29 +140,30 @@ class SessionRuntimeManager:
             self.media_job_queue.clear(sid)
 
     def drop_session_runtime(self, session_id: str):
-        self._runtimes.pop(normalize_session_id(session_id), None)
+        sid = normalize_session_id(session_id)
+        self._runtimes.pop(sid, None)
+        self._internal_llms.pop(sid, None)
+        self._background_llms.pop(sid, None)
 
     def _make_session_llm(self, session_id: str) -> LLMClient:
         base = self.base_llm_client
-        return LLMClient(
-            api_key=base.api_key,
-            base_url=base.base_url,
-            model=base.model,
-            thinking_enabled=base.thinking_enabled,
-            temperature=base.temperature,
+        return self.provider_runtime.make_client(
+            scope="chat_session",
             cache_affinity_enabled=base.cache_affinity_enabled,
             cache_session_id=self._cache_session_id(session_id),
             provider_user_id=self.registry.provider_user_id(session_id),
         )
 
     def _make_internal_llm(self, session_id: str) -> LLMClient:
-        base = self.base_llm_client
-        return LLMClient(
-            api_key=base.api_key,
-            base_url=base.base_url,
-            model=base.model,
-            thinking_enabled=base.thinking_enabled,
-            temperature=base.temperature,
+        return self.provider_runtime.make_client(
+            scope="internal_session",
+            cache_affinity_enabled=False,
+            provider_user_id="",
+        )
+
+    def _make_background_llm(self, session_id: str) -> LLMClient:
+        return self.provider_runtime.make_client(
+            scope="background_batch",
             cache_affinity_enabled=False,
             provider_user_id="",
         )

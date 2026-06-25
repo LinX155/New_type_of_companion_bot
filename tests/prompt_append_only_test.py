@@ -549,6 +549,8 @@ class PromptAppendOnlyTest(unittest.TestCase):
             self.assertEqual(reminder_payload["message_type"], "SYSTEM_REMINDER")
             self.assertEqual(reminder_payload["visibility"], "internal_only_not_visible_to_user")
             self.assertTrue(any("不要每轮都用问句结尾" in rule for rule in reminder_payload["rules"]))
+            self.assertTrue(any("是……还是" in rule for rule in reminder_payload["rules"]))
+            self.assertTrue(any("xxxx这句/这句话" in rule for rule in reminder_payload["rules"]))
             self.assertTrue(any("有趣有网感" in rule for rule in reminder_payload["rules"]))
             self.assertTrue(any("非必要不使用“😂”" in rule for rule in reminder_payload["rules"]))
             self.assertTrue(any("&&category:keywords&&" in rule for rule in reminder_payload["rules"]))
@@ -1162,6 +1164,13 @@ class PromptAppendOnlyTest(unittest.TestCase):
             self.assertIn("prompt_cache_key", endpoint.calls[0])
             self.assertIn("prompt_cache_key", endpoint.calls[1])
             self.assertGreaterEqual(client.get_client_calls, 2)
+            debug = client.get_last_call_debug()
+            self.assertEqual(debug["client_scope"], "standalone")
+            self.assertEqual(debug["status"], "ok")
+            self.assertEqual(debug["request_attempts"], 2)
+            self.assertEqual(debug["retry_attempts"], 1)
+            self.assertEqual(debug["retry_delays"], [0.0])
+            self.assertEqual(debug["transient_error_class"], "APIConnectionError")
 
         asyncio.run(scenario())
 
@@ -1183,6 +1192,11 @@ class PromptAppendOnlyTest(unittest.TestCase):
                 )
 
             self.assertEqual(len(endpoint.calls), 1)
+            debug = client.get_last_call_debug()
+            self.assertEqual(debug["status"], "error")
+            self.assertEqual(debug["request_attempts"], 1)
+            self.assertEqual(debug["retry_attempts"], 0)
+            self.assertEqual(debug["status_code"], 400)
 
         asyncio.run(scenario())
 
@@ -1209,6 +1223,12 @@ class PromptAppendOnlyTest(unittest.TestCase):
             self.assertIn("Connection error.", str(raised.exception))
             self.assertIn("after 2 attempts", str(raised.exception))
             self.assertEqual(len(endpoint.calls), 2)
+            debug = client.get_last_call_debug()
+            self.assertEqual(debug["status"], "transient_retry_exhausted")
+            self.assertEqual(debug["request_attempts"], 2)
+            self.assertEqual(debug["retry_attempts"], 1)
+            self.assertEqual(debug["retry_delays"], [0.0])
+            self.assertEqual(debug["transient_error_class"], "APIConnectionError")
 
         asyncio.run(scenario())
 
@@ -2000,6 +2020,8 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertIn("使用 ENTER_CHAT:", prompt)
         self.assertIn("用户: 早，醒了吗", prompt)
         self.assertIn("输出: ENTER_CHAT: 醒了，刚看手机。", prompt)
+        self.assertIn("是……还是", prompt)
+        self.assertIn("xxxx这句/这句话", prompt)
         self.assertNotIn('"action":"ENTER_CHAT"', prompt)
 
     def test_midnight_cleanup_prompt_handles_shared_context_and_expired_memory(self):
