@@ -941,8 +941,22 @@ def _display_send_units_with_split(items: list[SendItem], allow_text_split: bool
                 "original_item": item,
                 "display_item": display_item,
                 "is_last_part": part_index == len(display_parts) - 1,
+                "split_guard_fallback": split_guard_fallback,
             })
     return units
+
+
+def _safe_split_text_for_display(text: str) -> tuple[list[str], Optional[str]]:
+    original_safety = classify_visible_text(text or "", mode="bubble")
+    if not original_safety.ok:
+        return [], original_safety.reason or "unsafe_original_text"
+
+    parts = _split_text_for_display(text)
+    for part in parts:
+        safety = classify_visible_text(part or "", mode="bubble")
+        if not safety.ok:
+            return [text], safety.reason or "unsafe_split_part"
+    return parts, None
 
 
 def _split_text_for_display(text: str) -> list[str]:
