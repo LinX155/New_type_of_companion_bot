@@ -34,9 +34,7 @@ from ..core.decisions import Action, ActionDecision, SendItem, SendItemType
 from ..core.graph import CompanionGraph
 from ..core.media_jobs import MediaJob, MediaJobQueue
 from ..core.protocol import (
-    contains_internal_visible_protocol,
-    contains_malformed_visible_meme_marker,
-    contains_visible_meme_marker,
+    classify_visible_text,
 )
 from ..core.repetition_guard import (
     RECENT_REPETITION_WINDOW,
@@ -680,6 +678,18 @@ async def on_decision(ctx: ProcessContext):
                 })
                 return
 
+        final_guard_reason = _final_visible_item_guard_reason(item)
+        if final_guard_reason:
+            _record_internal_output_guard_filter(ctx, decision, [{
+                "item_index": original_index,
+                "item_type": item.type.value,
+                "reason": final_guard_reason,
+                "content_preview": item.content[:200],
+                "send_index": send_index,
+                "split_guard_fallback": unit.get("split_guard_fallback"),
+            }])
+            continue
+
         content = item.content
         item_type = item.type.value
         per_send_result = {**result, "text": content, "texts": [content], "item": item}
@@ -854,13 +864,19 @@ def _internal_output_guard_reason(item: SendItem) -> Optional[str]:
     if item.type != SendItemType.TEXT:
         return None
     content = item.content or ""
-    if contains_internal_visible_protocol(content):
-        return "internal_visible_protocol"
-    if contains_malformed_visible_meme_marker(content):
-        return "malformed_meme_marker"
-    if contains_visible_meme_marker(content):
-        return "unparsed_meme_marker"
+    safety = classify_visible_text(content, mode="bubble")
+    if not safety.ok:
+        return safety.reason or "unsafe_visible_text"
     return None
+
+
+def _final_visible_item_guard_reason(item: SendItem) -> Optional[str]:
+    if item.type != SendItemType.TEXT:
+        return None
+    safety = classify_visible_text(item.content or "", mode="bubble")
+    if safety.ok:
+        return None
+    return safety.reason or "unsafe_visible_text"
 
 
 def _record_internal_output_guard_filter(
@@ -911,8 +927,9 @@ def _build_display_send_units(items: list[SendItem]) -> list[dict]:
 def _display_send_units_with_split(items: list[SendItem], allow_text_split: bool) -> list[dict]:
     units: list[dict] = []
     for original_index, item in enumerate(items):
+        split_guard_fallback = None
         if item.type == SendItemType.TEXT and allow_text_split:
-            display_parts = _split_text_for_display(item.content)
+            display_parts, split_guard_fallback = _safe_split_text_for_display(item.content)
         else:
             display_parts = [item.content]
         for part_index, part in enumerate(display_parts):

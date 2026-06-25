@@ -234,6 +234,31 @@ class SendGateTest(unittest.TestCase):
             [item.content for item in items],
         )
 
+    def test_text_display_split_falls_back_when_split_creates_unsafe_fragment(self):
+        text = "这个句子前面已经很长，<"
+
+        units = routes._build_display_send_units([SendItem(type=SendItemType.TEXT, content=text)])
+
+        self.assertEqual([unit["display_item"].content for unit in units], [text])
+        self.assertEqual(units[0]["split_guard_fallback"], "standalone_angle_bracket")
+
+    def test_text_display_units_drop_unsafe_original_text(self):
+        units = routes._build_display_send_units([
+            SendItem(type=SendItemType.TEXT, content="assistant> 这条不能发</system>")
+        ])
+
+        self.assertEqual(units, [])
+
+    def test_final_visible_item_guard_blocks_system_fragments(self):
+        self.assertEqual(
+            routes._final_visible_item_guard_reason(SendItem(type=SendItemType.TEXT, content="] <]minimax[>")),
+            "vendor_control_token",
+        )
+        self.assertEqual(
+            routes._final_visible_item_guard_reason(SendItem(type=SendItemType.TEXT, content="正常聊天")),
+            None,
+        )
+
     def test_llm_typing_state_syncs_to_onebot_target_only(self):
         async def scenario():
             manager = FakeOneBotManager()

@@ -1,7 +1,7 @@
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 from .decisions import (
     MEME_PREFIX,
@@ -46,14 +46,20 @@ MALFORMED_MEME_MARKER_RE = re.compile(
 INTERNAL_SENTINEL_RE = re.compile(r"\[\[[A-Z][A-Z0-9_:\-]{2,}\]\]")
 INTERNAL_QUOTE_TAG_RE = re.compile(r"\[{1,2}\s*/?\s*quote\s*\]\]?", re.IGNORECASE)
 INTERNAL_XML_TAG_RE = re.compile(
-    r"<\s*/?\s*(?:tool_call|tool_name|tool|json|name|param|parameter|function|function_call|output|assistant_message|messages)\b[^>]*>",
+    r"<\s*/?\s*(?:system|assistant|user|developer|think|thinking|reasoning|tool_call|tool_name|tool|json|name|param|parameter|function|function_call|output|assistant_message|messages)\b[^>]*>",
     re.IGNORECASE,
 )
-INTERNAL_JSON_ROLE_RE = re.compile(r'"role"\s*:\s*"(?:system|assistant|user)"')
+INTERNAL_ROLE_PREFIX_RE = re.compile(r"^\s*(?:assistant|system|user|developer|tool)\s*>", re.IGNORECASE | re.MULTILINE)
+INTERNAL_LINE_ROLE_RE = re.compile(r"^\s*(?:assistant|system|user|developer|tool)\s*:?\s*$", re.IGNORECASE)
+INTERNAL_CHATML_RE = re.compile(r"<\|im_(?:start|end)\|>|\[/?INST\]|</?s>", re.IGNORECASE)
+VENDOR_CONTROL_TOKEN_RE = re.compile(r"(?:\]\s*<\]\s*minimax\s*\[>|\]<\]minimax\[>)", re.IGNORECASE)
+INTERNAL_JSON_ROLE_RE = re.compile(r'"role"\s*:\s*"(?:system|assistant|user|developer|tool)"')
 INTERNAL_JSON_MESSAGES_RE = re.compile(r'"messages"\s*:\s*\[')
+INTERNAL_JSON_ACTION_RE = re.compile(r'"action"\s*:\s*"[A-Z_]+"')
+INTERNAL_JSON_ITEMS_RE = re.compile(r'"items"\s*:\s*\[')
 INTERNAL_JSON_CONTENT_RE = re.compile(r'"content"\s*:\s*"')
 INTERNAL_JSON_KEY_RE = re.compile(
-    r'^\s*"(?:role|content|messages|message_type|task_name|task|prompt|text)"\s*:',
+    r'^\s*"(?:role|content|messages|message_type|task_name|task|prompt|text|action|items)"\s*:',
     re.IGNORECASE,
 )
 INTERNAL_LINE_ONLY_RE = re.compile(r'^\s*(?:[{}\[\]],?|</?[^>]+>)\s*$')
@@ -74,6 +80,15 @@ INTERNAL_MARKERS = (
     "run_background_process",
     "vqa_analysis",
 )
+
+VisibleSafetyMode = Literal["model_raw", "bubble"]
+
+
+@dataclass
+class VisibleSafetyResult:
+    ok: bool
+    reason: Optional[str] = None
+    mode: VisibleSafetyMode = "bubble"
 
 
 @dataclass
@@ -182,16 +197,26 @@ def parse_and_validate_main_output(raw_output: str, is_cold_context: bool = Fals
             errors=["模型输出为空，必须输出 WAIT、ENTER_CHAT: 文本或自然语言回复。"],
         )
 
-    if contains_internal_visible_protocol(text):
+    if _looks_like_json_output(text) and INTERNAL_JSON_ACTION_RE.search(text) and INTERNAL_JSON_ITEMS_RE.search(text):
+        legacy = parse_and_validate_raw_decision(text)
+        if legacy.ok:
+            return ProtocolResult(
+                status="legacy_json_protocol_error",
+                decision=legacy.decision,
+                errors=["旧 action/items JSON 已不再是主聊天输出协议，必须改写为轻量文本协议。"],
+                raw_data=legacy.raw_data,
+            )
+        return legacy
+
+    safety = classify_visible_text(text, mode="model_raw")
+    if not safety.ok:
+        if safety.reason == "malformed_meme_marker":
+            error = "模型输出包含畸形表情占位标记，不能作为用户可见聊天发送。"
+        else:
+            error = f"模型输出包含内部协议、调试结构或系统标记，不能作为用户可见聊天发送: {safety.reason}。"
         return ProtocolResult(
             status="internal_protocol_leak",
-            errors=["模型输出包含内部协议、调试结构或系统标记，不能作为用户可见聊天发送。"],
-            raw_data={"protocol": "lightweight_text", "raw_output": raw_output},
-        )
-    if contains_malformed_visible_meme_marker(text):
-        return ProtocolResult(
-            status="internal_protocol_leak",
-            errors=["模型输出包含畸形表情占位标记，不能作为用户可见聊天发送。"],
+            errors=[error],
             raw_data={"protocol": "lightweight_text", "raw_output": raw_output},
         )
 
@@ -381,12 +406,9 @@ def validate_protocol(decision: ActionDecision) -> list[str]:
         if item.type == SendItemType.TEXT:
             if any(prefix in content for prefix in PROTOCOL_PREFIXES):
                 errors.append(f"第 {index + 1} 个 text item 不能包含内部协议串。")
-            if contains_internal_visible_protocol(content):
-                errors.append(f"第 {index + 1} 个 text item 不能包含内部协议、调试结构或系统标记。")
-            if contains_visible_meme_marker(content):
-                errors.append(f"第 {index + 1} 个 text item 不能残留表情占位标记。")
-            if contains_malformed_visible_meme_marker(content):
-                errors.append(f"第 {index + 1} 个 text item 不能残留畸形表情占位标记。")
+            safety = classify_visible_text(content, mode="bubble")
+            if not safety.ok:
+                errors.append(f"第 {index + 1} 个 text item 不能包含用户不可见协议残片: {safety.reason}。")
             continue
 
         if item.type == SendItemType.MEME:
@@ -561,12 +583,9 @@ def _validate_raw_shape(data: dict):
             if item_key == "text":
                 if any(prefix in value for prefix in PROTOCOL_PREFIXES):
                     raise ValueError(f"items[{index}].text 不能包含内部协议串。")
-                if contains_internal_visible_protocol(value):
-                    raise ValueError(f"items[{index}].text 不能包含内部协议、调试结构或系统标记。")
-                if contains_visible_meme_marker(value):
-                    raise ValueError(f"items[{index}].text 不能残留表情占位标记。")
-                if contains_malformed_visible_meme_marker(value):
-                    raise ValueError(f"items[{index}].text 不能残留畸形表情占位标记。")
+                safety = classify_visible_text(value, mode="bubble")
+                if not safety.ok:
+                    raise ValueError(f"items[{index}].text 不能包含用户不可见协议残片: {safety.reason}。")
                 continue
 
             if item_key == "meme":
@@ -615,31 +634,56 @@ def contains_malformed_visible_meme_marker(text: str) -> bool:
     return False
 
 
-def contains_internal_visible_protocol(text: str) -> bool:
+def classify_visible_text(text: str, mode: VisibleSafetyMode = "bubble") -> VisibleSafetyResult:
     content = text or ""
-    if not content.strip():
-        return False
+    if mode not in ("model_raw", "bubble"):
+        mode = "bubble"
+    stripped = content.strip()
+    if not stripped:
+        return VisibleSafetyResult(ok=True, mode=mode)
 
+    if stripped in {"<", ">"}:
+        return VisibleSafetyResult(ok=False, reason="standalone_angle_bracket", mode=mode)
+    if VENDOR_CONTROL_TOKEN_RE.search(content):
+        return VisibleSafetyResult(ok=False, reason="vendor_control_token", mode=mode)
     if INTERNAL_SENTINEL_RE.search(content):
-        return True
+        return VisibleSafetyResult(ok=False, reason="internal_sentinel", mode=mode)
     if INTERNAL_QUOTE_TAG_RE.search(content):
-        return True
+        return VisibleSafetyResult(ok=False, reason="quote_tag", mode=mode)
     if INTERNAL_XML_TAG_RE.search(content):
-        return True
+        return VisibleSafetyResult(ok=False, reason="internal_xml_tag", mode=mode)
+    if INTERNAL_ROLE_PREFIX_RE.search(content):
+        return VisibleSafetyResult(ok=False, reason="role_prefix", mode=mode)
+    if INTERNAL_CHATML_RE.search(content):
+        return VisibleSafetyResult(ok=False, reason="chatml_or_instruction_token", mode=mode)
     if INTERNAL_JSON_MESSAGES_RE.search(content):
-        return True
+        return VisibleSafetyResult(ok=False, reason="json_messages", mode=mode)
+    if INTERNAL_JSON_ACTION_RE.search(content) and INTERNAL_JSON_ITEMS_RE.search(content):
+        return VisibleSafetyResult(ok=False, reason="legacy_action_json", mode=mode)
     if INTERNAL_JSON_ROLE_RE.search(content) and INTERNAL_JSON_CONTENT_RE.search(content):
-        return True
-    if INTERNAL_JSON_KEY_RE.search(content.strip()):
-        return True
-    if INTERNAL_LINE_ONLY_RE.match(content.strip()):
-        return True
+        return VisibleSafetyResult(ok=False, reason="json_role_content", mode=mode)
+    if INTERNAL_JSON_KEY_RE.search(stripped):
+        return VisibleSafetyResult(ok=False, reason="json_protocol_key", mode=mode)
+    if INTERNAL_LINE_ONLY_RE.match(stripped):
+        return VisibleSafetyResult(ok=False, reason="internal_line_only", mode=mode)
+    if INTERNAL_LINE_ROLE_RE.match(stripped):
+        return VisibleSafetyResult(ok=False, reason="role_line_only", mode=mode)
+    if contains_malformed_visible_meme_marker(content):
+        return VisibleSafetyResult(ok=False, reason="malformed_meme_marker", mode=mode)
+    if mode == "bubble" and contains_visible_meme_marker(content):
+        return VisibleSafetyResult(ok=False, reason="unparsed_meme_marker", mode=mode)
 
     for marker in INTERNAL_MARKERS:
         if marker in content:
-            return True
+            return VisibleSafetyResult(ok=False, reason="internal_marker", mode=mode)
 
     lines = [line.strip() for line in content.splitlines() if line.strip()]
     if lines and sum(1 for line in lines if INTERNAL_LINE_ONLY_RE.match(line)) >= 2:
-        return True
-    return False
+        return VisibleSafetyResult(ok=False, reason="multiple_internal_lines", mode=mode)
+    if lines and any(INTERNAL_LINE_ROLE_RE.match(line) for line in lines):
+        return VisibleSafetyResult(ok=False, reason="role_line", mode=mode)
+    return VisibleSafetyResult(ok=True, mode=mode)
+
+
+def contains_internal_visible_protocol(text: str) -> bool:
+    return not classify_visible_text(text, mode="model_raw").ok

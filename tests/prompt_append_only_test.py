@@ -10,6 +10,7 @@ from app.core.decisions import Action, ActionDecision, SendItem, SendItemType
 from app.core.graph import CompanionGraph
 from app.core.protocol import (
     build_repair_messages,
+    classify_visible_text,
     parse_and_validate_main_output,
     parse_and_validate_raw_decision,
     parse_meme_selection_output,
@@ -493,10 +494,19 @@ class PromptAppendOnlyTest(unittest.TestCase):
             hot_state = await graph._build_context({"ctx": hot_ctx})
             hot_messages = hot_state["messages"]
 
-            self.assertEqual(hot_messages[: len(cold_messages)], cold_messages)
-            self.assertTrue(graph.get_prompt_observability()["append_only_check"])
+            observability = graph.get_prompt_observability()
+            self.assertTrue(observability["append_only_check"])
+            self.assertTrue(observability["stable_prefix_append_only_check"])
+            self.assertFalse(observability["full_request_append_only_check"])
             self.assertEqual(self._count_content(hot_messages, "你在吗"), 1)
             self.assertEqual(self._count_content(hot_messages, "在。怎么了？"), 1)
+            self.assertFalse(any('"action"' in str(item.get("content") or "") for item in hot_messages))
+            self.assertEqual(sum(
+                1 for item in hot_messages if str(item.get("content") or "").strip().startswith('{"runtime_context"')
+            ), 1)
+            self.assertEqual(sum(
+                1 for item in hot_messages if str(item.get("content") or "").strip().startswith("## 最终输出前强提醒")
+            ), 1)
             self.assertTrue(any(
                 item.get("role") == "assistant" and "在。怎么了？" in str(item.get("content") or "")
                 for item in hot_messages
@@ -1331,10 +1341,18 @@ class PromptAppendOnlyTest(unittest.TestCase):
             second_state = await graph._build_context({"ctx": second_ctx})
             second_messages = second_state["messages"]
 
-            self.assertEqual(second_messages[: len(first_messages)], first_messages)
-            self.assertTrue(graph.get_prompt_observability()["append_only_check"])
+            observability = graph.get_prompt_observability()
+            self.assertTrue(observability["append_only_check"])
+            self.assertTrue(observability["stable_prefix_append_only_check"])
+            self.assertFalse(observability["full_request_append_only_check"])
             self.assertEqual(self._count_content(second_messages, "我还没说完"), 1)
             self.assertEqual(self._count_content(second_messages, "还有一句"), 1)
+            self.assertEqual(sum(
+                1 for item in second_messages if str(item.get("content") or "").strip().startswith('{"runtime_context"')
+            ), 1)
+            self.assertEqual(sum(
+                1 for item in second_messages if str(item.get("content") or "").strip().startswith("## 最终输出前强提醒")
+            ), 1)
 
         asyncio.run(scenario())
 
@@ -1523,6 +1541,92 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.status, "internal_protocol_leak")
 
+    def test_visible_text_classifier_blocks_provider_role_and_vendor_fragments(self):
+        bad_cases = [
+            "assistant> 我在呢</system>",
+            "</system> 这句别发",
+            "<tool_call>",
+            "[[quote]]",
+            "]<]minimax[>[(´ᴗ`) ฅ",
+            "<",
+            ">",
+            "晚安 &&resting:sleep tight|||",
+        ]
+        for text in bad_cases:
+            with self.subTest(text=text):
+                self.assertFalse(classify_visible_text(text, mode="model_raw").ok)
+                self.assertFalse(classify_visible_text(text, mode="bubble").ok)
+
+        self.assertTrue(classify_visible_text("Tom & Jerry & Co 也太经典了", mode="bubble").ok)
+        self.assertTrue(classify_visible_text("笑死了 &&amused:laugh&&", mode="model_raw").ok)
+        self.assertFalse(classify_visible_text("笑死了 &&amused:laugh&&", mode="bubble").ok)
+
+    def test_unsafe_provider_content_repairs_before_visible_decision(self):
+        async def scenario():
+            bad_raw = "]<]minimax[>[(´ᴗ`) ฅ"
+            llm = FakeSequentialEnvelopeLLM(
+                LLMResponseEnvelope(
+                    assistant_message={"role": "assistant", "content": bad_raw},
+                    content=bad_raw,
+                    raw_response_meta={"finish_reason": "stop"},
+                ),
+                LLMResponseEnvelope(
+                    assistant_message={"role": "assistant", "content": "我在呢"},
+                    content="我在呢",
+                    raw_response_meta={"finish_reason": "stop"},
+                ),
+            )
+            graph = CompanionGraph(llm, FakeMemory(), FakeMemeCatalog())
+            ctx = SimpleNamespace(
+                gate=self._gate(msg_index=2, age="just now"),
+                snapshot=ConversationSnapshot(
+                    snapshot_id=2,
+                    buffer_version=2,
+                    status=ChatStatus.HOT,
+                    events=[{"event_id": "e2", "event_type": "message.text", "text": "在吗"}],
+                ),
+            )
+
+            state = await graph._build_context({"ctx": ctx})
+            state = await graph._call_llm_for_decision(state)
+
+            self.assertEqual(llm.calls, 2)
+            self.assertEqual(state["decision"].action, Action.REPLY)
+            self.assertEqual([item.content for item in state["decision"].all_items()], ["我在呢"])
+            self.assertEqual(graph.get_prompt_observability()["normalized_raw_source"], "unsafe_content")
+            self.assertEqual(graph.get_prompt_observability()["visible_safety_reason"], "vendor_control_token")
+
+        asyncio.run(scenario())
+
+    def test_finish_reason_length_is_not_treated_as_complete_visible_text(self):
+        graph = CompanionGraph(FakeLLM(), FakeMemory(), FakeMemeCatalog())
+        normalized = graph._normalize_llm_output(LLMResponseEnvelope(
+            assistant_message={"role": "assistant", "content": "我还没说完"},
+            content="我还没说完",
+            raw_response_meta={"finish_reason": "length"},
+        ))
+
+        self.assertEqual(normalized.visible_text, "")
+        self.assertEqual(normalized.raw_source, "finish_reason_length")
+        self.assertEqual(normalized.unsafe_reason, "finish_reason_length")
+        self.assertIn("[[UNSAFE_LLM_OUTPUT:finish_reason_length]]", graph._output_text_for_parser(normalized))
+
+    def test_tool_calls_are_not_visible_chat_output(self):
+        graph = CompanionGraph(FakeLLM(), FakeMemory(), FakeMemeCatalog())
+        normalized = graph._normalize_llm_output(LLMResponseEnvelope(
+            assistant_message={
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "call_1", "type": "function"}],
+            },
+            content=None,
+            raw_response_meta={"finish_reason": "tool_calls"},
+        ))
+
+        self.assertEqual(normalized.visible_text, "")
+        self.assertEqual(normalized.raw_source, "tool_calls")
+        self.assertEqual(normalized.unsafe_reason, "tool_calls")
+
     def test_provider_transcript_skips_internal_assistant_leak(self):
         graph = CompanionGraph(FakeLLM(), FakeMemory(), FakeMemeCatalog())
 
@@ -1536,6 +1640,12 @@ class PromptAppendOnlyTest(unittest.TestCase):
             graph._last_prompt_observability["assistant_message_skipped_reason"],
             "internal_visible_protocol_leak",
         )
+
+        graph._append_provider_assistant_message({
+            "role": "assistant",
+            "content": "assistant> 这个也不能进 transcript",
+        })
+        self.assertEqual(graph._copy_prompt_transcript(), [])
 
     def test_conversation_context_skips_prior_internal_leaks(self):
         graph = CompanionGraph(FakeLLM(), FakeMemory(), FakeMemeCatalog())

@@ -50,6 +50,18 @@ class LLMResponseEnvelope:
     raw_response_meta: Optional[dict] = None
 
 
+@dataclass
+class NormalizedLLMOutput:
+    visible_text: str
+    hidden_reasoning: Optional[str] = None
+    tool_calls: Optional[list | dict] = None
+    finish_reason: Optional[str] = None
+    raw_source: str = "content_empty"
+    unsafe_reason: Optional[str] = None
+    assistant_message_for_provider: Optional[dict] = None
+    raw_text: str = ""
+
+
 class LLMClient:
     def __init__(
         self,

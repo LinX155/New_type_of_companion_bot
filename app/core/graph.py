@@ -17,6 +17,7 @@ from .protocol import (
     ProtocolResult,
     VALID_MEME_CATEGORIES,
     build_repair_messages,
+    classify_visible_text,
     contains_internal_visible_protocol,
     contains_malformed_visible_meme_marker,
     contains_visible_meme_marker,
@@ -25,7 +26,7 @@ from .protocol import (
 )
 from .state import ChatStatus
 from ..active.messages import ACTIVE_SECTIONS, expire_stale_candidates, parse_active_candidates
-from ..llm.client import LLMClient, LLMResponseEnvelope
+from ..llm.client import LLMClient, LLMResponseEnvelope, NormalizedLLMOutput
 from ..llm.prompts import (
     FINAL_ACTION_OUTPUT_REMINDER,
     build_stable_prompt_hash_source,
@@ -192,6 +193,7 @@ class CompanionGraph:
         self._prompt_transcript_identity: Optional[str] = None
         self._prefix_rebuild_reason: Optional[str] = None
         self._last_prompt_messages: list[dict] = []
+        self._last_stable_prompt_messages: list[dict] = []
         self._last_prompt_observability: dict = {}
         self._prompt_block_hashes: dict = {}
         self._last_runtime_block_hash: Optional[str] = None
@@ -209,6 +211,7 @@ class CompanionGraph:
         self._last_media_debug: list[dict] = []
         self._last_multimodal_debug: list[dict] = []
         self._last_llm_request_messages: list[dict] = []
+        self._last_normalized_llm_output: Optional[NormalizedLLMOutput] = None
 
     def _record_llm_raw_output(self, raw_output: str):
         self._last_llm_raw_output = raw_output
@@ -243,18 +246,18 @@ class CompanionGraph:
             self._initialize_prompt_transcript(ctx.snapshot)
 
         self._last_hot_turn_reminder_hash = None
-        self._append_runtime_context(ctx)
-        self._prompt_transcript.append({
+        messages = self._copy_prompt_transcript()
+        self._append_runtime_context(ctx, target=messages)
+        messages.append({
             "role": "system",
             "content": json.dumps(
                 self._build_media_followup_payload(media_payload),
                 ensure_ascii=False,
             ),
         })
-        self._append_hot_turn_system_reminder(ctx.snapshot)
-        self._prompt_transcript.append({"role": "system", "content": FINAL_ACTION_OUTPUT_REMINDER})
+        self._append_hot_turn_system_reminder(ctx.snapshot, target=messages)
+        messages.append({"role": "system", "content": FINAL_ACTION_OUTPUT_REMINDER})
 
-        messages = self._copy_prompt_transcript()
         self._record_prompt_observability(messages)
         state: GraphState = {"ctx": ctx, "messages": messages}
         state = await self._call_llm_for_decision(state)
@@ -276,13 +279,13 @@ class CompanionGraph:
             self._initialize_prompt_transcript(snapshot)
 
         self._last_hot_turn_reminder_hash = None
-        self._append_runtime_context(ctx)
         multimodal_replacements = await self._append_snapshot_events(snapshot.events)
-        self._append_media_pending_payloads_and_enqueue_jobs(ctx)
-        self._append_hot_turn_system_reminder(snapshot)
-        self._prompt_transcript.append({"role": "system", "content": FINAL_ACTION_OUTPUT_REMINDER})
 
         messages = self._copy_prompt_transcript()
+        self._append_runtime_context(ctx, target=messages)
+        self._append_media_pending_payloads_and_enqueue_jobs(ctx, target=messages)
+        self._append_hot_turn_system_reminder(snapshot, target=messages)
+        messages.append({"role": "system", "content": FINAL_ACTION_OUTPUT_REMINDER})
         self._apply_multimodal_replacements(messages, multimodal_replacements)
         self._record_prompt_observability(messages)
         return {**state, "messages": messages}
@@ -710,7 +713,9 @@ class CompanionGraph:
                 self._conversation_history.append({"role": "user", "text": text})
 
         for item in items:
-            text = self._history_text_for_item(item)
+            text = self._safe_history_text_for_item(item)
+            if not text:
+                continue
             self._conversation_history.append({"role": "assistant", "text": text})
             if self._prompt_transcript:
                 self._append_assistant_text_to_prompt(text)
@@ -720,13 +725,19 @@ class CompanionGraph:
             return
 
         for item in items:
-            text = self._history_text_for_item(item)
+            text = self._safe_history_text_for_item(item)
+            if not text:
+                continue
             self._conversation_history.append({"role": "assistant", "text": text})
             if self._prompt_transcript:
                 self._append_assistant_text_to_prompt(text)
 
     def commit_external_assistant_text(self, text: str):
         if not text:
+            return
+        safety = classify_visible_text(text, mode="bubble")
+        if not safety.ok:
+            self._last_prompt_observability["assistant_history_commit_skipped_reason"] = safety.reason
             return
         self._conversation_history.append({"role": "assistant", "text": text})
         if self._prompt_transcript:
@@ -757,6 +768,7 @@ class CompanionGraph:
         self._prompt_event_ids.clear()
         self._media_harness_event_ids.clear()
         self._last_prompt_messages.clear()
+        self._last_stable_prompt_messages.clear()
         self._last_prompt_observability.clear()
         self._prompt_block_hashes.clear()
         self._last_media_debug.clear()
@@ -770,6 +782,16 @@ class CompanionGraph:
         if item.type == SendItemType.EMOJI:
             return item.content[6:]
         return f"[表情: meme:{item.harness_value()}]"
+
+    def _safe_history_text_for_item(self, item: SendItem) -> Optional[str]:
+        text = self._history_text_for_item(item)
+        if item.type != SendItemType.TEXT:
+            return text
+        safety = classify_visible_text(text, mode="bubble")
+        if safety.ok:
+            return text
+        self._last_prompt_observability["assistant_history_commit_skipped_reason"] = safety.reason
+        return None
 
     def _record_parsed_decision(self, parsed: ActionDecision):
         self._last_parsed_action = parsed.action.value
@@ -936,19 +958,22 @@ class CompanionGraph:
             effective_messages = self._messages_without_direct_multimodal(effective_messages)
             envelope = await self._request_llm_envelope(effective_messages, temperature)
         self._last_llm_request_messages = copy.deepcopy(effective_messages)
-        raw_output, raw_source = self._raw_output_from_envelope(envelope)
-        if raw_source == "content_empty":
+        normalized = self._normalize_llm_output(envelope)
+        if normalized.raw_source == "content_empty":
             retry_envelope = await self._request_llm_envelope(effective_messages, temperature)
-            retry_output, retry_source = self._raw_output_from_envelope(retry_envelope)
+            retry_normalized = self._normalize_llm_output(retry_envelope)
             self._last_prompt_observability["content_empty_retry_count"] = 1
             envelope = retry_envelope
-            raw_output = retry_output
-            raw_source = retry_source if retry_source != "content_empty" else "content_empty_after_retry"
+            normalized = retry_normalized
+            if normalized.raw_source == "content_empty":
+                normalized.raw_source = "content_empty_after_retry"
+        self._last_normalized_llm_output = normalized
+        raw_output = self._output_text_for_parser(normalized)
         if record_prompt_usage:
-            self._record_prompt_usage(envelope=envelope, raw_output_source=raw_source)
+            self._record_prompt_usage(envelope=envelope, normalized_output=normalized)
         self._record_llm_raw_output(raw_output)
         if append_assistant_to_transcript:
-            self._append_provider_assistant_message(envelope.assistant_message)
+            self._append_provider_assistant_message(normalized.assistant_message_for_provider)
         return raw_output
 
     async def _request_llm_envelope(self, messages: list[dict], temperature: float) -> LLMResponseEnvelope:
@@ -981,18 +1006,152 @@ class CompanionGraph:
             raw_response_meta=None,
         )
 
-    def _raw_output_from_envelope(self, envelope: LLMResponseEnvelope) -> tuple[str, str]:
+    def _normalize_llm_output(self, envelope: LLMResponseEnvelope) -> NormalizedLLMOutput:
+        assistant_message = envelope.assistant_message if isinstance(envelope.assistant_message, dict) else {}
+        finish_reason = self._finish_reason_from_envelope(envelope)
+        tool_calls = self._tool_calls_from_assistant_message(assistant_message)
+        hidden_reasoning = envelope.reasoning_content or self._reasoning_from_assistant_message(assistant_message)
+        content = envelope.content or ""
+
+        finish_unsafe_reason = self._unsafe_finish_reason(finish_reason)
+        if tool_calls:
+            return NormalizedLLMOutput(
+                visible_text="",
+                hidden_reasoning=hidden_reasoning,
+                tool_calls=tool_calls,
+                finish_reason=finish_reason,
+                raw_source="tool_calls",
+                unsafe_reason="tool_calls",
+                assistant_message_for_provider=None,
+                raw_text=content,
+            )
+
         content = envelope.content or ""
         if content.strip():
-            return content, "content"
+            safety = classify_visible_text(content, mode="model_raw")
+            if finish_unsafe_reason:
+                return NormalizedLLMOutput(
+                    visible_text="",
+                    hidden_reasoning=hidden_reasoning,
+                    tool_calls=tool_calls,
+                    finish_reason=finish_reason,
+                    raw_source=f"finish_reason_{finish_reason}",
+                    unsafe_reason=f"finish_reason_{finish_reason}",
+                    assistant_message_for_provider=None,
+                    raw_text=content,
+                )
+            if not safety.ok:
+                return NormalizedLLMOutput(
+                    visible_text="",
+                    hidden_reasoning=hidden_reasoning,
+                    tool_calls=tool_calls,
+                    finish_reason=finish_reason,
+                    raw_source="unsafe_content",
+                    unsafe_reason=safety.reason,
+                    assistant_message_for_provider=None,
+                    raw_text=content,
+                )
+            return NormalizedLLMOutput(
+                visible_text=content,
+                hidden_reasoning=hidden_reasoning,
+                tool_calls=tool_calls,
+                finish_reason=finish_reason,
+                raw_source="content",
+                assistant_message_for_provider={"role": "assistant", "content": content},
+                raw_text=content,
+            )
 
         reasoning_content = envelope.reasoning_content or ""
         if reasoning_content.strip():
             rescued = _extract_rescuable_reasoning_output(reasoning_content)
             if rescued:
-                return rescued, "reasoning_content_rescue"
+                safety = classify_visible_text(rescued, mode="model_raw")
+                if finish_unsafe_reason:
+                    return NormalizedLLMOutput(
+                        visible_text="",
+                        hidden_reasoning=hidden_reasoning,
+                        tool_calls=tool_calls,
+                        finish_reason=finish_reason,
+                        raw_source=f"finish_reason_{finish_reason}",
+                        unsafe_reason=f"finish_reason_{finish_reason}",
+                        assistant_message_for_provider=None,
+                        raw_text=rescued,
+                    )
+                if safety.ok:
+                    return NormalizedLLMOutput(
+                        visible_text=rescued,
+                        hidden_reasoning=hidden_reasoning,
+                        tool_calls=tool_calls,
+                        finish_reason=finish_reason,
+                        raw_source="reasoning_content_rescue",
+                        assistant_message_for_provider={"role": "assistant", "content": rescued},
+                        raw_text=rescued,
+                    )
+                return NormalizedLLMOutput(
+                    visible_text="",
+                    hidden_reasoning=hidden_reasoning,
+                    tool_calls=tool_calls,
+                    finish_reason=finish_reason,
+                    raw_source="unsafe_reasoning_content_rescue",
+                    unsafe_reason=safety.reason,
+                    assistant_message_for_provider=None,
+                    raw_text=rescued,
+                )
 
-        return content, "content_empty"
+        return NormalizedLLMOutput(
+            visible_text="",
+            hidden_reasoning=hidden_reasoning,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            raw_source="content_empty",
+            unsafe_reason=finish_unsafe_reason,
+            assistant_message_for_provider=None,
+            raw_text=content,
+        )
+
+    def _raw_output_from_envelope(self, envelope: LLMResponseEnvelope) -> tuple[str, str]:
+        normalized = self._normalize_llm_output(envelope)
+        return self._output_text_for_parser(normalized), normalized.raw_source
+
+    def _output_text_for_parser(self, normalized: NormalizedLLMOutput) -> str:
+        if normalized.visible_text:
+            return normalized.visible_text
+        if normalized.unsafe_reason and normalized.raw_text:
+            return f"[[UNSAFE_LLM_OUTPUT:{normalized.unsafe_reason}]]\n{normalized.raw_text}"
+        return normalized.raw_text or ""
+
+    def _finish_reason_from_envelope(self, envelope: LLMResponseEnvelope) -> Optional[str]:
+        meta = envelope.raw_response_meta or {}
+        finish_reason = meta.get("finish_reason") if isinstance(meta, dict) else None
+        if finish_reason is None and isinstance(envelope.assistant_message, dict):
+            finish_reason = envelope.assistant_message.get("finish_reason")
+        return str(finish_reason) if finish_reason is not None else None
+
+    def _unsafe_finish_reason(self, finish_reason: Optional[str]) -> Optional[str]:
+        if not finish_reason:
+            return None
+        normalized = str(finish_reason).strip().lower()
+        if normalized in {"stop", "end_turn", "complete", "completed"}:
+            return None
+        if normalized in {"length", "max_tokens", "content_filter", "error", "aborted", "cancelled", "tool_calls", "function_call"}:
+            return f"finish_reason_{normalized}"
+        return None
+
+    def _tool_calls_from_assistant_message(self, assistant_message: dict):
+        if not isinstance(assistant_message, dict):
+            return None
+        return assistant_message.get("tool_calls") or assistant_message.get("function_call")
+
+    def _reasoning_from_assistant_message(self, assistant_message: dict) -> Optional[str]:
+        if not isinstance(assistant_message, dict):
+            return None
+        value = assistant_message.get("reasoning_content") or assistant_message.get("thinking")
+        if value:
+            return str(value)
+        details = assistant_message.get("reasoning_details")
+        if details:
+            return json.dumps(details, ensure_ascii=False)
+        return None
 
     def _initialize_prompt_transcript(self, snapshot):
         self._prompt_transcript_identity = self._current_llm_identity()
@@ -1132,7 +1291,7 @@ class CompanionGraph:
             "TOMORROW_TOPICS.md",
         )
 
-    def _append_runtime_context(self, ctx: ProcessContext):
+    def _append_runtime_context(self, ctx: ProcessContext, target: Optional[list[dict]] = None):
         snapshot = ctx.snapshot
         cold_meta = snapshot.cold_start_meta
         runtime_message = build_runtime_context_message(
@@ -1146,14 +1305,14 @@ class CompanionGraph:
             cold_start_timestamp=cold_meta.timestamp if cold_meta else None,
         )
         self._last_runtime_block_hash = self._hash_text(runtime_message["content"])
-        self._prompt_transcript.append(runtime_message)
+        (target if target is not None else self._prompt_transcript).append(runtime_message)
 
-    def _append_hot_turn_system_reminder(self, snapshot):
+    def _append_hot_turn_system_reminder(self, snapshot, target: Optional[list[dict]] = None):
         if snapshot.status != ChatStatus.HOT:
             return
         reminder_message = build_hot_turn_system_reminder_message()
         self._last_hot_turn_reminder_hash = self._hash_text(reminder_message["content"])
-        self._prompt_transcript.append(reminder_message)
+        (target if target is not None else self._prompt_transcript).append(reminder_message)
 
     def _build_media_followup_payload(self, payload: dict) -> dict:
         result = payload.get("result") if isinstance(payload, dict) else None
@@ -1208,8 +1367,9 @@ class CompanionGraph:
             ),
         }
 
-    def _append_media_pending_payloads_and_enqueue_jobs(self, ctx: ProcessContext):
+    def _append_media_pending_payloads_and_enqueue_jobs(self, ctx: ProcessContext, target: Optional[list[dict]] = None):
         self._last_media_debug = []
+        target_messages = target if target is not None else self._prompt_transcript
         for evt in ctx.snapshot.events:
             raw = self._event_get(evt, "raw") or {}
             if not isinstance(raw, dict):
@@ -1244,7 +1404,7 @@ class CompanionGraph:
                 else:
                     pending_payload["status"] = "queue_not_configured"
 
-                self._prompt_transcript.append({
+                target_messages.append({
                     "role": "system",
                     "content": json.dumps(pending_payload, ensure_ascii=False),
                 })
@@ -1606,11 +1766,7 @@ class CompanionGraph:
         return text
 
     def _is_internal_visible_leak(self, text: str) -> bool:
-        return (
-            contains_internal_visible_protocol(text)
-            or contains_malformed_visible_meme_marker(text)
-            or contains_visible_meme_marker(text)
-        )
+        return not classify_visible_text(text, mode="bubble").ok
 
     def _event_get(self, evt, key: str, default=None):
         if isinstance(evt, dict):
@@ -1623,8 +1779,13 @@ class CompanionGraph:
         return getattr(evt, key, default)
 
     def _append_assistant_text_to_prompt(self, text: str):
-        if text:
-            self._prompt_transcript.append({"role": "assistant", "content": text})
+        if not text:
+            return
+        safety = classify_visible_text(text, mode="bubble")
+        if not safety.ok:
+            self._last_prompt_observability["assistant_prompt_append_skipped_reason"] = safety.reason
+            return
+        self._prompt_transcript.append({"role": "assistant", "content": text})
 
     def _append_provider_assistant_message(self, assistant_message: dict):
         sanitized, skip_reason = self._sanitize_provider_assistant_message(assistant_message)
@@ -1700,23 +1861,39 @@ class CompanionGraph:
 
     def _record_prompt_observability(self, messages: list[dict]):
         safe_messages = self._messages_for_observability(self._provider_safe_messages(messages))
+        stable_messages = self._messages_for_observability(self._provider_safe_messages(self._copy_prompt_transcript()))
         previous_messages = copy.deepcopy(self._last_prompt_messages)
+        previous_stable_messages = copy.deepcopy(self._last_stable_prompt_messages)
         messages = safe_messages
-        append_only = self._is_messages_prefix(previous_messages, messages) if previous_messages else True
+        full_request_append_only = self._is_messages_prefix(previous_messages, messages) if previous_messages else True
+        stable_append_only = (
+            self._is_messages_prefix(previous_stable_messages, stable_messages)
+            if previous_stable_messages
+            else True
+        )
         previous_hash = self._messages_hash(previous_messages) if previous_messages else None
+        previous_stable_hash = self._messages_hash(previous_stable_messages) if previous_stable_messages else None
         full_hash = self._messages_hash(messages)
+        stable_hash = self._messages_hash(stable_messages)
         serialized = self._messages_json(messages)
         observability = {
             "message_count": len(messages),
             "previous_message_count": len(previous_messages),
+            "stable_prefix_message_count": len(stable_messages),
+            "previous_stable_prefix_message_count": len(previous_stable_messages),
             "role_sequence": self._provider_role_sequence(messages),
             "full_request_hash": full_hash,
             "previous_request_hash": previous_hash,
+            "stable_prefix_hash": stable_hash,
+            "previous_stable_prefix_hash": previous_stable_hash,
             **self._prompt_block_hashes,
             "runtime_block_hash": self._last_runtime_block_hash,
             "hot_turn_reminder_hash": self._last_hot_turn_reminder_hash,
-            "append_only_check": append_only,
-            "prefix_rebuild_reason": None if append_only else "previous_request_not_prefix",
+            "append_only_check": stable_append_only,
+            "stable_prefix_append_only_check": stable_append_only,
+            "full_request_append_only_check": full_request_append_only,
+            "prefix_rebuild_reason": None if stable_append_only else "previous_stable_prefix_not_prefix",
+            "full_request_prefix_rebuild_reason": None if full_request_append_only else "previous_request_not_prefix",
             "char_count": len(serialized),
             "estimated_tokens": max(1, len(serialized) // 4),
             "estimated_prompt_tokens": max(1, len(serialized) // 4),
@@ -1726,10 +1903,11 @@ class CompanionGraph:
             observability["cache_affinity"] = cache_debug
         if self._last_multimodal_debug:
             observability["multimodal"] = copy.deepcopy(self._last_multimodal_debug)
-        if append_only and self._prefix_rebuild_reason:
+        if stable_append_only and self._prefix_rebuild_reason:
             observability["prefix_rebuild_reason"] = self._prefix_rebuild_reason
         self._prefix_rebuild_reason = None
         self._last_prompt_messages = copy.deepcopy(messages)
+        self._last_stable_prompt_messages = copy.deepcopy(stable_messages)
         self._last_prompt_observability = observability
         print(f"[prompt_cache_debug] {json.dumps(observability, ensure_ascii=False)}")
 
@@ -1776,7 +1954,7 @@ class CompanionGraph:
     def _record_prompt_usage(
         self,
         envelope: Optional[LLMResponseEnvelope] = None,
-        raw_output_source: Optional[str] = None,
+        normalized_output: Optional[NormalizedLLMOutput] = None,
     ):
         usage = envelope.usage if envelope else (
             self.llm.get_last_usage() if hasattr(self.llm, "get_last_usage") else None
@@ -1814,13 +1992,21 @@ class CompanionGraph:
             self._last_prompt_observability["assistant_has_reasoning_content"] = bool(
                 assistant_message.get("reasoning_content")
             )
+            self._last_prompt_observability["assistant_has_tool_calls"] = bool(
+                assistant_message.get("tool_calls") or assistant_message.get("function_call")
+            )
             self._last_prompt_observability["content_empty_with_reasoning"] = not bool(
                 str(assistant_message.get("content") or "").strip()
             ) and bool(assistant_message.get("reasoning_content"))
         if envelope and envelope.raw_response_meta:
             self._last_prompt_observability["llm_response_meta"] = envelope.raw_response_meta
-        if raw_output_source:
-            self._last_prompt_observability["raw_output_source"] = raw_output_source
+        if normalized_output:
+            self._last_prompt_observability["raw_output_source"] = normalized_output.raw_source
+            self._last_prompt_observability["normalized_raw_source"] = normalized_output.raw_source
+            self._last_prompt_observability["visible_safety_reason"] = normalized_output.unsafe_reason
+            self._last_prompt_observability["provider_finish_reason"] = normalized_output.finish_reason
+            self._last_prompt_observability["assistant_has_reasoning_content"] = bool(normalized_output.hidden_reasoning)
+            self._last_prompt_observability["assistant_has_tool_calls"] = bool(normalized_output.tool_calls)
 
     def _extract_cached_tokens(self, usage: dict) -> Optional[int]:
         details = usage.get("prompt_tokens_details") or usage.get("input_token_details") or {}
