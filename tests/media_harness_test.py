@@ -135,8 +135,10 @@ class FakeMemeSaver:
 class FakeVisionLLM:
     def __init__(self):
         self.main_messages = []
+        self.vision_messages = []
 
     async def chat_completion(self, messages, temperature=0.7, max_tokens=None, stream=False):
+        self.vision_messages.append(messages)
         serialized = json.dumps(messages, ensure_ascii=False)
         if "表情包理解器" in serialized:
             return json.dumps({
@@ -342,7 +344,7 @@ class MediaHarnessTest(unittest.TestCase):
             index = json.loads((meme_base / "image_dhash_index.json").read_text(encoding="utf-8"))
             self.assertTrue(any("amused_cat_laugh_sticker.png" in key for key in index))
 
-    def test_graph_enqueues_ordinary_image_without_waiting_for_vision(self):
+    def test_graph_runs_ordinary_image_understanding_inline(self):
         async def scenario():
             with tempfile.TemporaryDirectory() as tmp_dir:
                 root = Path(tmp_dir)
@@ -376,15 +378,20 @@ class MediaHarnessTest(unittest.TestCase):
 
                 decision = await graph.run(ctx)
 
-                self.assertEqual(decision.all_items()[0].content, "我看看")
+                self.assertEqual(decision.all_items()[0].content, "看到啦，是咖啡续命现场对吧")
                 debug = graph.get_last_media_debug()
-                self.assertEqual(debug[0]["internal_event_harness"], "media_pending")
-                self.assertEqual(debug[0]["status"], "queued")
-                self.assertEqual(queue.status()["queue_size"], 1)
+                self.assertEqual(debug[0]["internal_event_harness"], "image_understanding_result")
+                self.assertEqual(debug[0]["status"], "completed")
+                self.assertTrue(debug[0]["inline_image_understanding"])
+                self.assertFalse(debug[0]["media_cache_hit"])
+                self.assertTrue(debug[0]["media_cache_write"])
+                self.assertEqual(queue.status()["queue_size"], 0)
                 self.assertEqual(analyzer.analyze_calls, [])
+                self.assertEqual(len(llm.vision_messages), 1)
                 serialized_main = json.dumps(llm.main_messages[-1], ensure_ascii=False)
-                self.assertIn("media_pending", serialized_main)
-                self.assertIn("queued_for_download_vision_and_intake", serialized_main)
+                self.assertIn("image_understanding_result", serialized_main)
+                self.assertIn("桌上有一杯咖啡", serialized_main)
+                self.assertNotIn("media_pending", serialized_main)
                 self.assertNotIn(str(image_path), serialized_main)
 
         asyncio.run(scenario())
@@ -446,7 +453,7 @@ class MediaHarnessTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_completed_image_result_uses_media_followup_not_next_user_prompt(self):
+    def test_inline_image_understanding_cache_reused_for_latest_snapshot(self):
         async def scenario():
             with tempfile.TemporaryDirectory() as tmp_dir:
                 root = Path(tmp_dir)
@@ -457,66 +464,49 @@ class MediaHarnessTest(unittest.TestCase):
                     media_downloader=FakeMediaDownloader(str(image_path)),
                     meme_steal_analyzer=FakeVisionAnalyzer(),
                 )
-                job = MediaJob(
-                    media_key="img-1:0:image.png",
-                    session_id="default",
-                    snapshot_id=1,
-                    buffer_version=1,
-                    source_job_id="job-1",
-                    event={
-                        "event_id": "img-1",
-                        "event_type": "message.image",
-                        "text": "[图片]",
-                        "raw": {"media_refs": []},
-                    },
-                    media_ref={
-                        "segment_index": 0,
-                        "segment_type": "image",
-                        "is_sticker": False,
-                        "file": "image.png",
-                    },
-                    event_text="[图片]",
-                    context_text="user: 今天靠咖啡续命",
-                )
-                queue.start()
-                self.assertTrue(queue.enqueue(job))
-                await asyncio.wait_for(queue._queue.join(), timeout=1)
-                await queue.shutdown()
-
-                prompt_payloads = queue.get_completed_payloads_for_prompt()
-                self.assertEqual(prompt_payloads[0]["internal_event_harness"], "image_understanding_result")
-                serialized_payloads = json.dumps(prompt_payloads, ensure_ascii=False)
-                self.assertIn("桌上有一杯咖啡", serialized_payloads)
-                self.assertNotIn("raw_output", serialized_payloads)
-                self.assertNotIn(str(image_path), serialized_payloads)
-
                 graph = CompanionGraph(
                     llm,
                     FakeMemory(),
                     FakeMemeCatalog(),
                     media_job_queue=queue,
                 )
-                decision = await graph.run(_process_context({
-                    "event_id": "text-1",
-                    "event_type": "message.text",
-                    "text": "那个图怎么样",
-                    "raw": {},
-                }))
+                image_event = {
+                    "event_id": "img-1",
+                    "event_type": "message.image",
+                    "text": "[图片]",
+                    "raw": {
+                        "media_refs": [{
+                            "segment_index": 0,
+                            "segment_type": "image",
+                            "is_sticker": False,
+                            "file": "image.png",
+                        }]
+                    },
+                }
+                await graph.run(_process_context(image_event))
+                self.assertEqual(len(llm.vision_messages), 1)
 
-                self.assertEqual(decision.all_items()[0].content, "收到")
+                decision = await graph.run(_process_context([
+                    image_event,
+                    {
+                        "event_id": "text-1",
+                        "event_type": "message.text",
+                        "text": "那个图怎么样",
+                        "raw": {},
+                    },
+                ]))
+
+                self.assertEqual(decision.all_items()[0].content, "看到啦，是咖啡续命现场对吧")
+                self.assertEqual(len(llm.vision_messages), 1)
+                debug = graph.get_last_media_debug()
+                self.assertEqual(debug[0]["status"], "cached")
+                self.assertTrue(debug[0]["media_cache_hit"])
                 serialized_main = json.dumps(llm.main_messages[-1], ensure_ascii=False)
-                self.assertNotIn("桌上有一杯咖啡", serialized_main)
+                self.assertIn("那个图怎么样", serialized_main)
+                self.assertIn("桌上有一杯咖啡", serialized_main)
+                self.assertIn("cached", serialized_main)
+                self.assertNotIn("media_followup", serialized_main)
                 self.assertNotIn(str(image_path), serialized_main)
-
-                followup_ctx = _media_followup_context()
-                followup = await graph.run_media_followup(followup_ctx, prompt_payloads[0])
-
-                self.assertEqual(followup.all_items()[0].content, "看到啦，是咖啡续命现场对吧")
-                serialized_followup = json.dumps(llm.main_messages[-1], ensure_ascii=False)
-                self.assertIn("media_followup", serialized_followup)
-                self.assertIn("桌上有一杯咖啡", serialized_followup)
-                self.assertNotIn("raw_output", serialized_followup)
-                self.assertNotIn(str(image_path), serialized_followup)
 
         asyncio.run(scenario())
 
@@ -571,13 +561,14 @@ class MediaHarnessTest(unittest.TestCase):
         asyncio.run(scenario())
 
 
-def _process_context(event: dict) -> ProcessContext:
+def _process_context(event: dict | list[dict]) -> ProcessContext:
+    events = event if isinstance(event, list) else [event]
     snapshot = ConversationSnapshot(
         session_id="default",
         snapshot_id=1,
         buffer_version=1,
         status=ChatStatus.HOT,
-        events=[event],
+        events=events,
     )
     fake_gate = SimpleNamespace(
         state=SimpleNamespace(msg_index_today=1),

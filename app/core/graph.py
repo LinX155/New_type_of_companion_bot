@@ -212,6 +212,7 @@ class CompanionGraph:
         self._last_multimodal_debug: list[dict] = []
         self._last_llm_request_messages: list[dict] = []
         self._last_normalized_llm_output: Optional[NormalizedLLMOutput] = None
+        self._media_understanding_cache: dict[str, dict] = {}
 
     def _record_llm_raw_output(self, raw_output: str):
         self._last_llm_raw_output = raw_output
@@ -283,7 +284,7 @@ class CompanionGraph:
 
         messages = self._copy_prompt_transcript()
         self._append_runtime_context(ctx, target=messages)
-        self._append_media_pending_payloads_and_enqueue_jobs(ctx, target=messages)
+        await self._append_media_payloads_and_enqueue_jobs(ctx, target=messages)
         self._append_hot_turn_system_reminder(snapshot, target=messages)
         messages.append({"role": "system", "content": FINAL_ACTION_OUTPUT_REMINDER})
         self._apply_multimodal_replacements(messages, multimodal_replacements)
@@ -756,11 +757,13 @@ class CompanionGraph:
     def clear_prompt_state(self):
         self._conversation_history.clear()
         self._context_checkpoint_text = None
+        self._media_understanding_cache.clear()
         self.reset_provider_transcript(reason="conversation_cleared")
 
     def load_conversation_context(self, checkpoint_text: Optional[str], history: Optional[list[dict]] = None):
         self._context_checkpoint_text = (checkpoint_text or "").strip() or None
         self._conversation_history = self._sanitize_history_items(history or [])
+        self._media_understanding_cache.clear()
         self.reset_provider_transcript(reason="context_checkpoint_loaded")
 
     def reset_provider_transcript(self, reason: str = "provider_transcript_reset"):
@@ -1367,7 +1370,7 @@ class CompanionGraph:
             ),
         }
 
-    def _append_media_pending_payloads_and_enqueue_jobs(self, ctx: ProcessContext, target: Optional[list[dict]] = None):
+    async def _append_media_payloads_and_enqueue_jobs(self, ctx: ProcessContext, target: Optional[list[dict]] = None):
         self._last_media_debug = []
         target_messages = target if target is not None else self._prompt_transcript
         for evt in ctx.snapshot.events:
@@ -1382,34 +1385,182 @@ class CompanionGraph:
                 if not isinstance(media_ref, dict):
                     continue
                 media_key = self._media_harness_key(ctx, evt, media_ref, index)
-                if media_key in self._media_harness_event_ids:
+                is_sticker = bool(media_ref.get("is_sticker"))
+                if is_sticker and media_key in self._media_harness_event_ids:
                     continue
 
-                pending_payload = self._build_media_pending_payload(ctx, evt, media_ref, media_key, index)
-                if self.media_job_queue:
-                    enqueued = self.media_job_queue.enqueue(
-                        MediaJob(
-                            media_key=media_key,
-                            session_id=ctx.snapshot.session_id,
-                            snapshot_id=ctx.snapshot.snapshot_id,
-                            buffer_version=ctx.snapshot.buffer_version,
-                            source_job_id=ctx.job_id,
-                            event=copy.deepcopy(evt),
-                            media_ref=copy.deepcopy(media_ref),
-                            event_text=str(self._event_get(evt, "text") or ""),
-                            context_text=self._media_context_text(evt),
+                if is_sticker:
+                    pending_payload = self._build_media_pending_payload(ctx, evt, media_ref, media_key, index)
+                    if self.media_job_queue:
+                        enqueued = self.media_job_queue.enqueue(
+                            MediaJob(
+                                media_key=media_key,
+                                session_id=ctx.snapshot.session_id,
+                                snapshot_id=ctx.snapshot.snapshot_id,
+                                buffer_version=ctx.snapshot.buffer_version,
+                                source_job_id=ctx.job_id,
+                                event=copy.deepcopy(evt),
+                                media_ref=copy.deepcopy(media_ref),
+                                event_text=str(self._event_get(evt, "text") or ""),
+                                context_text=self._media_context_text(evt),
+                            )
                         )
-                    )
-                    pending_payload["status"] = "queued" if enqueued else "already_queued"
-                else:
-                    pending_payload["status"] = "queue_not_configured"
+                        pending_payload["status"] = "queued" if enqueued else "already_queued"
+                    else:
+                        pending_payload["status"] = "queue_not_configured"
+                    target_messages.append({
+                        "role": "system",
+                        "content": json.dumps(pending_payload, ensure_ascii=False),
+                    })
+                    self._last_media_debug.append(pending_payload)
+                    self._media_harness_event_ids.add(media_key)
+                    continue
 
+                prompt_payload = await self._inline_image_understanding_payload(
+                    ctx=ctx,
+                    evt=evt,
+                    media_ref=media_ref,
+                    media_key=media_key,
+                    index=index,
+                )
                 target_messages.append({
                     "role": "system",
-                    "content": json.dumps(pending_payload, ensure_ascii=False),
+                    "content": json.dumps(prompt_payload, ensure_ascii=False),
                 })
-                self._last_media_debug.append(pending_payload)
+                self._last_media_debug.append(prompt_payload)
                 self._media_harness_event_ids.add(media_key)
+
+    async def _inline_image_understanding_payload(
+        self,
+        ctx: ProcessContext,
+        evt: dict,
+        media_ref: dict,
+        media_key: str,
+        index: int,
+    ) -> dict:
+        cached = self._media_understanding_cache.get(media_key)
+        if cached:
+            prompt_payload = copy.deepcopy(cached)
+            original_status = prompt_payload.get("status")
+            prompt_payload.update({
+                "status": "cached",
+                "cached_original_status": original_status,
+                "inline_image_understanding": True,
+                "media_cache_hit": True,
+                "media_cache_write": False,
+                "media_understanding_status": "cached",
+                "media_understanding_error": prompt_payload.get("error"),
+                "prompt_usage": "available_for_current_turn",
+            })
+            return prompt_payload
+
+        if not self.media_job_queue:
+            prompt_payload = self._inline_image_understanding_unavailable_payload(
+                ctx=ctx,
+                media_ref=media_ref,
+                media_key=media_key,
+                index=index,
+                error="media_job_queue is not configured",
+            )
+            self._media_understanding_cache[media_key] = copy.deepcopy(prompt_payload)
+            return prompt_payload
+
+        job = MediaJob(
+            media_key=media_key,
+            session_id=ctx.snapshot.session_id,
+            snapshot_id=ctx.snapshot.snapshot_id,
+            buffer_version=ctx.snapshot.buffer_version,
+            source_job_id=ctx.job_id,
+            event=copy.deepcopy(evt),
+            media_ref=copy.deepcopy(media_ref),
+            event_text=str(self._event_get(evt, "text") or ""),
+            context_text=self._media_context_text(evt),
+        )
+        prompt_payload, debug_payloads = await self.media_job_queue.process_inline_image_for_prompt(job)
+        image_debug = next(
+            (
+                payload
+                for payload in debug_payloads
+                if payload.get("internal_event_harness") == "image_understanding_result"
+            ),
+            {},
+        )
+        if not prompt_payload:
+            prompt_payload = self._inline_image_understanding_unavailable_payload(
+                ctx=ctx,
+                media_ref=media_ref,
+                media_key=media_key,
+                index=index,
+                error="inline image understanding produced no image payload",
+            )
+
+        stale_cached = self._is_context_job_stale(ctx)
+        prompt_payload = {
+            **prompt_payload,
+            "inline_image_understanding": True,
+            "media_cache_hit": False,
+            "media_cache_write": True,
+            "media_understanding_status": prompt_payload.get("status"),
+            "media_understanding_error": prompt_payload.get("error"),
+            "stale_image_result_cached": stale_cached,
+            "prompt_usage": "available_for_current_turn",
+        }
+        if image_debug.get("download"):
+            prompt_payload["download"] = image_debug.get("download")
+        self._media_understanding_cache[media_key] = copy.deepcopy(prompt_payload)
+        return prompt_payload
+
+    def _inline_image_understanding_unavailable_payload(
+        self,
+        ctx: ProcessContext,
+        media_ref: dict,
+        media_key: str,
+        index: int,
+        error: str,
+    ) -> dict:
+        payload = {
+            "internal_event_harness": "image_understanding_result",
+            "status": "failed",
+            "media_key": media_key,
+            "session_id": ctx.snapshot.session_id,
+            "source_job_id": ctx.job_id,
+            "snapshot_id": ctx.snapshot.snapshot_id,
+            "buffer_version": ctx.snapshot.buffer_version,
+            "segment_index": media_ref.get("segment_index", index),
+            "is_sticker": False,
+            "visibility": "internal_only_not_visible_to_user",
+            "prompt_usage": "available_for_current_turn",
+            "media_ref": self._safe_media_ref_for_prompt(media_ref),
+            "error": error,
+            "instruction": self._image_harness_failure_instruction(False),
+            "inline_image_understanding": True,
+            "media_cache_hit": False,
+            "media_cache_write": True,
+            "media_understanding_status": "failed",
+            "media_understanding_error": error,
+            "stale_image_result_cached": self._is_context_job_stale(ctx),
+        }
+        return payload
+
+    def _is_context_job_stale(self, ctx: ProcessContext) -> bool:
+        checker = getattr(ctx.gate, "is_job_stale", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker(ctx.job_id))
+        except Exception:
+            return False
+
+    def _image_harness_failure_instruction(self, is_sticker: bool) -> str:
+        if is_sticker:
+            return (
+                "表情包/贴纸理解失败。主聊天仍只能把它当作心情、语气或接梗信号，"
+                "不要编造画面细节，也不要解释内部失败。"
+            )
+        return (
+            "普通图片理解失败。主聊天可以轻问或 WAIT，但不能编造图片内容，"
+            "也不要解释内部看图流程。"
+        )
 
     def _build_media_pending_payload(
         self,

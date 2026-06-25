@@ -131,6 +131,20 @@ class MediaJobQueue:
         self._queue.put_nowait(job)
         return True
 
+    async def process_inline_image_for_prompt(self, job: MediaJob) -> tuple[Optional[dict], list[dict]]:
+        payloads = await self._process_job(job)
+        self._last_payloads = payloads
+        image_payload = next(
+            (
+                payload
+                for payload in payloads
+                if payload.get("internal_event_harness") == "image_understanding_result"
+            ),
+            None,
+        )
+        prompt_payload = self._payload_for_prompt(image_payload) if image_payload else None
+        return prompt_payload, copy.deepcopy(payloads)
+
     def get_last_payloads(self) -> list[dict]:
         return copy.deepcopy(self._last_payloads)
 

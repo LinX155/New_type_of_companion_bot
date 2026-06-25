@@ -2146,19 +2146,7 @@ async def _record_background_media_payloads(payloads: list[dict], job: MediaJob)
 
 
 def _media_followup_payloads(payloads: Optional[list[dict]]) -> list[dict]:
-    result: list[dict] = []
-    for payload in payloads or []:
-        if payload.get("internal_event_harness") != "image_understanding_result":
-            continue
-        if payload.get("status") != "completed":
-            continue
-        if payload.get("is_sticker"):
-            continue
-        media_key = str(payload.get("media_key") or "").strip()
-        if not media_key or media_key in _media_followup_keys:
-            continue
-        result.append(payload)
-    return result
+    return []
 
 
 async def _dispatch_media_followup_when_idle(job: MediaJob, payload: dict):
