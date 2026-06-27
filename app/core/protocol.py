@@ -1,6 +1,7 @@
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Callable, Literal, Optional
 
 from .decisions import (
@@ -37,6 +38,14 @@ VALID_MEME_CATEGORIES = {
 PROTOCOL_PREFIXES = ("emoji:", "meme:", "search_meme:")
 HARNESS_ITEM_KEYS = ("text", "meme", "search_meme")
 MEME_MARKER_RE = re.compile(r"(?<!&)&{1,2}([^&\r\n]{1,120})&{1,2}(?!&)")
+ACTIVE_SCHEDULE_MARKER_RE = re.compile(
+    r"(?<!&)&&\s*(?P<kind>next|daily)\s*:\s*(?P<time>[^&\r\n]{1,64})&&",
+    re.IGNORECASE,
+)
+MALFORMED_ACTIVE_SCHEDULE_MARKER_RE = re.compile(
+    r"(?<!&)&&\s*(?:next|daily)\s*:[^&\r\n]{0,80}(?:\|\|\||$)",
+    re.IGNORECASE,
+)
 MALFORMED_MEME_MARKER_RE = re.compile(
     r"(?<!&)(?:"
     r"&&\s*(?P<open_category>[A-Za-z_][A-Za-z0-9_]{1,32})\s*:[^&\r\n]{0,120}(?:\|\|\||$)"
@@ -113,6 +122,13 @@ class ExecutableValidation:
     @property
     def ok(self) -> bool:
         return not self.errors
+
+
+@dataclass
+class ActiveScheduleParse:
+    clean_text: str
+    setting: Optional[dict] = None
+    error: Optional[str] = None
 
 
 def parse_raw_decision(raw_output: str) -> dict:
@@ -231,7 +247,19 @@ def parse_and_validate_main_output(raw_output: str, is_cold_context: bool = Fals
             )
         return legacy
 
-    decision = _decision_from_lightweight_text(text, is_cold_context=is_cold_context)
+    active_schedule = _extract_active_schedule_marker(text)
+    if active_schedule.error:
+        return ProtocolResult(
+            status="active_schedule_marker_error",
+            errors=[active_schedule.error],
+            raw_data={"protocol": "lightweight_text", "raw_output": raw_output},
+        )
+
+    decision = _decision_from_lightweight_text(
+        active_schedule.clean_text,
+        is_cold_context=is_cold_context,
+        active_message_setting=active_schedule.setting,
+    )
     errors = validate_protocol(decision)
     if errors:
         return ProtocolResult(
@@ -244,7 +272,11 @@ def parse_and_validate_main_output(raw_output: str, is_cold_context: bool = Fals
     return ProtocolResult(
         status="ok",
         decision=decision,
-        raw_data={"protocol": "lightweight_text", "raw_output": raw_output},
+        raw_data={
+            "protocol": "lightweight_text",
+            "raw_output": raw_output,
+            "active_message_setting": active_schedule.setting,
+        },
     )
 
 
@@ -259,36 +291,97 @@ def parse_meme_selection_output(raw_output: str, candidates: set[str]) -> Option
     return stem
 
 
-def _decision_from_lightweight_text(text: str, is_cold_context: bool) -> ActionDecision:
+def _decision_from_lightweight_text(
+    text: str,
+    is_cold_context: bool,
+    active_message_setting: Optional[dict] = None,
+) -> ActionDecision:
     stripped = text.strip()
+    side_effects = _active_side_effects(active_message_setting)
     if stripped.upper() == "WAIT":
-        return ActionDecision(action=Action.WAIT, items=None)
+        return ActionDecision(action=Action.WAIT, items=None, side_effects=side_effects)
 
     enter_prefix = "ENTER_CHAT:"
     if stripped.upper().startswith(enter_prefix):
         body = stripped[len(enter_prefix):].strip()
         items = _items_from_marker_text(body)
-        return ActionDecision(action=Action.ENTER_CHAT, items=items or None)
+        return ActionDecision(action=Action.ENTER_CHAT, items=items or None, side_effects=side_effects)
 
     items = _items_from_marker_text(stripped)
     if not items:
-        return ActionDecision(action=Action.WAIT, items=None)
+        return ActionDecision(action=Action.WAIT, items=None, side_effects=side_effects)
 
     has_text = any(item.type == SendItemType.TEXT for item in items)
     has_marker = any(item.type == SendItemType.SEARCH_MEME for item in items)
 
     if is_cold_context:
         if has_marker and not has_text:
-            return ActionDecision(action=Action.REACT, items=items)
+            return ActionDecision(action=Action.REACT, items=items, side_effects=side_effects)
         if has_marker and has_text:
-            return ActionDecision(action=Action.ENTER_CHAT, items=items)
+            return ActionDecision(action=Action.ENTER_CHAT, items=items, side_effects=side_effects)
         if _looks_like_light_ack(items):
-            return ActionDecision(action=Action.LIGHT_ACK, items=items)
-        return ActionDecision(action=Action.ENTER_CHAT, items=items)
+            return ActionDecision(action=Action.LIGHT_ACK, items=items, side_effects=side_effects)
+        return ActionDecision(action=Action.ENTER_CHAT, items=items, side_effects=side_effects)
 
     if has_marker:
-        return ActionDecision(action=Action.REACT, items=items)
-    return ActionDecision(action=Action.REPLY, items=items)
+        return ActionDecision(action=Action.REACT, items=items, side_effects=side_effects)
+    return ActionDecision(action=Action.REPLY, items=items, side_effects=side_effects)
+
+
+def _extract_active_schedule_marker(text: str) -> ActiveScheduleParse:
+    source = text or ""
+    matches = list(ACTIVE_SCHEDULE_MARKER_RE.finditer(source))
+    if len(matches) > 1:
+        return ActiveScheduleParse(
+            clean_text=source,
+            error="模型输出包含多个主动消息时间设置 marker；每轮最多只能设置一个 next 或 daily。",
+        )
+    if not matches:
+        if MALFORMED_ACTIVE_SCHEDULE_MARKER_RE.search(source):
+            return ActiveScheduleParse(
+                clean_text=source,
+                error="模型输出包含畸形主动消息时间设置 marker，不能作为用户可见聊天发送。",
+            )
+        return ActiveScheduleParse(clean_text=source)
+
+    match = matches[0]
+    kind = match.group("kind").strip().lower()
+    raw_time = match.group("time").strip()
+    setting = _normalize_active_schedule_marker(kind, raw_time)
+    if not setting:
+        return ActiveScheduleParse(
+            clean_text=source,
+            error=f"模型输出包含无效主动消息时间设置 marker: {match.group(0)}。",
+        )
+
+    clean_text = (source[:match.start()] + source[match.end():]).strip()
+    return ActiveScheduleParse(clean_text=clean_text, setting=setting)
+
+
+def _normalize_active_schedule_marker(kind: str, raw_time: str) -> Optional[dict]:
+    if kind == "daily":
+        match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", raw_time)
+        if not match:
+            return None
+        return {
+            "type": "daily",
+            "time": f"{int(match.group(1)):02d}:{int(match.group(2)):02d}",
+        }
+
+    if kind == "next":
+        try:
+            parsed = datetime.strptime(raw_time, "%Y-%m-%d %H:%M")
+        except ValueError:
+            return None
+        return {"type": "next", "time": parsed.strftime("%Y-%m-%d %H:%M")}
+
+    return None
+
+
+def _active_side_effects(setting: Optional[dict]) -> Optional[dict]:
+    if not setting:
+        return None
+    return {"active_message_setting": setting}
 
 
 def _items_from_marker_text(text: str) -> list[SendItem]:
@@ -378,6 +471,9 @@ def _looks_like_json_output(text: str) -> bool:
 def validate_protocol(decision: ActionDecision) -> list[str]:
     errors: list[str] = []
     items = decision.all_items()
+    active_setting = decision.active_message_setting()
+    if active_setting and not _normalize_active_message_setting_payload(active_setting):
+        errors.append("active_message_setting side effect 必须是 next: YYYY-MM-DD HH:mm 或 daily: HH:mm。")
 
     if decision.action in (Action.WAIT, Action.END_CHAT):
         if items:
@@ -431,6 +527,14 @@ def validate_protocol(decision: ActionDecision) -> list[str]:
                 )
 
     return errors
+
+
+def _normalize_active_message_setting_payload(setting: dict) -> Optional[dict]:
+    kind = str(setting.get("type") or "").strip().lower()
+    value = str(setting.get("time") or "").strip()
+    if not kind or not value:
+        return None
+    return _normalize_active_schedule_marker(kind, value)
 
 
 def validate_executable(
@@ -493,7 +597,7 @@ def build_repair_messages(
         "original_raw_output": original_raw or "(空输出)",
         "original_decision": original_payload,
         "required_output": "Return one corrected lightweight chat output.",
-        "repair_task": "Rewrite the blocked assistant draft into WAIT, ENTER_CHAT: text, natural text, or natural text with &&category:keywords&&.",
+        "repair_task": "Rewrite the blocked assistant draft into WAIT, ENTER_CHAT: text, natural text, natural text with &&category:keywords&&, or natural confirmation text with one active schedule marker.",
         "repair_rules": [
             "This is a system protocol repair event, not a user message.",
             "The previous assistant output failed local Action Harness validation and was blocked before delivery.",
@@ -503,8 +607,10 @@ def build_repair_messages(
             "如果 original_raw_output 是自然语言回复，优先原样保留其语气和主要内容。",
             "如果 original_raw_output 里有旧 JSON、多个对象、Markdown 或解释文字，提取其中真正想发给用户的自然聊天内容。",
             "如果原草稿想发表情包但没有自然可见文字，用 &&category:keywords&& 表达表情占位。",
+            "如果用户本轮明确要求你在某个时间主动联系/提醒/叫他，允许在自然确认文本末尾附一个 &&next:YYYY-MM-DD HH:mm&& 或 &&daily:HH:mm&&。",
+            "如果没有明确主动联系要求，不要添加 next/daily marker；不要只输出 marker。",
             "基于同一轮对话修正，不要开启新话题，不要解释错误。",
-            "只输出 WAIT、ENTER_CHAT: <自然语言>、普通自然语言，或带一个 &&category:keywords&& 的普通自然语言。",
+            "只输出 WAIT、ENTER_CHAT: <自然语言>、普通自然语言，或带一个 &&category:keywords&& / &&next:YYYY-MM-DD HH:mm&& / &&daily:HH:mm&& 的普通自然语言。",
             "不要输出 JSON、Markdown、解释、前后缀或多个候选答案。",
             "COLD 下如果值得进入连续聊天，使用 ENTER_CHAT:；如果只是低负担接一下，可以输出很短自然句或 WAIT。",
             "如果需要表情，使用 &&category:keywords&&；category 必须是固定英文分类 ID，keywords 用简短英文 token。",
@@ -536,6 +642,7 @@ def build_repair_messages(
                 "SYSTEM REMINDER: ACTION_HARNESS_PROTOCOL_ERROR. "
                 "The prior assistant message is an internal blocked draft, not user-visible chat history. "
                 "Rewrite that draft into WAIT, ENTER_CHAT: text, natural text, or natural text with &&category:keywords&& for the same turn. "
+                "If and only if the current user explicitly asked for a future active contact time, a natural confirmation may end with one &&next:YYYY-MM-DD HH:mm&& or &&daily:HH:mm&& marker. "
                 "Return the corrected lightweight output only; no explanation, no Markdown, no JSON. "
                 "如果原输出是自然语言，就尽量保留原意，不要丢成“嗯”。"
             ),
@@ -626,6 +733,29 @@ def contains_visible_meme_marker(text: str) -> bool:
     return False
 
 
+def contains_visible_active_schedule_marker(text: str) -> bool:
+    for match in ACTIVE_SCHEDULE_MARKER_RE.finditer(text or ""):
+        if _normalize_active_schedule_marker(
+            match.group("kind").strip().lower(),
+            match.group("time").strip(),
+        ):
+            return True
+    return False
+
+
+def contains_malformed_active_schedule_marker(text: str) -> bool:
+    source = text or ""
+    if MALFORMED_ACTIVE_SCHEDULE_MARKER_RE.search(source):
+        return True
+    for match in ACTIVE_SCHEDULE_MARKER_RE.finditer(source):
+        if not _normalize_active_schedule_marker(
+            match.group("kind").strip().lower(),
+            match.group("time").strip(),
+        ):
+            return True
+    return False
+
+
 def contains_malformed_visible_meme_marker(text: str) -> bool:
     for match in MALFORMED_MEME_MARKER_RE.finditer(text or ""):
         category = match.group("open_category") or match.group("close_category")
@@ -668,6 +798,10 @@ def classify_visible_text(text: str, mode: VisibleSafetyMode = "bubble") -> Visi
         return VisibleSafetyResult(ok=False, reason="internal_line_only", mode=mode)
     if INTERNAL_LINE_ROLE_RE.match(stripped):
         return VisibleSafetyResult(ok=False, reason="role_line_only", mode=mode)
+    if contains_malformed_active_schedule_marker(content):
+        return VisibleSafetyResult(ok=False, reason="malformed_active_schedule_marker", mode=mode)
+    if mode == "bubble" and contains_visible_active_schedule_marker(content):
+        return VisibleSafetyResult(ok=False, reason="unparsed_active_schedule_marker", mode=mode)
     if contains_malformed_visible_meme_marker(content):
         return VisibleSafetyResult(ok=False, reason="malformed_meme_marker", mode=mode)
     if mode == "bubble" and contains_visible_meme_marker(content):

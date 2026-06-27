@@ -603,6 +603,13 @@ async def on_decision(ctx: ProcessContext):
     if not result["visible"] or not items:
         await _emit_llm_finished(llm_target, "dropped")
         _record_decision_drop(ctx, decision)
+        _record_active_message_setting_side_effect(ctx, decision, "skipped", {
+            "active_schedule_marker_detected": True,
+            "active_message_setting": decision.active_message_setting(),
+            "visibility": "internal_debug_only",
+            "reason": "not_visible",
+            "sent_item_count": 0,
+        })
         gate.mark_job_dropped(ctx.job_id)
         await _emit_state({
             "session_id": ctx.snapshot.session_id,
@@ -768,11 +775,146 @@ async def on_decision(ctx: ProcessContext):
 
     commit_sent_progress()
     if sent_items:
+        _apply_active_message_setting_side_effect_after_send(ctx, decision, sent_items)
         gate.mark_job_sent(ctx.job_id)
         await _emit_llm_finished(llm_target, "sent")
     else:
+        _record_active_message_setting_side_effect(ctx, decision, "skipped", {
+            "active_schedule_marker_detected": True,
+            "active_message_setting": decision.active_message_setting(),
+            "visibility": "internal_debug_only",
+            "reason": "no_visible_send",
+            "sent_item_count": 0,
+        })
         gate.mark_job_dropped(ctx.job_id)
         await _emit_llm_finished(llm_target, "dropped")
+
+
+def _apply_active_message_setting_side_effect_after_send(
+    ctx: ProcessContext,
+    decision: ActionDecision,
+    sent_items: list[SendItem],
+):
+    setting = decision.active_message_setting()
+    if not setting:
+        return
+
+    base_payload = {
+        "active_schedule_marker_detected": True,
+        "active_message_setting": setting,
+        "sent_item_count": len(sent_items),
+        "visibility": "internal_debug_only",
+        "applied_after_visible_send": bool(sent_items),
+    }
+    if not sent_items:
+        _record_active_message_setting_side_effect(
+            ctx,
+            decision,
+            "skipped",
+            {**base_payload, "reason": "no_visible_send"},
+        )
+        return
+
+    allowed, reason = _active_message_setting_side_effect_allowed(ctx)
+    if not allowed:
+        _record_active_message_setting_side_effect(
+            ctx,
+            decision,
+            "skipped",
+            {**base_payload, "reason": reason},
+        )
+        return
+
+    try:
+        success, response_text = _apply_active_message_setting(ctx.snapshot.session_id, setting)
+    except Exception as exc:  # noqa: BLE001
+        _record_active_message_setting_side_effect(
+            ctx,
+            decision,
+            "error",
+            {
+                **base_payload,
+                "active_schedule_applied": False,
+                "reason": "apply_exception",
+                "error": str(exc)[:500],
+            },
+        )
+        return
+
+    _record_active_message_setting_side_effect(
+        ctx,
+        decision,
+        "applied" if success else "error",
+        {
+            **base_payload,
+            "active_schedule_applied": success,
+            "response_text": response_text,
+            "reason": "applied" if success else "apply_failed",
+        },
+    )
+
+
+def _active_message_setting_side_effect_allowed(ctx: ProcessContext) -> tuple[bool, str]:
+    user_text = _active_message_setting_snapshot_user_text(ctx)
+    if not user_text:
+        return False, "no_user_text_in_snapshot"
+    if looks_like_active_message_setting_request(user_text):
+        return True, "current_user_requested_active_message_setting"
+    return False, "current_user_text_did_not_request_active_message_setting"
+
+
+def _active_message_setting_snapshot_user_text(ctx: ProcessContext) -> str:
+    parts: list[str] = []
+    for evt in getattr(ctx.snapshot, "events", []) or []:
+        if _event_role(evt) != "user":
+            continue
+        text = _event_text(evt)
+        if text:
+            parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def _event_role(evt) -> str:
+    if isinstance(evt, dict):
+        return str(evt.get("role") or "user").strip().lower()
+    return str(getattr(evt, "role", "user") or "user").strip().lower()
+
+
+def _event_text(evt) -> str:
+    if isinstance(evt, dict):
+        return str(evt.get("text") or "").strip()
+    return str(getattr(evt, "text", "") or "").strip()
+
+
+def _record_active_message_setting_side_effect(
+    ctx: ProcessContext,
+    decision: ActionDecision,
+    status: str,
+    payload: dict,
+):
+    setting = decision.active_message_setting()
+    if not setting:
+        return
+    db = next(get_db())
+    try:
+        log = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id=ctx.snapshot.session_id,
+            event_type="active_message.setting_side_effect",
+            raw_payload=_json_dumps(payload),
+            parsed_payload=_json_dumps(decision.to_harness_payload(exclude_none=True)),
+            action=decision.action.value,
+            snapshot_id=ctx.snapshot.snapshot_id,
+            buffer_version=ctx.snapshot.buffer_version,
+            job_id=ctx.job_id,
+            status=status,
+        )
+        db.add(log)
+        db.commit()
+    except Exception as e:
+        print(f"DB error: {e}")
+    finally:
+        db.close()
 
 
 def _apply_recent_repetition_guard(

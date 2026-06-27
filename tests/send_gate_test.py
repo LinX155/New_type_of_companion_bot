@@ -500,6 +500,202 @@ class SendGateTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_active_schedule_side_effect_applies_after_visible_send(self):
+        async def scenario():
+            decision = ActionDecision(
+                action=Action.REPLY,
+                items=[SendItem(type=SendItemType.TEXT, content="好，那我明天十点左右来找你。")],
+                side_effects={
+                    "active_message_setting": {
+                        "type": "next",
+                        "time": "2099-06-28 10:00",
+                    }
+                },
+            )
+            graph = FakeGraph(decision)
+            gate = FakeGate()
+            emitted = []
+            apply_calls = []
+            side_effect_logs = []
+            order = []
+
+            original_commit = graph.commit_sent_items
+
+            def fake_commit(ctx, items):
+                order.append("commit")
+                original_commit(ctx, items)
+
+            graph.commit_sent_items = fake_commit
+
+            originals = {
+                "companion_graph": routes.companion_graph,
+                "event_gate": routes.event_gate,
+                "_emit_llm_started": routes._emit_llm_started,
+                "_emit_message": routes._emit_message,
+                "_emit_state": routes._emit_state,
+                "_emit_conversation_changed": routes._emit_conversation_changed,
+                "_wait_until_user_not_composing": routes._wait_until_user_not_composing,
+                "_apply_recent_repetition_guard": routes._apply_recent_repetition_guard,
+                "_record_prompt_cache_debug": routes._record_prompt_cache_debug,
+                "_record_assistant_send": routes._record_assistant_send,
+                "_record_job_state": routes._record_job_state,
+                "_apply_active_message_setting": routes._apply_active_message_setting,
+                "_record_active_message_setting_side_effect": routes._record_active_message_setting_side_effect,
+            }
+
+            async def noop_async(*args, **kwargs):
+                pass
+
+            async def fake_emit_message(data):
+                order.append("emit")
+                emitted.append(data)
+
+            async def fake_wait(ctx, expected_buffer_version=None):
+                return True
+
+            def fake_record_send(*args, **kwargs):
+                order.append("record_send")
+
+            def fake_apply(session_id, setting):
+                order.append("apply")
+                apply_calls.append((session_id, setting))
+                return True, "ok"
+
+            def fake_record_side_effect(ctx, decision, status, payload):
+                side_effect_logs.append((status, payload))
+
+            try:
+                routes.companion_graph = graph
+                routes.event_gate = gate
+                routes._emit_llm_started = noop_async
+                routes._emit_message = fake_emit_message
+                routes._emit_state = noop_async
+                routes._emit_conversation_changed = noop_async
+                routes._wait_until_user_not_composing = fake_wait
+                routes._apply_recent_repetition_guard = lambda ctx, decision: (decision, [])
+                routes._record_prompt_cache_debug = lambda *args, **kwargs: None
+                routes._record_assistant_send = fake_record_send
+                routes._record_job_state = lambda *args, **kwargs: None
+                routes._apply_active_message_setting = fake_apply
+                routes._record_active_message_setting_side_effect = fake_record_side_effect
+
+                ctx = SimpleNamespace(
+                    gate=gate,
+                    job_id="job_active_marker",
+                    snapshot=SimpleNamespace(
+                        session_id="qq_private_1",
+                        snapshot_id=1,
+                        buffer_version=10,
+                        events=[{"text": "明天 10点提醒我吃药"}],
+                    ),
+                )
+                await routes.on_decision(ctx)
+            finally:
+                for name, value in originals.items():
+                    setattr(routes, name, value)
+
+            assistant_messages = [item for item in emitted if item.get("type") == "assistant_message"]
+            self.assertEqual(len(assistant_messages), 1)
+            self.assertEqual(assistant_messages[0]["content"], "好，那我明天十点左右来找你。")
+            self.assertNotIn("next:", assistant_messages[0]["content"])
+            self.assertEqual(
+                apply_calls,
+                [("qq_private_1", {"type": "next", "time": "2099-06-28 10:00"})],
+            )
+            self.assertEqual(side_effect_logs[-1][0], "applied")
+            self.assertEqual(order[-1], "apply")
+            self.assertIn("commit", order)
+            self.assertLess(order.index("commit"), order.index("apply"))
+            self.assertTrue(gate.sent)
+
+        asyncio.run(scenario())
+
+    def test_active_schedule_side_effect_is_skipped_without_user_request(self):
+        async def scenario():
+            decision = ActionDecision(
+                action=Action.REPLY,
+                items=[SendItem(type=SendItemType.TEXT, content="晚点再说。")],
+                side_effects={
+                    "active_message_setting": {
+                        "type": "daily",
+                        "time": "07:45",
+                    }
+                },
+            )
+            graph = FakeGraph(decision)
+            gate = FakeGate()
+            apply_calls = []
+            side_effect_logs = []
+
+            originals = {
+                "companion_graph": routes.companion_graph,
+                "event_gate": routes.event_gate,
+                "_emit_llm_started": routes._emit_llm_started,
+                "_emit_message": routes._emit_message,
+                "_emit_state": routes._emit_state,
+                "_emit_conversation_changed": routes._emit_conversation_changed,
+                "_wait_until_user_not_composing": routes._wait_until_user_not_composing,
+                "_apply_recent_repetition_guard": routes._apply_recent_repetition_guard,
+                "_record_prompt_cache_debug": routes._record_prompt_cache_debug,
+                "_record_assistant_send": routes._record_assistant_send,
+                "_record_job_state": routes._record_job_state,
+                "_apply_active_message_setting": routes._apply_active_message_setting,
+                "_record_active_message_setting_side_effect": routes._record_active_message_setting_side_effect,
+            }
+
+            async def noop_async(*args, **kwargs):
+                pass
+
+            async def fake_wait(ctx, expected_buffer_version=None):
+                return True
+
+            def fake_apply(session_id, setting):
+                apply_calls.append((session_id, setting))
+                return True, "ok"
+
+            def fake_record_side_effect(ctx, decision, status, payload):
+                side_effect_logs.append((status, payload))
+
+            try:
+                routes.companion_graph = graph
+                routes.event_gate = gate
+                routes._emit_llm_started = noop_async
+                routes._emit_message = noop_async
+                routes._emit_state = noop_async
+                routes._emit_conversation_changed = noop_async
+                routes._wait_until_user_not_composing = fake_wait
+                routes._apply_recent_repetition_guard = lambda ctx, decision: (decision, [])
+                routes._record_prompt_cache_debug = lambda *args, **kwargs: None
+                routes._record_assistant_send = lambda *args, **kwargs: None
+                routes._record_job_state = lambda *args, **kwargs: None
+                routes._apply_active_message_setting = fake_apply
+                routes._record_active_message_setting_side_effect = fake_record_side_effect
+
+                ctx = SimpleNamespace(
+                    gate=gate,
+                    job_id="job_active_marker_skip",
+                    snapshot=SimpleNamespace(
+                        session_id="qq_private_1",
+                        snapshot_id=1,
+                        buffer_version=10,
+                        events=[{"text": "今天事情好多"}],
+                    ),
+                )
+                await routes.on_decision(ctx)
+            finally:
+                for name, value in originals.items():
+                    setattr(routes, name, value)
+
+            self.assertEqual(apply_calls, [])
+            self.assertEqual(side_effect_logs[-1][0], "skipped")
+            self.assertEqual(
+                side_effect_logs[-1][1]["reason"],
+                "current_user_text_did_not_request_active_message_setting",
+            )
+            self.assertTrue(gate.sent)
+
+        asyncio.run(scenario())
+
     def test_meme_sends_before_following_text_is_deferred_by_composing(self):
         async def scenario():
             decision = ActionDecision(

@@ -83,6 +83,7 @@ class ActionDecision(BaseModel):
     action: Action
     items: Optional[list[SendItem]] = None
     text: DecisionText = None
+    side_effects: Optional[dict[str, Any]] = None
 
     @field_validator("text", mode="before")
     @classmethod
@@ -120,6 +121,13 @@ class ActionDecision(BaseModel):
             if item:
                 items.append(item)
         return items or None
+
+    @field_validator("side_effects", mode="before")
+    @classmethod
+    def normalize_side_effects(cls, value):
+        if not isinstance(value, dict):
+            return None
+        return value or None
 
     @model_validator(mode="after")
     def validate_action_payload(self):
@@ -259,7 +267,13 @@ class ActionDecision(BaseModel):
         return [item.content for item in self.all_items() if item.type == SendItemType.TEXT]
 
     def with_items(self, items: list[SendItem], action: Optional[Action] = None) -> "ActionDecision":
-        return ActionDecision(action=action or self.action, items=items)
+        return ActionDecision(action=action or self.action, items=items, side_effects=self.side_effects)
+
+    def active_message_setting(self) -> Optional[dict[str, Any]]:
+        if not isinstance(self.side_effects, dict):
+            return None
+        setting = self.side_effects.get("active_message_setting")
+        return setting if isinstance(setting, dict) else None
 
     def to_harness_payload(self, exclude_none: bool = False) -> dict:
         items = [item.to_harness_item() for item in self.all_items()]
@@ -267,6 +281,9 @@ class ActionDecision(BaseModel):
             "action": self.action.value,
             "items": items or None,
         }
-        if exclude_none and payload["items"] is None:
-            payload.pop("items")
+        if self.side_effects is not None:
+            payload["side_effects"] = self.side_effects
+        if exclude_none:
+            if payload["items"] is None:
+                payload.pop("items")
         return payload

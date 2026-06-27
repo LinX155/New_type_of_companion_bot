@@ -1580,6 +1580,9 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertTrue(classify_visible_text("Tom & Jerry & Co 也太经典了", mode="bubble").ok)
         self.assertTrue(classify_visible_text("笑死了 &&amused:laugh&&", mode="model_raw").ok)
         self.assertFalse(classify_visible_text("笑死了 &&amused:laugh&&", mode="bubble").ok)
+        self.assertTrue(classify_visible_text("好 &&next:2026-06-28 10:00&&", mode="model_raw").ok)
+        self.assertFalse(classify_visible_text("好 &&next:2026-06-28 10:00&&", mode="bubble").ok)
+        self.assertFalse(classify_visible_text("好 &&daily:99:99&&", mode="model_raw").ok)
 
     def test_unsafe_provider_content_repairs_before_visible_decision(self):
         async def scenario():
@@ -1740,6 +1743,30 @@ class PromptAppendOnlyTest(unittest.TestCase):
         normal = parse_and_validate_main_output("Tom & Jerry & Co 也太经典了")
         self.assertTrue(normal.ok, normal.errors)
         self.assertEqual(normal.decision.all_items()[0].harness_value(), "Tom & Jerry & Co 也太经典了")
+
+    def test_main_harness_parses_active_schedule_marker_as_side_effect(self):
+        result = parse_and_validate_main_output("好，那我明天十点左右来找你。\n&&next:2026-06-28 10:00&&")
+
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual(result.decision.action, Action.REPLY)
+        self.assertEqual(
+            [item.harness_value() for item in result.decision.all_items()],
+            ["好，那我明天十点左右来找你。"],
+        )
+        self.assertEqual(
+            result.decision.active_message_setting(),
+            {"type": "next", "time": "2026-06-28 10:00"},
+        )
+        self.assertNotIn("next:", result.decision.text or "")
+
+    def test_main_harness_rejects_invalid_or_multiple_active_schedule_markers(self):
+        invalid = parse_and_validate_main_output("好\n&&daily:99:99&&")
+        self.assertFalse(invalid.ok)
+        self.assertEqual(invalid.status, "internal_protocol_leak")
+
+        multiple = parse_and_validate_main_output("好\n&&daily:07:45&&\n&&next:2026-06-28 10:00&&")
+        self.assertFalse(multiple.ok)
+        self.assertEqual(multiple.status, "active_schedule_marker_error")
 
     def test_debug_parsed_items_use_short_harness_shape(self):
         graph = CompanionGraph(FakeLLM(), FakeMemory(), FakeMemeCatalog())
