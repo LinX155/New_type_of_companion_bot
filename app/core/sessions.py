@@ -45,6 +45,11 @@ def qq_private_session_id(user_id: str) -> str:
     return f"qq_private_{safe_user_id}"
 
 
+def qq_group_session_id(group_id: str) -> str:
+    safe_group_id = normalize_session_id(str(group_id or "unknown"), "unknown")
+    return f"qq_group_{safe_group_id}"
+
+
 def identity_for_webui(session_id: Optional[str] = None) -> SessionIdentity:
     sid = webui_session_id(session_id)
     return SessionIdentity(
@@ -65,11 +70,24 @@ def identity_for_qq_private(user_id: str) -> SessionIdentity:
     )
 
 
+def identity_for_qq_group(group_id: str) -> SessionIdentity:
+    sid = qq_group_session_id(group_id)
+    return SessionIdentity(
+        session_id=sid,
+        platform="qq_group",
+        user_id=str(group_id or "unknown"),
+        label=f"QQ 群 {group_id}",
+    )
+
+
 def infer_identity(session_id: str) -> SessionIdentity:
     sid = normalize_session_id(session_id)
     if sid.startswith("qq_private_"):
         user_id = sid[len("qq_private_"):] or "unknown"
         return SessionIdentity(session_id=sid, platform="qq", user_id=user_id, label=f"QQ {user_id}")
+    if sid.startswith("qq_group_"):
+        group_id = sid[len("qq_group_"):] or "unknown"
+        return SessionIdentity(session_id=sid, platform="qq_group", user_id=group_id, label=f"QQ 群 {group_id}")
     return SessionIdentity(session_id=sid, platform="webui", user_id="user", label=sid)
 
 

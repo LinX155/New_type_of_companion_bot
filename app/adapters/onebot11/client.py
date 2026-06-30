@@ -118,6 +118,30 @@ class OneBotConnectionManager:
             reply_to_message_id=reply_to_message_id,
         )
 
+    async def send_group_text(
+        self,
+        group_id: str,
+        text: str,
+        reply_to_message_id: Optional[str] = None,
+    ) -> dict:
+        return await self.send_group_message(
+            group_id=group_id,
+            message=[{"type": "text", "data": {"text": text}}],
+            reply_to_message_id=reply_to_message_id,
+        )
+
+    async def send_group_image(
+        self,
+        group_id: str,
+        file_uri: str,
+        reply_to_message_id: Optional[str] = None,
+    ) -> dict:
+        return await self.send_group_message(
+            group_id=group_id,
+            message=[{"type": "image", "data": {"file": file_uri}}],
+            reply_to_message_id=reply_to_message_id,
+        )
+
     async def send_private_message(
         self,
         user_id: str,
@@ -128,6 +152,20 @@ class OneBotConnectionManager:
             action="send_private_msg",
             params={
                 "user_id": _coerce_int(user_id),
+                "message": _with_reply_segment(message, reply_to_message_id),
+            },
+        )
+
+    async def send_group_message(
+        self,
+        group_id: str,
+        message: list[dict],
+        reply_to_message_id: Optional[str] = None,
+    ) -> dict:
+        return await self.request(
+            action="send_group_msg",
+            params={
+                "group_id": _coerce_int(group_id),
                 "message": _with_reply_segment(message, reply_to_message_id),
             },
         )

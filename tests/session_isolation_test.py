@@ -9,7 +9,7 @@ from app.adapters.onebot11.events import parse_onebot_event
 from app.core.events import ChatEvent, EventType
 from app.core.media_jobs import MediaJobQueue
 from app.core.runtime import SessionRuntimeManager
-from app.core.sessions import SessionRegistry, qq_private_session_id
+from app.core.sessions import SessionRegistry, infer_identity, qq_group_session_id, qq_private_session_id
 from app.core.snapshots import SnapshotManager
 from app.core.state import ChatStatus
 from app.llm.client import LLMClient
@@ -42,6 +42,22 @@ class SessionIsolationTest(unittest.TestCase):
 
         self.assertIsNotNone(event)
         self.assertEqual(event.session_id, qq_private_session_id("550808201"))
+
+    def test_onebot_group_message_maps_to_qq_group_session(self):
+        event = parse_onebot_event({
+            "post_type": "message",
+            "message_type": "group",
+            "group_id": 123456,
+            "user_id": 550808201,
+            "message_id": 123,
+            "message": [{"type": "text", "data": {"text": "群聊消息"}}],
+        })
+
+        self.assertIsNotNone(event)
+        self.assertEqual(event.session_id, qq_group_session_id("123456"))
+        identity = infer_identity(event.session_id)
+        self.assertEqual(identity.platform, "qq_group")
+        self.assertEqual(identity.user_id, "123456")
 
     def test_memory_files_are_isolated_by_session(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -132,6 +132,28 @@ class FakeMemeSaver:
         )
 
 
+class FakeDuplicateMemeSaver:
+    def __init__(self):
+        self.find_duplicate_calls = []
+        self.save_calls = []
+
+    async def find_duplicate(self, image_ref):
+        self.find_duplicate_calls.append(image_ref)
+        return MemeStealSaveResult(
+            status="duplicate",
+            saved=False,
+            duplicate=True,
+            file_stem="amused_existing_cat_laugh",
+            matched_file=str(Path(image_ref)),
+            distance=2,
+            reason="already exists",
+        )
+
+    async def save_from_analysis(self, image_ref, analysis):
+        self.save_calls.append((image_ref, analysis))
+        raise AssertionError("duplicate sticker should not run save_from_analysis")
+
+
 class FakeVisionLLM:
     def __init__(self):
         self.main_messages = []
@@ -450,6 +472,62 @@ class MediaHarnessTest(unittest.TestCase):
                 self.assertEqual(len(analyzer.analyze_calls), 1)
                 self.assertEqual(len(saver.save_calls), 1)
                 self.assertEqual(payloads[1]["user_visible_behavior"], "silent")
+                self.assertEqual(queue.get_completed_payloads_for_prompt("default"), [])
+
+        asyncio.run(scenario())
+
+    def test_media_job_queue_checks_duplicate_before_meme_analysis(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                root = Path(tmp_dir)
+                image_path = _write_image(root / "sticker.png", (240, 200, 20))
+                analyzer = FakeVisionAnalyzer()
+                saver = FakeDuplicateMemeSaver()
+                llm = FakeVisionLLM()
+                completed = []
+                queue = MediaJobQueue(
+                    llm_client=llm,
+                    media_downloader=FakeMediaDownloader(str(image_path)),
+                    meme_steal_analyzer=analyzer,
+                    meme_steal_saver=saver,
+                    on_payloads=lambda payloads, job: completed.append((payloads, job)),
+                )
+                job = MediaJob(
+                    media_key="sticker-duplicate:0:sticker.png",
+                    session_id="default",
+                    snapshot_id=1,
+                    buffer_version=1,
+                    source_job_id="job-duplicate",
+                    event={
+                        "event_id": "sticker-duplicate",
+                        "event_type": "message.sticker",
+                        "text": "[表情]",
+                        "raw": {"media_refs": []},
+                    },
+                    media_ref={
+                        "segment_index": 0,
+                        "segment_type": "image",
+                        "sub_type": 1,
+                        "summary": "[动画表情]",
+                        "is_sticker": True,
+                        "file": "sticker.png",
+                    },
+                    event_text="[表情]",
+                    context_text="user: 下班了",
+                )
+
+                queue.start()
+                self.assertTrue(queue.enqueue(job))
+                await asyncio.wait_for(queue._queue.join(), timeout=1)
+                await queue.shutdown()
+
+                payloads = completed[0][0]
+                self.assertEqual(payloads[1]["status"], "duplicate")
+                self.assertTrue(payloads[1]["duplicate_checked_before_analysis"])
+                self.assertEqual(payloads[1]["save_result"]["file_stem"], "amused_existing_cat_laugh")
+                self.assertEqual(len(saver.find_duplicate_calls), 1)
+                self.assertEqual(len(analyzer.analyze_calls), 0)
+                self.assertEqual(len(saver.save_calls), 0)
 
         asyncio.run(scenario())
 

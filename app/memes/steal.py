@@ -368,6 +368,28 @@ class MemeStealSaver:
         async with self._write_lock:
             return await asyncio.to_thread(self._save_from_analysis_sync, image_ref, analysis)
 
+    async def find_duplicate(self, image_ref: str) -> Optional[MemeStealSaveResult]:
+        async with self._write_lock:
+            return await asyncio.to_thread(self._find_duplicate_sync, image_ref)
+
+    def _find_duplicate_sync(self, image_ref: str) -> Optional[MemeStealSaveResult]:
+        source_path = self._local_path_from_ref(image_ref)
+        self._validate_source(source_path)
+        self.catalog.sync_dhash_index()
+        duplicate = self._find_duplicate(source_path)
+        if not duplicate:
+            return None
+        matched_path, distance = duplicate
+        return MemeStealSaveResult(
+            status="duplicate",
+            saved=False,
+            duplicate=True,
+            file_stem=os.path.splitext(os.path.basename(matched_path))[0],
+            matched_file=matched_path,
+            distance=distance,
+            reason="这个表情包已经在本地库里有近似重复",
+        )
+
     def _save_from_analysis_sync(
         self,
         image_ref: str,

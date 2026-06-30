@@ -56,6 +56,7 @@ class SchedulerManager:
         self.llm_client_factory: Optional[Callable[[str], LLMClient]] = None
         self.active_message_callback: Optional[Callable[[Optional[str], str, Optional[str]], Awaitable[dict]]] = None
         self.active_message_setting_callback: Optional[Callable[[str, dict], tuple[bool, str]]] = None
+        self.group_activity_callback: Optional[Callable[[], Awaitable[dict]]] = None
         self.session_ids_provider: Optional[Callable[[], list[str]]] = None
         self.context_checkpoint_callback: Optional[Callable[[str, str, list[dict]], None]] = None
         self._job_configs = {
@@ -78,6 +79,11 @@ class SchedulerManager:
                 "hour": 10,
                 "minute": 0,
                 "func": self._run_active_message,
+            },
+            "group_activity_update": {
+                "hour": 6,
+                "minute": 0,
+                "func": self._run_group_activity_update,
             },
         }
 
@@ -123,6 +129,9 @@ class SchedulerManager:
 
     def set_active_message_setting_callback(self, callback: Callable[[str, dict], tuple[bool, str]]):
         self.active_message_setting_callback = callback
+
+    def set_group_activity_callback(self, callback: Callable[[], Awaitable[dict]]):
+        self.group_activity_callback = callback
 
     def refresh_active_message_jobs(self, config: dict) -> tuple[dict, bool]:
         """Rebuild per-session active message jobs from persisted config."""
@@ -580,6 +589,22 @@ class SchedulerManager:
             self._finish_job(log_id, status, note)
         except Exception as e:
             self._finish_job(log_id, "failed", str(e))
+
+    async def _run_group_activity_update(self):
+        job_id = f"group_activity_update_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        log_id = self._start_job(job_id, "group_activity_update", session_id="qq_group")
+        try:
+            if self.group_activity_callback is None:
+                result = {"status": "skipped", "reason": "callback_not_configured"}
+            else:
+                result = await self.group_activity_callback()
+            note = json.dumps(result, ensure_ascii=False)[:1000]
+            status = "failed" if result.get("status") == "error" else "completed"
+            self._finish_job(log_id, status, note)
+            return result
+        except Exception as e:
+            self._finish_job(log_id, "failed", str(e))
+            return {"status": "error", "error_message": str(e)}
 
     def _load_transcript_for_date(self, day: datetime, session_id: str) -> list[dict]:
         start = day.replace(hour=0, minute=0, second=0, microsecond=0)

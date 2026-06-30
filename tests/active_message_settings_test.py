@@ -87,6 +87,31 @@ class ActiveMessageSettingsTest(unittest.TestCase):
             {"due": True, "source": "global", "time": "10:00"},
         )
 
+    def test_active_message_config_drops_group_sessions(self):
+        config = routes._normalize_active_message_config({
+            "enabled": True,
+            "sessions": {
+                "qq_private_1": {"daily_time": "08:30"},
+                "qq_group_123456": {"daily_time": "09:30"},
+            },
+        })
+
+        self.assertEqual(config["sessions"], {"qq_private_1": {"daily_time": "08:30"}})
+
+    def test_active_message_once_skips_group_without_runtime_dispatch(self):
+        original_runtime_for_session = routes._runtime_for_session
+
+        def fail_runtime(_sid):
+            raise AssertionError("group readonly session must not enter active message runtime")
+
+        routes._runtime_for_session = fail_runtime
+        try:
+            result = asyncio.run(routes.run_active_message_once(session_id="qq_group_123456"))
+        finally:
+            routes._runtime_for_session = original_runtime_for_session
+
+        self.assertEqual(result, {"status": "skipped", "reason": "group_readonly_session"})
+
     def test_scheduled_status_enforces_priority_and_stale_jobs(self):
         next_time = (datetime.now() + timedelta(days=1)).replace(hour=9, minute=30, second=0, microsecond=0)
         next_time_text = next_time.strftime("%Y-%m-%d %H:%M")

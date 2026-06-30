@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Optional
 
 from ...core.events import ChatEvent, EventType
-from ...core.sessions import qq_private_session_id
+from ...core.sessions import qq_group_session_id, qq_private_session_id
 
 
 def parse_onebot_event(payload: dict, default_input_ttl_ms: int = 8000) -> Optional[ChatEvent]:
@@ -37,6 +37,9 @@ def parse_onebot_event(payload: dict, default_input_ttl_ms: int = 8000) -> Optio
 
     if _is_private_message(payload):
         return _parse_private_message(payload)
+
+    if _is_group_message(payload):
+        return _parse_group_message(payload)
 
     return None
 
@@ -104,19 +107,25 @@ def _is_private_message(payload: dict) -> bool:
     )
 
 
-def _parse_private_message(payload: dict) -> ChatEvent:
-    user_id = _string_id(payload.get("user_id") or "unknown")
-    message_id = _string_id(payload.get("message_id") or uuid.uuid4().hex)
-    timestamp = _onebot_timestamp(payload.get("time"))
-    segments = _message_segments(payload)
+def _is_group_message(payload: dict) -> bool:
+    return (
+        payload.get("post_type") == "message"
+        and payload.get("message_type") == "group"
+    )
 
+
+def _parse_message_content(payload: dict, user_id: str, message_id: str, group_id: str = "") -> dict:
+    segments = _message_segments(payload)
     text_parts: list[str] = []
     has_user_text = False
+    has_mention = False
     has_image = False
     has_sticker = False
     has_audio = False
     has_video = False
     reply_to_message_id = None
+    at_user_ids: list[str] = []
+    at_all = False
     media_refs: list[dict] = []
     audio_refs: list[dict] = []
     video_refs: list[dict] = []
@@ -140,6 +149,18 @@ def _parse_private_message(payload: dict) -> ChatEvent:
             reply_to_message_id = _string_id(data.get("id") or data.get("message_id") or "")
             continue
 
+        if seg_type == "at":
+            target = _string_id(data.get("qq") or data.get("user_id") or data.get("id") or "")
+            if target:
+                has_mention = True
+                if target.lower() == "all":
+                    at_all = True
+                    text_parts.append("[提及全体]")
+                else:
+                    at_user_ids.append(target)
+                    text_parts.append("[提及]")
+            continue
+
         if seg_type == "face":
             has_sticker = True
             face_id = _string_id(data.get("id") or "")
@@ -154,6 +175,7 @@ def _parse_private_message(payload: dict) -> ChatEvent:
             media_refs.append({
                 "source": "qq",
                 "qq_user_id": user_id,
+                **({"qq_group_id": group_id} if group_id else {}),
                 "onebot_message_id": message_id,
                 "segment_index": segment_index,
                 "segment_type": seg_type,
@@ -182,6 +204,7 @@ def _parse_private_message(payload: dict) -> ChatEvent:
                 message_id=message_id,
                 segment_index=segment_index,
                 segment_type=seg_type,
+                group_id=group_id,
             ))
             continue
 
@@ -194,6 +217,7 @@ def _parse_private_message(payload: dict) -> ChatEvent:
                 message_id=message_id,
                 segment_index=segment_index,
                 segment_type=seg_type,
+                group_id=group_id,
             ))
             continue
 
@@ -201,7 +225,7 @@ def _parse_private_message(payload: dict) -> ChatEvent:
             text_parts.append(f"[{seg_type}]")
 
     text = "".join(text_parts).strip()
-    if has_user_text:
+    if has_user_text or has_mention:
         event_type = EventType.TEXT
     elif has_sticker:
         event_type = EventType.STICKER
@@ -215,24 +239,84 @@ def _parse_private_message(payload: dict) -> ChatEvent:
         event_type = EventType.TEXT
         text = text or str(payload.get("raw_message") or "")
 
+    return {
+        "event_type": event_type,
+        "text": text,
+        "segments": segments,
+        "reply_to_message_id": reply_to_message_id,
+        "at_user_ids": at_user_ids,
+        "at_all": at_all,
+        "media_refs": media_refs,
+        "audio_refs": audio_refs,
+        "video_refs": video_refs,
+    }
+
+
+def _parse_private_message(payload: dict) -> ChatEvent:
+    user_id = _string_id(payload.get("user_id") or "unknown")
+    message_id = _string_id(payload.get("message_id") or uuid.uuid4().hex)
+    timestamp = _onebot_timestamp(payload.get("time"))
+    parsed = _parse_message_content(payload, user_id, message_id)
+
     return ChatEvent(
         event_id=f"onebot_msg_{message_id}",
         session_id=qq_private_session_id(user_id),
         platform="qq",
         user_id=user_id,
-        event_type=event_type,
-        text=text,
+        event_type=parsed["event_type"],
+        text=parsed["text"],
         timestamp=timestamp,
         raw={
             "source": "onebot11",
             "qq_user_id": user_id,
             "onebot_message_id": message_id,
-            "reply_to_message_id": reply_to_message_id,
-            "message_segments": segments,
-            "media_refs": media_refs,
-            "audio_refs": audio_refs,
-            "video_refs": video_refs,
+            "reply_to_message_id": parsed["reply_to_message_id"],
+            "at_user_ids": parsed["at_user_ids"],
+            "at_all": parsed["at_all"],
+            "message_segments": parsed["segments"],
+            "media_refs": parsed["media_refs"],
+            "audio_refs": parsed["audio_refs"],
+            "video_refs": parsed["video_refs"],
             "onebot": payload,
+        },
+    )
+
+
+def _parse_group_message(payload: dict) -> ChatEvent:
+    group_id = _string_id(payload.get("group_id") or "unknown")
+    user_id = _string_id(payload.get("user_id") or "unknown")
+    self_id = _string_id(payload.get("self_id") or "")
+    message_id = _string_id(payload.get("message_id") or uuid.uuid4().hex)
+    timestamp = _onebot_timestamp(payload.get("time"))
+    parsed = _parse_message_content(payload, user_id, message_id, group_id=group_id)
+    mentions_bot = bool(self_id and self_id in parsed["at_user_ids"])
+
+    return ChatEvent(
+        event_id=f"onebot_group_msg_{group_id}_{message_id}",
+        session_id=qq_group_session_id(group_id),
+        platform="qq",
+        user_id=user_id,
+        event_type=parsed["event_type"],
+        text=parsed["text"],
+        timestamp=timestamp,
+        raw={
+            "source": "onebot11",
+            "message_type": "group",
+            "read_only_group": True,
+            "qq_group_id": group_id,
+            "qq_user_id": user_id,
+            "qq_self_id": self_id,
+            "onebot_message_id": message_id,
+            "reply_to_message_id": parsed["reply_to_message_id"],
+            "at_user_ids": parsed["at_user_ids"],
+            "at_all": parsed["at_all"],
+            "mentions_bot": mentions_bot,
+            "message_segments": parsed["segments"],
+            "media_refs": parsed["media_refs"],
+            "audio_refs": parsed["audio_refs"],
+            "video_refs": parsed["video_refs"],
+            "raw_message": payload.get("raw_message"),
+            "sub_type": payload.get("sub_type"),
         },
     )
 
@@ -264,10 +348,12 @@ def _media_segment_ref(
     message_id: str,
     segment_index: int,
     segment_type: str,
+    group_id: str = "",
 ) -> dict:
     return {
         "source": "qq",
         "qq_user_id": user_id,
+        **({"qq_group_id": group_id} if group_id else {}),
         "onebot_message_id": message_id,
         "segment_index": segment_index,
         "segment_type": segment_type,

@@ -1,5 +1,6 @@
 import os
 import asyncio
+import copy
 import json
 import re
 import uuid
@@ -32,6 +33,27 @@ from ..core.event_gate import EventGate, ProcessContext, USER_COMPOSING_MAX_BLOC
 from ..core.events import ChatEvent, EventType
 from ..core.decisions import Action, ActionDecision, SendItem, SendItemType
 from ..core.graph import CompanionGraph
+from ..core.group_buffer import GroupChatBuffer
+from ..core.group_activity import GroupActivityTracker
+from ..core.group_chat import (
+    classify_group_visible_text,
+    group_chat_runtime_status,
+    known_message_ids_from_group_window,
+    known_qids_from_group_window,
+    parse_group_chat_output,
+)
+from ..core.group_media import GroupImageUnderstandingCache, group_image_media_key
+from ..core.group_memory import GroupMemoryManager
+from ..core.group_repetition import GroupRepetitionDetector
+from ..core.group_scheduler import GroupReplyScheduler
+from ..core.group_send import (
+    GroupSendLimiter,
+    evaluate_group_send_policy,
+    group_id_from_session_id,
+    group_send_policy_for_session,
+    normalize_group_policy,
+    normalize_group_send_config,
+)
 from ..core.media_jobs import MediaJob, MediaJobQueue
 from ..core.protocol import (
     classify_visible_text,
@@ -54,7 +76,11 @@ from ..core.sessions import (
 from ..core.state import ChatStatus
 from ..core.settings import load_settings, save_settings
 from ..llm.client import LLMClient
-from ..llm.prompts import build_active_message_messages, build_active_message_setting_messages
+from ..llm.prompts import (
+    build_active_message_messages,
+    build_active_message_setting_messages,
+    build_group_chat_messages,
+)
 from ..memory.files import MemoryFileManager, TOMORROW_TOPICS_TEMPLATE
 from ..memes.catalog import MemeCatalog
 from ..memes.steal import MemeStealAnalyzer, MemeStealSaver
@@ -217,6 +243,13 @@ companion_graph: Optional[CompanionGraph] = None
 event_gate: Optional[EventGate] = None
 media_job_queue: Optional[MediaJobQueue] = None
 runtime_manager: Optional[SessionRuntimeManager] = None
+group_chat_buffer = GroupChatBuffer()
+group_image_cache = GroupImageUnderstandingCache()
+group_memory_manager = GroupMemoryManager(ROOT_DIR)
+group_repetition_detector = GroupRepetitionDetector()
+group_activity_tracker = GroupActivityTracker()
+group_send_limiter = GroupSendLimiter()
+group_reply_scheduler: Optional[GroupReplyScheduler] = None
 session_registry = SessionRegistry(ROOT_DIR)
 _media_followup_keys: set[str] = set()
 
@@ -289,6 +322,17 @@ class ContextCheckpointConfig(BaseModel):
     threshold_k: int = 500
 
 
+class GroupChatOpsConfig(BaseModel):
+    enabled: Optional[bool] = None
+    group_id: Optional[str] = None
+    observe_only: Optional[bool] = None
+    allow_mention_reply: Optional[bool] = None
+    allow_roll_reply: Optional[bool] = None
+    allow_repetition: Optional[bool] = None
+    allow_meme_send: Optional[bool] = None
+    allow_command_reply: Optional[bool] = None
+
+
 class InputStatusConfig(BaseModel):
     composing: bool = True
     ttl_ms: int = 3000
@@ -311,26 +355,18 @@ class MemeStealAnalyzeRequest(BaseModel):
 def init_gate():
     global event_gate, companion_graph, media_job_queue, runtime_manager
     if runtime_manager is None:
-        media_job_queue = MediaJobQueue(
-            llm_client=llm_client,
-            media_downloader=onebot_media_downloader,
-            meme_steal_analyzer=meme_steal_analyzer,
-            meme_steal_saver=meme_steal_saver,
-            on_payloads=_record_background_media_payloads,
-            max_workers=1,
-        )
-        media_job_queue.start()
+        queue = _ensure_media_job_queue()
         runtime_manager = SessionRuntimeManager(
             root_dir=ROOT_DIR,
             base_llm_client=llm_client,
             base_memory_manager=memory_manager,
             meme_catalog=meme_catalog,
-            media_job_queue=media_job_queue,
+            media_job_queue=queue,
             on_decision=on_decision,
             hot_duration_minutes=_persisted.get("hot_duration_minutes", 30),
             conversation_context_loader=_load_conversation_context_for_runtime,
         )
-        media_job_queue.set_llm_client_factory(runtime_manager.make_internal_llm_for_session)
+        queue.set_llm_client_factory(runtime_manager.make_internal_llm_for_session)
         scheduler_manager.set_llm_client_factory(runtime_manager.make_background_llm_for_session)
         default_runtime = runtime_manager.get(DEFAULT_SESSION_ID)
         event_gate = default_runtime.gate
@@ -343,12 +379,76 @@ def init_gate():
         active_cfg = _normalize_active_message_config(_persisted.get("active_message"))
         scheduler_manager.set_active_message_callback(run_scheduled_active_messages)
         scheduler_manager.set_active_message_setting_callback(_apply_active_message_setting)
+        scheduler_manager.set_group_activity_callback(run_group_activity_update)
         scheduler_manager.set_session_ids_provider(_scheduler_session_ids)
         scheduler_manager.set_context_checkpoint_callback(_apply_context_checkpoint_to_runtime)
         _refresh_active_message_jobs(active_cfg)
         scheduler_manager.start()
     elif media_job_queue:
         media_job_queue.start()
+
+
+def _ensure_media_job_queue() -> MediaJobQueue:
+    global media_job_queue
+    if media_job_queue is None:
+        media_job_queue = MediaJobQueue(
+            llm_client=llm_client,
+            media_downloader=onebot_media_downloader,
+            meme_steal_analyzer=meme_steal_analyzer,
+            meme_steal_saver=meme_steal_saver,
+            on_payloads=_record_background_media_payloads,
+            max_workers=1,
+        )
+    media_job_queue.start()
+    return media_job_queue
+
+
+def _ensure_group_reply_scheduler() -> GroupReplyScheduler:
+    global group_reply_scheduler
+    if group_reply_scheduler is None:
+        group_reply_scheduler = GroupReplyScheduler(
+            group_buffer=group_chat_buffer,
+            decision_callback=_run_group_reply_decision,
+            send_callback=_send_group_reply_candidate,
+            debug_callback=_record_group_reply_scheduler_event,
+            activity_callback=group_activity_tracker.roll_cooldown_adjustment,
+        )
+    return group_reply_scheduler
+
+
+def _current_group_send_config() -> dict:
+    return normalize_group_send_config(load_settings().get("group_chat_send"))
+
+
+def _save_group_send_config(config: dict) -> dict:
+    normalized = normalize_group_send_config(config)
+    save_settings({"group_chat_send": normalized})
+    group_send_limiter.update_config(normalized)
+    return normalized
+
+
+def _group_policy_gate(
+    session_id: str,
+    *,
+    trigger_reason: Optional[str] = None,
+    item_type: Optional[str] = None,
+) -> dict:
+    return evaluate_group_send_policy(
+        _current_group_send_config(),
+        normalize_session_id(session_id),
+        trigger_reason=trigger_reason,
+        item_type=item_type,
+    )
+
+
+def _group_trigger_reason_for_event(event: ChatEvent) -> str:
+    raw = event.raw if isinstance(event.raw, dict) else {}
+    return "mention" if raw.get("mentions_bot") else "roll"
+
+
+def _refresh_group_send_limiter() -> GroupSendLimiter:
+    group_send_limiter.update_config(_current_group_send_config())
+    return group_send_limiter
 
 
 def _runtime_for_session(session_id: Optional[str]) -> SessionRuntime:
@@ -406,6 +506,10 @@ def _refresh_active_message_jobs(config: Optional[dict] = None, persist: bool = 
 
 def _session_id_from_query(session_id: Optional[str]) -> str:
     return webui_session_id(session_id)
+
+
+def _is_group_session_id(session_id: Optional[str]) -> bool:
+    return normalize_session_id(session_id or "").startswith("qq_group_")
 
 
 def _list_sessions() -> list[dict]:
@@ -472,7 +576,7 @@ def _list_sessions() -> list[dict]:
 
 
 def _scheduler_session_ids() -> list[str]:
-    return [item["session_id"] for item in _list_sessions()]
+    return [item["session_id"] for item in _list_sessions() if not _is_group_session_id(item["session_id"])]
 
 
 def _clear_media_followup_keys(session_id: Optional[str] = None):
@@ -1501,6 +1605,46 @@ def _record_onebot_send(
         db.close()
 
 
+def _record_onebot_group_send(
+    session_id: str,
+    send_key: str,
+    target_group_id: str,
+    item_type: str,
+    content: str,
+    response: Optional[dict],
+    status: str,
+    error_message: Optional[str] = None,
+    reply_to_message_id: Optional[str] = None,
+):
+    db = next(get_db())
+    try:
+        log = RawChatLog(
+            event_id=f"{send_key}:onebot",
+            session_id=session_id,
+            event_type="onebot_group_send",
+            platform="qq_group",
+            user_id=target_group_id,
+            raw_payload=_json_dumps({
+                "target_group_id": target_group_id,
+                "item_type": item_type,
+                "reply_to_message_id": reply_to_message_id,
+                "onebot_message_id": _onebot_response_message_id(response),
+                "response": response,
+            }),
+            final_text=content,
+            item_type=item_type,
+            send_key=send_key,
+            status=status,
+            error_message=error_message,
+        )
+        db.add(log)
+        db.commit()
+    except Exception as exc:
+        print(f"DB error: {exc}")
+    finally:
+        db.close()
+
+
 def _record_onebot_input_status(
     target_user_id: str,
     event_type: int,
@@ -2002,6 +2146,63 @@ async def handle_onebot_payload(payload: dict) -> None:
     if not event:
         return
 
+    if _is_group_chat_event(event):
+        if event.event_type == EventType.TEXT:
+            event_type = _event_type_for_text(event.text or "")
+            if event_type != event.event_type:
+                event = event.model_copy(update={"event_type": event_type})
+        group_window = await group_chat_buffer.append(event)
+        group_image_refs = group_image_cache.remember_event(event)
+        group_meme_jobs = _enqueue_group_sticker_jobs(event, group_window)
+        group_memory_observation = _observe_group_memory_event(event)
+        group_activity_update = _maybe_update_group_activity(event.session_id)
+        group_repetition = None
+        group_memory_command = None
+        if event.event_type in (EventType.COMMAND_MEM, EventType.COMMAND_FORGET):
+            group_reply_trigger = {"status": "skipped", "reason": "group_memory_command"}
+            group_memory_command = await _handle_group_memory_command_event(event)
+        else:
+            group_repetition = await _handle_group_repetition_event(event)
+            if group_repetition and group_repetition.get("status") == "selected":
+                group_reply_trigger = {
+                    "status": "skipped",
+                    "reason": "group_repetition_triggered",
+                    "repetition": group_repetition,
+                }
+            else:
+                trigger_policy = _group_policy_gate(
+                    event.session_id,
+                    trigger_reason=_group_trigger_reason_for_event(event),
+                    item_type=SendItemType.TEXT.value,
+                )
+                if not trigger_policy.get("ok"):
+                    group_reply_trigger = {
+                        "status": "skipped",
+                        "reason": trigger_policy.get("reason") or "group_trigger_policy_blocked",
+                        "policy": trigger_policy,
+                    }
+                else:
+                    group_reply_trigger = await _ensure_group_reply_scheduler().on_group_event(event, group_window)
+        _record_incoming_event(event)
+        await _emit_conversation_changed("incoming_group_event", event)
+        await _emit_state({
+            "session_id": event.session_id,
+            "result": "group_buffered",
+            "group_buffer": {
+                "buffer_version": group_window["buffer_version"],
+                "buffered_events": group_window["buffered_events"],
+                "latest": group_window["latest"],
+            },
+            "group_image_refs": group_image_refs,
+            "group_meme_jobs": group_meme_jobs,
+            "group_reply_trigger": group_reply_trigger,
+            "group_memory_observation": group_memory_observation,
+            "group_memory_command": group_memory_command,
+            "group_repetition": group_repetition,
+            "group_activity_update": group_activity_update,
+        })
+        return
+
     init_gate()
     event = await _enrich_onebot_reply_context(event)
     if event.event_type == EventType.TEXT:
@@ -2031,6 +2232,908 @@ async def handle_onebot_payload(payload: dict) -> None:
             "target_platform": "qq",
             "target_user_id": event.user_id,
         })
+
+
+def _is_group_chat_event(event: ChatEvent) -> bool:
+    raw = event.raw or {}
+    return (
+        _is_group_session_id(event.session_id)
+        and isinstance(raw, dict)
+        and raw.get("message_type") == "group"
+    )
+
+
+def _observe_group_memory_event(event: ChatEvent) -> Optional[dict]:
+    if event.event_type != EventType.TEXT:
+        return None
+    raw = event.raw if isinstance(event.raw, dict) else {}
+    sender_qid = str(raw.get("qq_user_id") or event.user_id or "").strip()
+    if not sender_qid:
+        return {"status": "skipped", "reason": "missing_sender_qid"}
+    self_id = str(raw.get("qq_self_id") or "").strip()
+    if self_id and self_id == sender_qid:
+        return {"status": "skipped", "reason": "self_message"}
+    result = group_memory_manager.observe_group_text(
+        event.text or "",
+        session_id=event.session_id,
+        sender_qid=sender_qid,
+        timestamp=event.timestamp,
+    )
+    if result.get("status") in {"identity_observed", "write_failed"}:
+        _record_group_memory_observation(event, result)
+    return result
+
+
+def _record_group_memory_observation(event: ChatEvent, payload: dict):
+    db = next(get_db())
+    try:
+        session_id = normalize_session_id(event.session_id)
+        raw = event.raw if isinstance(event.raw, dict) else {}
+        log = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id=session_id,
+            event_type="group_memory_observation",
+            platform="qq_group",
+            user_id=str(raw.get("qq_group_id") or ""),
+            input_text=event.text,
+            raw_payload=_json_dumps({
+                "sender_qid": raw.get("qq_user_id"),
+                "group_id": raw.get("qq_group_id"),
+                "payload": payload,
+            }),
+            action="group.memory.observe",
+            status="ok" if payload.get("status") == "identity_observed" else "error",
+        )
+        db.add(log)
+        db.commit()
+    except Exception as exc:
+        print(f"DB error: {exc}")
+    finally:
+        db.close()
+
+
+def _maybe_update_group_activity(session_id: str) -> dict:
+    sid = normalize_session_id(session_id)
+    entries = group_chat_buffer.get_window(sid)
+    result = group_activity_tracker.maybe_update(sid, entries)
+    if result.get("status") == "updated":
+        _record_group_activity_update(sid, result)
+    return result
+
+
+async def run_group_activity_update() -> dict:
+    sessions = _group_buffer_session_ids()
+    results = []
+    for sid in sessions:
+        entries = group_chat_buffer.get_window(sid)
+        result = group_activity_tracker.maybe_update(sid, entries, force=True)
+        results.append(result)
+        if result.get("status") == "updated":
+            _record_group_activity_update(sid, result)
+    return {
+        "status": "completed",
+        "updated": sum(1 for item in results if item.get("status") == "updated"),
+        "sessions": results,
+    }
+
+
+def _group_buffer_session_ids() -> list[str]:
+    panel = group_chat_buffer.status()
+    sessions = panel.get("sessions") if isinstance(panel, dict) else {}
+    if not isinstance(sessions, dict):
+        return []
+    return sorted(sid for sid in sessions.keys() if _is_group_session_id(sid))
+
+
+def _record_group_activity_update(session_id: str, payload: dict):
+    db = next(get_db())
+    try:
+        log = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id=normalize_session_id(session_id),
+            event_type="group_activity_update",
+            platform="qq_group",
+            raw_payload=_json_dumps(payload),
+            action="group.activity.update",
+            status=str(payload.get("status") or "debug"),
+        )
+        db.add(log)
+        db.commit()
+    except Exception as exc:
+        print(f"DB error: {exc}")
+    finally:
+        db.close()
+
+
+async def _handle_group_repetition_event(event: ChatEvent) -> Optional[dict]:
+    if event.event_type != EventType.TEXT:
+        return None
+    policy = _group_policy_gate(
+        event.session_id,
+        trigger_reason="group_repetition",
+        item_type=SendItemType.TEXT.value,
+    )
+    if not policy.get("ok"):
+        return {
+            "status": "skipped",
+            "reason": policy.get("reason") or "group_repetition_policy_blocked",
+            "session_id": normalize_session_id(event.session_id),
+            "policy": policy,
+        }
+    raw = event.raw if isinstance(event.raw, dict) else {}
+    group_window = group_chat_buffer.get_window(event.session_id)
+    evaluation = group_repetition_detector.evaluate(event, group_window)
+    if evaluation.get("status") != "selected":
+        return evaluation
+
+    trigger = {
+        "trigger_id": f"group_repeat_{uuid.uuid4().hex[:8]}",
+        "reason": "group_repetition",
+        "source_message_id": str(raw.get("onebot_message_id") or evaluation.get("latest_message_id") or ""),
+        "reply_to_message_id": None,
+        "repetition": evaluation,
+    }
+    decision = {
+        "should_send_candidate": True,
+        "final_text": evaluation["text"],
+    }
+    send_result = await _send_group_reply_candidate(event.session_id, trigger, decision)
+    result = {**evaluation, "send_result": send_result}
+    _record_group_repetition_event(event, result)
+    if send_result.get("status") == "sent":
+        await _emit_conversation_changed("assistant_group_repetition", session_id=event.session_id)
+    return result
+
+
+def _record_group_repetition_event(event: ChatEvent, payload: dict):
+    raw = event.raw if isinstance(event.raw, dict) else {}
+    db = next(get_db())
+    try:
+        log = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id=normalize_session_id(event.session_id),
+            event_type="group_repetition",
+            platform="qq_group",
+            user_id=str(raw.get("qq_group_id") or ""),
+            input_text=event.text,
+            raw_payload=_json_dumps(payload),
+            action="group.repetition",
+            final_text=str(payload.get("text") or ""),
+            item_type="text",
+            status=str((payload.get("send_result") or {}).get("status") or payload.get("status") or "debug"),
+        )
+        db.add(log)
+        db.commit()
+    except Exception as exc:
+        print(f"DB error: {exc}")
+    finally:
+        db.close()
+
+
+async def _handle_group_memory_command_event(event: ChatEvent) -> dict:
+    raw = event.raw if isinstance(event.raw, dict) else {}
+    sender_qid = str(raw.get("qq_user_id") or event.user_id or "").strip()
+    if event.event_type == EventType.COMMAND_MEM:
+        success, response_text, payload = group_memory_manager.apply_mem_command(
+            event.text or "",
+            session_id=event.session_id,
+            sender_qid=sender_qid,
+            timestamp=event.timestamp,
+        )
+        action = "group.command.mem"
+    elif event.event_type == EventType.COMMAND_FORGET:
+        success, response_text, payload = group_memory_manager.apply_forget_command(
+            event.text or "",
+            session_id=event.session_id,
+            sender_qid=sender_qid,
+        )
+        action = "group.command.forget"
+    else:
+        return {"handled": False, "reason": "not_group_memory_command"}
+
+    send_result = await _send_group_reply_candidate(
+        event.session_id,
+        {
+            "trigger_id": f"group_memory_{uuid.uuid4().hex[:8]}",
+            "reason": action,
+            "source_message_id": str(raw.get("onebot_message_id") or ""),
+            "reply_to_message_id": str(raw.get("onebot_message_id") or ""),
+        },
+        {
+            "should_send_candidate": True,
+            "final_text": response_text,
+            "reply_to_message_id": str(raw.get("onebot_message_id") or ""),
+        },
+    )
+    sent = send_result.get("status") == "sent"
+    _record_group_memory_command_response(
+        event,
+        action,
+        response_text,
+        success,
+        payload,
+        visible=sent,
+        send_result=send_result,
+    )
+    if sent:
+        await _emit_message({
+            "type": "assistant_message",
+            "session_id": event.session_id,
+            "action": action,
+            "text": response_text,
+            "content": response_text,
+            "item_type": "text",
+            "visible": True,
+            "is_meme": False,
+            "meme_path": None,
+            "target_platform": "qq_group",
+            "target_group_id": raw.get("qq_group_id"),
+        })
+        await _emit_conversation_changed("assistant_group_memory_command_response", session_id=event.session_id)
+    return {
+        "handled": True,
+        "action": action,
+        "success": success,
+        "response": response_text,
+        "payload": payload,
+        "send_result": send_result,
+    }
+
+
+def _record_group_memory_command_response(
+    event: ChatEvent,
+    action: str,
+    response_text: str,
+    success: bool,
+    payload: dict,
+    visible: bool = True,
+    send_result: Optional[dict] = None,
+):
+    db = next(get_db())
+    try:
+        session_id = normalize_session_id(event.session_id)
+        raw = event.raw if isinstance(event.raw, dict) else {}
+        if visible:
+            conv = ConversationEvent(
+                session_id=session_id,
+                event_type="assistant_system",
+                text=response_text,
+                is_visible=True,
+                action=action,
+            )
+            db.add(conv)
+        log = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id=session_id,
+            event_type="group_memory_command",
+            platform="qq_group",
+            user_id=str(raw.get("qq_group_id") or ""),
+            raw_payload=_json_dumps({
+                "action": action,
+                "sender_qid": raw.get("qq_user_id"),
+                "group_id": raw.get("qq_group_id"),
+                "payload": payload,
+                "send_result": send_result,
+                "visible_recorded": visible,
+            }),
+            action=action,
+            final_text=response_text,
+            item_type="text",
+            status="ok" if success else "error",
+        )
+        db.add(log)
+        db.commit()
+    except Exception as exc:
+        print(f"DB error: {exc}")
+    finally:
+        db.close()
+
+
+def _enqueue_group_sticker_jobs(event: ChatEvent, group_window: dict) -> dict:
+    raw = event.raw if isinstance(event.raw, dict) else {}
+    media_refs = raw.get("media_refs") or []
+    if not isinstance(media_refs, list):
+        return {"queued": 0, "jobs": []}
+
+    sticker_refs = [
+        (index, media_ref)
+        for index, media_ref in enumerate(media_refs)
+        if isinstance(media_ref, dict) and media_ref.get("is_sticker")
+    ]
+    if not sticker_refs:
+        return {"queued": 0, "jobs": []}
+
+    queue = _ensure_media_job_queue()
+    jobs = []
+    event_payload = _event_payload(event)
+    for index, media_ref in sticker_refs:
+        media_key = _group_media_harness_key(event, media_ref, index)
+        enqueued = queue.enqueue(
+            MediaJob(
+                media_key=media_key,
+                session_id=event.session_id,
+                snapshot_id=0,
+                buffer_version=int(group_window.get("buffer_version") or 0),
+                source_job_id=f"group_meme:{event.event_id}",
+                event=copy.deepcopy(event_payload),
+                media_ref=copy.deepcopy(media_ref),
+                event_text=str(event.text or ""),
+                context_text=_group_meme_context_text(event.session_id),
+            )
+        )
+        jobs.append({
+            "media_key": media_key,
+            "message_id": str(media_ref.get("onebot_message_id") or raw.get("onebot_message_id") or ""),
+            "segment_index": media_ref.get("segment_index", index),
+            "status": "queued" if enqueued else "already_queued",
+        })
+    return {
+        "queued": sum(1 for job in jobs if job["status"] == "queued"),
+        "jobs": jobs,
+    }
+
+
+def _group_media_harness_key(event: ChatEvent, media_ref: dict, index: int) -> str:
+    segment_index = media_ref.get("segment_index")
+    if segment_index is None:
+        segment_index = index
+    identity = (
+        media_ref.get("file_unique")
+        or media_ref.get("file_id")
+        or media_ref.get("file")
+        or media_ref.get("url")
+        or segment_index
+    )
+    return f"{event.session_id}:{event.event_id}:{segment_index}:{identity}"
+
+
+def _group_meme_context_text(session_id: str) -> str:
+    window = group_chat_buffer.get_model_window(session_id, limit=12)
+    return json.dumps({"group_window": window}, ensure_ascii=False)
+
+
+async def _prepare_group_image_understanding_for_window(
+    session_id: str,
+    *,
+    trigger: dict,
+    model_window: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    sid = normalize_session_id(session_id)
+    enhanced_window = copy.deepcopy(model_window or [])
+    debug_items: list[dict] = []
+    media_queue = _ensure_media_job_queue()
+
+    for entry in enhanced_window:
+        if not isinstance(entry, dict):
+            continue
+        media_items = entry.get("media")
+        if not isinstance(media_items, list):
+            continue
+        for media in media_items:
+            if not isinstance(media, dict) or media.get("kind") != "image":
+                continue
+            media_key = group_image_media_key(sid, media.get("message_id"), media.get("segment_index"))
+            if not media_key:
+                continue
+
+            prompt_payload = group_image_cache.get_payload(sid, media_key)
+            cache_hit = prompt_payload is not None
+            cache_write = False
+            raw_payloads: list[dict] = []
+            if not prompt_payload:
+                raw_ref = group_image_cache.get_ref(sid, media_key)
+                if raw_ref:
+                    job = MediaJob(
+                        media_key=media_key,
+                        session_id=sid,
+                        snapshot_id=0,
+                        buffer_version=_safe_int(trigger.get("request_buffer_version"))
+                        or _safe_int(trigger.get("source_buffer_version"))
+                        or 0,
+                        source_job_id=f"group_image_understanding:{trigger.get('trigger_id') or uuid.uuid4().hex[:8]}",
+                        event={"raw": {"onebot_message_id": media.get("message_id")}},
+                        media_ref=copy.deepcopy(raw_ref),
+                        event_text=str(entry.get("text") or "[图片]"),
+                        context_text=_group_image_context_text(enhanced_window),
+                    )
+                    prompt_payload, raw_payloads = await media_queue.process_inline_image_for_prompt(job)
+                    _record_media_job_payloads(raw_payloads, job)
+                    if prompt_payload:
+                        group_image_cache.set_payload(sid, media_key, prompt_payload)
+                        cache_write = True
+                else:
+                    prompt_payload = _missing_group_image_understanding_payload(
+                        session_id=sid,
+                        media_key=media_key,
+                        media=media,
+                    )
+
+            compact = _compact_group_image_understanding_for_prompt(prompt_payload)
+            if compact:
+                media["image"] = compact
+            item_debug = {
+                "media_key": media_key,
+                "message_id": str(media.get("message_id") or ""),
+                "segment_index": media.get("segment_index"),
+                "status": compact.get("status") if isinstance(compact, dict) else "missing",
+                "media_cache_hit": cache_hit,
+                "media_cache_write": cache_write,
+                "reply_target_candidate": bool(compact.get("reply_target_candidate")) if isinstance(compact, dict) else False,
+            }
+            debug_items.append(item_debug)
+            _record_group_image_understanding_log(sid, item_debug)
+    return enhanced_window, debug_items
+
+
+def _group_image_context_text(model_window: list[dict]) -> str:
+    compact_window = copy.deepcopy(model_window or [])
+    for entry in compact_window:
+        if not isinstance(entry, dict):
+            continue
+        for media in entry.get("media") or []:
+            if isinstance(media, dict):
+                media.pop("image", None)
+    return json.dumps({"group_window": compact_window}, ensure_ascii=False)
+
+
+def _compact_group_image_understanding_for_prompt(payload: Optional[dict]) -> Optional[dict]:
+    if not isinstance(payload, dict):
+        return None
+    status = str(payload.get("status") or "unknown")
+    if status != "completed":
+        return {
+            "status": status,
+            "instruction": payload.get("instruction") or "图片没有成功看清；不要编造图片内容。",
+            "reply_target_candidate": False,
+        }
+
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    compact = {
+        "status": "completed",
+        "summary": result.get("visible_summary"),
+        "relation": result.get("relation_to_context"),
+        "intent": result.get("user_intent"),
+        "desired_response": result.get("desired_response"),
+        "reply_style": result.get("reply_style"),
+        "confidence": result.get("confidence"),
+        "reply_target_candidate": True,
+    }
+    return {key: value for key, value in compact.items() if value is not None}
+
+
+def _missing_group_image_understanding_payload(session_id: str, media_key: str, media: dict) -> dict:
+    return {
+        "internal_event_harness": "image_understanding_result",
+        "media_key": media_key,
+        "session_id": session_id,
+        "status": "failed",
+        "media_ref": {
+            "onebot_message_id": str(media.get("message_id") or ""),
+            "segment_index": media.get("segment_index"),
+            "is_sticker": False,
+        },
+        "error": "group image media ref is no longer available",
+        "visibility": "internal_only_not_visible_to_user",
+        "instruction": "图片没有成功看清；不要编造图片内容，可以基于群聊文字轻问或 WAIT。",
+    }
+
+
+def _select_group_reply_target(trigger: dict, model_window: list[dict], should_send: bool) -> Optional[str]:
+    if not should_send:
+        return None
+    explicit = str(trigger.get("reply_to_message_id") or "").strip()
+    if explicit:
+        return explicit
+    latest = model_window[-1] if model_window else {}
+    if not isinstance(latest, dict):
+        return None
+    for media in latest.get("media") or []:
+        if not isinstance(media, dict) or media.get("kind") != "image":
+            continue
+        image = media.get("image") if isinstance(media.get("image"), dict) else {}
+        if image.get("status") == "completed" and image.get("reply_target_candidate"):
+            return str(media.get("message_id") or "").strip() or None
+    return None
+
+
+def _group_window_with_confirmed_nicknames(model_window: list[dict], qid_to_nickname: dict[str, str]) -> list[dict]:
+    known = {
+        str(qid): str(name).strip()
+        for qid, name in (qid_to_nickname or {}).items()
+        if str(qid).strip() and str(name).strip()
+    }
+    window = copy.deepcopy(model_window or [])
+    for item in window:
+        if not isinstance(item, dict):
+            continue
+        qid = str(item.get("qid") or "")
+        if qid in known:
+            item["nickname"] = known[qid]
+        else:
+            item.pop("nickname", None)
+    return window
+
+
+def _record_group_image_understanding_log(session_id: str, payload: dict):
+    db = next(get_db())
+    try:
+        log = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id=session_id,
+            event_type="group_image_understanding",
+            raw_payload=_json_dumps(payload),
+            job_id=str(payload.get("media_key") or ""),
+            status=str(payload.get("status") or "debug"),
+        )
+        db.add(log)
+        db.commit()
+    except Exception as exc:
+        print(f"DB error: {exc}")
+    finally:
+        db.close()
+
+
+async def _send_group_reply_candidate(session_id: str, trigger: dict, decision: dict) -> dict:
+    sid = normalize_session_id(session_id)
+    group_id = group_id_from_session_id(sid)
+    send_key = f"{str(trigger.get('trigger_id') or 'group_reply')}:group_send"
+    item_type, content = _group_candidate_send_item(decision)
+    reply_to_message_id = str(decision.get("reply_to_message_id") or "").strip() or None
+    if not content:
+        result = {
+            "status": "skipped",
+            "reason": "empty_group_candidate",
+            "session_id": sid,
+            "send_key": send_key,
+        }
+        _record_onebot_group_send(sid, send_key, group_id, item_type, content, None, result["status"], result["reason"], reply_to_message_id)
+        return result
+
+    known_window = group_chat_buffer.get_model_window(sid, limit=50)
+    known_qids = known_qids_from_group_window(known_window)
+    known_message_ids = known_message_ids_from_group_window(
+        known_window,
+        extra_message_ids=[trigger.get("source_message_id"), trigger.get("reply_to_message_id"), reply_to_message_id],
+    )
+    if item_type == SendItemType.TEXT.value:
+        safety = classify_group_visible_text(
+            content,
+            known_qids=known_qids,
+            known_message_ids=known_message_ids,
+        )
+        if not safety.ok:
+            result = {
+                "status": "skipped",
+                "reason": safety.reason or "unsafe_group_visible_text",
+                "session_id": sid,
+                "group_id": group_id,
+                "send_key": send_key,
+                "safety": safety.__dict__,
+            }
+            _record_onebot_group_send(sid, send_key, group_id, item_type, content, None, result["status"], result["reason"], reply_to_message_id)
+            await _emit_state({"result": "group_reply_send", **result})
+            return result
+
+    limiter = _refresh_group_send_limiter()
+    gate = limiter.evaluate(
+        sid,
+        item_type=item_type,
+        content=content,
+        reply_to_message_id=reply_to_message_id,
+        trigger_reason=str(trigger.get("reason") or ""),
+    )
+    group_id = str(gate.get("group_id") or group_id)
+    if not gate.get("ok"):
+        result = {
+            "status": "skipped",
+            "reason": gate.get("reason") or "group_send_blocked",
+            "session_id": sid,
+            "group_id": group_id,
+            "send_key": send_key,
+            "gate": gate,
+        }
+        _record_onebot_group_send(sid, send_key, group_id, item_type, content, None, result["status"], result["reason"], reply_to_message_id)
+        await _emit_state({"result": "group_reply_send", **result})
+        return result
+
+    try:
+        if item_type == SendItemType.MEME.value or content.startswith("meme:") or content.startswith(":meme:"):
+            stem = _meme_stem_from_group_content(content)
+            image_path = _meme_path_for_stem(stem)
+            if not image_path:
+                result = {
+                    "status": "skipped",
+                    "reason": "meme_not_found",
+                    "session_id": sid,
+                    "group_id": group_id,
+                    "send_key": send_key,
+                }
+                _record_onebot_group_send(sid, send_key, group_id, item_type, content, None, result["status"], result["reason"], reply_to_message_id)
+                await _emit_state({"result": "group_reply_send", **result})
+                return result
+            response = await onebot_manager.send_group_image(
+                group_id,
+                Path(image_path).resolve().as_uri(),
+                reply_to_message_id=reply_to_message_id,
+            )
+        elif item_type == "image":
+            response = await onebot_manager.send_group_image(
+                group_id,
+                _sendable_file_uri(content),
+                reply_to_message_id=reply_to_message_id,
+            )
+        else:
+            response = await onebot_manager.send_group_text(
+                group_id,
+                content,
+                reply_to_message_id=reply_to_message_id,
+            )
+        limiter.record_sent(
+            sid,
+            item_type=item_type,
+            content=content,
+            reply_to_message_id=reply_to_message_id,
+        )
+        result = {
+            "status": "sent",
+            "reason": None,
+            "session_id": sid,
+            "group_id": group_id,
+            "send_key": send_key,
+            "onebot_message_id": _onebot_response_message_id(response),
+            "gate": gate,
+        }
+        _record_onebot_group_send(sid, send_key, group_id, item_type, content, response, result["status"], None, reply_to_message_id)
+        await _emit_state({"result": "group_reply_send", **result})
+        return result
+    except Exception as exc:
+        result = {
+            "status": "error",
+            "reason": "onebot_group_send_error",
+            "session_id": sid,
+            "group_id": group_id,
+            "send_key": send_key,
+            "error_message": str(exc),
+            "gate": gate,
+        }
+        _record_onebot_group_send(sid, send_key, group_id, item_type, content, None, result["status"], str(exc), reply_to_message_id)
+        await _emit_state({"result": "group_reply_send", **result})
+        return result
+
+
+def _group_candidate_send_item(decision: dict) -> tuple[str, str]:
+    item_type = str(decision.get("item_type") or SendItemType.TEXT.value).strip().lower()
+    content = str(decision.get("content") or decision.get("final_text") or "").strip()
+    items = decision.get("items")
+    if isinstance(items, list) and items:
+        first = items[0] if isinstance(items[0], dict) else {}
+        item_type = str(first.get("type") or item_type).strip().lower()
+        content = str(first.get("content") or first.get("text") or content).strip()
+    if content.startswith("meme:") or content.startswith(":meme:"):
+        item_type = SendItemType.MEME.value
+    return item_type or SendItemType.TEXT.value, content
+
+
+def _meme_stem_from_group_content(content: str) -> str:
+    text = str(content or "").strip()
+    if text.startswith(":meme:"):
+        return text[len(":meme:"):].strip()
+    if text.startswith("meme:"):
+        return text[len("meme:"):].strip()
+    return text
+
+
+def _sendable_file_uri(content: str) -> str:
+    value = str(content or "").strip()
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", value):
+        return value
+    path = Path(value)
+    if path.exists():
+        return path.resolve().as_uri()
+    return value
+
+
+async def _run_group_reply_decision(session_id: str, trigger: dict, model_window: list[dict]) -> dict:
+    sid = normalize_session_id(session_id)
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    llm = _internal_llm_for_session(sid)
+    send_config = _current_group_send_config()
+    group_id = group_id_from_session_id(sid)
+    send_policy = evaluate_group_send_policy(
+        send_config,
+        sid,
+        trigger_reason=str(trigger.get("reason") or ""),
+        item_type=SendItemType.TEXT.value,
+    )
+    if not send_policy.get("ok"):
+        result = {
+            "status": "policy_skipped",
+            "action": None,
+            "should_send_candidate": False,
+            "send_layer_enabled": True,
+            "send_config_enabled": send_config["enabled"],
+            "group_whitelisted": group_id in set(send_config["allowed_group_ids"]),
+            "send_policy": send_policy,
+            "final_text": None,
+            "reply_to_message_id": None,
+            "image_understanding": [],
+            "parse_status": "policy_skipped",
+            "safety_reason": send_policy.get("reason"),
+            "errors": [send_policy.get("reason") or "group_send_policy_blocked"],
+            "llm_debug": llm.get_cache_debug(),
+        }
+        _record_group_reply_decision_log(
+            sid,
+            trigger=trigger,
+            raw_output="",
+            result=result,
+            buffer_version=trigger.get("request_buffer_version"),
+        )
+        return result
+    window_qids = known_qids_from_group_window(model_window)
+    group_memory_context = group_memory_manager.prompt_context(sid, qids=window_qids)
+    qid_to_nickname = group_memory_context.get("qid_to_nickname") or {}
+    named_window = _group_window_with_confirmed_nicknames(model_window, qid_to_nickname)
+    enhanced_window, image_debug = await _prepare_group_image_understanding_for_window(
+        sid,
+        trigger=trigger,
+        model_window=named_window,
+    )
+    known_qids = known_qids_from_group_window(enhanced_window, qid_to_nickname=qid_to_nickname)
+    messages = build_group_chat_messages(
+        group_window=enhanced_window,
+        trigger={
+            **trigger,
+            "image_understanding": image_debug,
+        },
+        qid_to_nickname=qid_to_nickname,
+        group_memory=group_memory_context,
+        current_time=current_time,
+        send_enabled=bool(send_policy.get("ok")),
+    )
+    known_message_ids = known_message_ids_from_group_window(
+        enhanced_window,
+        extra_message_ids=[trigger.get("source_message_id"), trigger.get("reply_to_message_id")],
+    )
+    raw_output = ""
+    await _emit_llm_started({"session_id": sid})
+    try:
+        raw_output = await llm.chat_completion(messages=messages, temperature=0.8, max_tokens=160)
+        parsed = parse_group_chat_output(
+            raw_output,
+            known_qids=known_qids,
+            known_message_ids=known_message_ids,
+        )
+        final_text = parsed.decision.text_bubbles()[0] if parsed.should_send else None
+        reply_to_message_id = _select_group_reply_target(
+            trigger=trigger,
+            model_window=enhanced_window,
+            should_send=parsed.should_send,
+        )
+        status = "candidate_ready_not_sent" if parsed.should_send else ("guarded" if parsed.errors else "wait")
+        result = {
+            "status": status,
+            "action": parsed.decision.action.value,
+            "should_send_candidate": parsed.should_send,
+            "send_layer_enabled": True,
+            "send_config_enabled": send_config["enabled"],
+            "group_whitelisted": group_id in set(send_config["allowed_group_ids"]),
+            "send_policy": send_policy,
+            "final_text": final_text,
+            "reply_to_message_id": reply_to_message_id,
+            "image_understanding": image_debug,
+            "parse_status": parsed.status,
+            "safety_reason": parsed.safety.reason,
+            "errors": parsed.errors,
+            "llm_debug": llm.get_cache_debug(),
+        }
+        _record_group_reply_decision_log(
+            sid,
+            trigger=trigger,
+            raw_output=raw_output,
+            result=result,
+            buffer_version=trigger.get("request_buffer_version"),
+        )
+        return result
+    except Exception as exc:
+        result = {
+            "status": "error",
+            "action": None,
+            "should_send_candidate": False,
+            "send_layer_enabled": True,
+            "send_config_enabled": send_config["enabled"],
+            "group_whitelisted": group_id in set(send_config["allowed_group_ids"]),
+            "send_policy": send_policy,
+            "final_text": None,
+            "reply_to_message_id": None,
+            "image_understanding": image_debug,
+            "parse_status": "error",
+            "safety_reason": None,
+            "errors": [str(exc)],
+            "llm_debug": llm.get_cache_debug(),
+        }
+        _record_group_reply_decision_log(
+            sid,
+            trigger=trigger,
+            raw_output=raw_output,
+            result=result,
+            buffer_version=trigger.get("request_buffer_version"),
+            error_message=str(exc),
+        )
+        return result
+    finally:
+        await _emit_llm_finished({"session_id": sid}, reason="group_reply_decision_finished")
+
+
+def _record_group_reply_decision_log(
+    session_id: str,
+    *,
+    trigger: dict,
+    raw_output: str,
+    result: dict,
+    buffer_version=None,
+    error_message: Optional[str] = None,
+):
+    db = next(get_db())
+    try:
+        log = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id=session_id,
+            event_type="group_reply_decision",
+            raw_payload=_json_dumps({
+                "trigger": trigger,
+                "send_layer_enabled": result.get("send_layer_enabled"),
+                "send_config_enabled": result.get("send_config_enabled"),
+                "group_whitelisted": result.get("group_whitelisted"),
+            }),
+            llm_raw_output=raw_output,
+            parsed_payload=_json_dumps(result),
+            action=result.get("action"),
+            final_text=result.get("final_text"),
+            item_type="text" if result.get("final_text") else None,
+            buffer_version=_safe_int(buffer_version),
+            job_id=str(trigger.get("trigger_id") or ""),
+            status=str(result.get("status") or "debug"),
+            error_message=error_message,
+        )
+        db.add(log)
+        db.commit()
+    except Exception as exc:
+        print(f"DB error: {exc}")
+    finally:
+        db.close()
+
+
+async def _record_group_reply_scheduler_event(payload: dict):
+    session_id = normalize_session_id(payload.get("session_id") or DEFAULT_SESSION_ID)
+    status = str(payload.get("status") or payload.get("event_type") or "debug")
+    db = next(get_db())
+    try:
+        trigger = payload.get("trigger") if isinstance(payload.get("trigger"), dict) else {}
+        log = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id=session_id,
+            event_type=str(payload.get("event_type") or "group_reply_scheduler"),
+            raw_payload=_json_dumps(payload),
+            buffer_version=_safe_int(trigger.get("source_buffer_version")),
+            job_id=str(trigger.get("trigger_id") or payload.get("pending_trigger_id") or ""),
+            status=status,
+            error_message=str(payload.get("error_message") or "")[:2000] or None,
+        )
+        db.add(log)
+        db.commit()
+    except Exception as exc:
+        print(f"DB error: {exc}")
+    finally:
+        db.close()
+    await _emit_state({"result": "group_reply_scheduler", **payload})
+
+
+def _safe_int(value) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 async def _handle_command_event(event: ChatEvent, result: Optional[dict] = None) -> dict:
@@ -2302,15 +3405,66 @@ def _record_media_harness_debug(ctx: ProcessContext, payloads: Optional[list[dic
 
 async def _record_background_media_payloads(payloads: list[dict], job: MediaJob):
     _record_media_job_payloads(payloads, job)
+    group_meme_update = await _update_group_meme_from_payloads(payloads, job)
     await _emit_state({
         "session_id": job.session_id,
         "result": "media_job_finished",
         "media_job_id": job.job_id,
         "media_key": job.media_key,
         "payloads": payloads,
+        "group_meme_update": group_meme_update,
     })
     for payload in _media_followup_payloads(payloads):
         asyncio.create_task(_dispatch_media_followup_when_idle(job, payload))
+
+
+async def _update_group_meme_from_payloads(payloads: list[dict], job: MediaJob) -> Optional[dict]:
+    if not _is_group_session_id(job.session_id):
+        return None
+    updates = []
+    for payload in payloads or []:
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("internal_event_harness") != "meme_intake_result":
+            continue
+        media_ref = payload.get("media_ref") if isinstance(payload.get("media_ref"), dict) else {}
+        message_id = str(
+            media_ref.get("onebot_message_id")
+            or job.media_ref.get("onebot_message_id")
+            or ""
+        )
+        if not message_id:
+            continue
+        segment_index = media_ref.get("segment_index", job.media_ref.get("segment_index"))
+        meme = _meme_name_from_intake_payload(payload)
+        update = await group_chat_buffer.update_meme_result(
+            session_id=job.session_id,
+            message_id=message_id,
+            segment_index=segment_index,
+            meme=meme,
+            intake_status=str(payload.get("status") or ""),
+            media_key=str(payload.get("media_key") or job.media_key or ""),
+        )
+        updates.append({
+            "message_id": message_id,
+            "segment_index": segment_index,
+            "meme": update.get("meme"),
+            "updated": update.get("updated"),
+            "buffer_version": update.get("buffer_version"),
+        })
+    if not updates:
+        return None
+    return {"updated": any(item.get("updated") for item in updates), "items": updates}
+
+
+def _meme_name_from_intake_payload(payload: dict) -> str:
+    save_result = payload.get("save_result")
+    if isinstance(save_result, dict):
+        status = str(save_result.get("status") or payload.get("status") or "")
+        file_stem = str(save_result.get("file_stem") or "").strip()
+        if status in {"saved", "duplicate"} and file_stem:
+            return file_stem
+    return "unknown"
 
 
 def _media_followup_payloads(payloads: Optional[list[dict]]) -> list[dict]:
@@ -2499,6 +3653,8 @@ async def run_active_message_once(
     MVP 只做一次轻量开场：有 pending 候选、处于 COLD、无未处理输入、未超每日上限时才发送。
     """
     sid = normalize_session_id(session_id or DEFAULT_SESSION_ID)
+    if _is_group_session_id(sid):
+        return {"status": "skipped", "reason": "group_readonly_session"}
     runtime = _runtime_for_session(sid)
     gate = runtime.gate
     graph = runtime.graph
@@ -2797,6 +3953,8 @@ def _normalize_active_message_sessions(value) -> dict:
         sid = normalize_session_id(str(raw_sid or ""))
         if not sid or not isinstance(raw_cfg, dict):
             continue
+        if _is_group_session_id(sid):
+            continue
         cfg = {}
         daily_time = _normalize_hhmm(raw_cfg.get("daily_time"))
         next_active_at = _normalize_active_datetime(raw_cfg.get("next_active_at"))
@@ -2885,6 +4043,8 @@ def _active_message_monitor_rows(config: dict, now: datetime) -> list[dict]:
     rows = []
     for item in _list_sessions():
         sid = normalize_session_id(item.get("session_id") or DEFAULT_SESSION_ID)
+        if _is_group_session_id(sid):
+            continue
         topics = _read_session_tomorrow_topics(sid)
         if not _is_non_initial_tomorrow_topics(topics):
             continue
@@ -3307,6 +4467,103 @@ async def update_context_checkpoint_config(config: ContextCheckpointConfig):
     return {"status": "ok", "config": normalized}
 
 
+@router.get("/api/group-chat/config")
+async def get_group_chat_config(
+    group_id: Optional[str] = Query(None),
+    session_id: Optional[str] = Query(None),
+):
+    config = _current_group_send_config()
+    resolved_group_id = _resolve_group_id_for_config(group_id=group_id, session_id=session_id)
+    sid = f"qq_group_{resolved_group_id}" if resolved_group_id else ""
+    return {
+        "status": "ok",
+        "config": config,
+        "group_id": resolved_group_id,
+        "session_id": sid or None,
+        "known_group_ids": _known_group_config_ids(config),
+        "group_policy": group_send_policy_for_session(config, sid) if sid else None,
+    }
+
+
+@router.post("/api/group-chat/config")
+async def update_group_chat_config(config_update: GroupChatOpsConfig):
+    current = _current_group_send_config()
+    payload = config_update.model_dump(exclude_unset=True)
+    if "enabled" in payload and payload["enabled"] is not None:
+        current["enabled"] = bool(payload["enabled"])
+
+    group_id = _normalize_group_id_value(payload.get("group_id"))
+    policy_keys = {
+        "observe_only",
+        "allow_mention_reply",
+        "allow_roll_reply",
+        "allow_repetition",
+        "allow_meme_send",
+        "allow_command_reply",
+    }
+    policy_updates = {
+        key: bool(payload[key])
+        for key in policy_keys
+        if key in payload and payload[key] is not None
+    }
+    if group_id and policy_updates:
+        existing_policy = current.get("groups", {}).get(group_id) or current.get("default_group_policy") or {}
+        current.setdefault("groups", {})[group_id] = normalize_group_policy({
+            **existing_policy,
+            **policy_updates,
+        })
+        allowed = set(current.get("allowed_group_ids") or [])
+        allowed.add(group_id)
+        current["allowed_group_ids"] = sorted(allowed)
+
+    normalized = _save_group_send_config(current)
+    sid = f"qq_group_{group_id}" if group_id else ""
+    return {
+        "status": "ok",
+        "config": normalized,
+        "group_id": group_id or None,
+        "session_id": sid or None,
+        "known_group_ids": _known_group_config_ids(normalized),
+        "group_policy": group_send_policy_for_session(normalized, sid) if sid else None,
+    }
+
+
+def _resolve_group_id_for_config(
+    *,
+    group_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    direct = _normalize_group_id_value(group_id)
+    if direct:
+        return direct
+    sid = normalize_session_id(session_id or "")
+    from_session = group_id_from_session_id(sid)
+    if from_session:
+        return from_session
+    known = _known_group_config_ids(_current_group_send_config())
+    return known[0] if known else ""
+
+
+def _normalize_group_id_value(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.startswith("qq_group_"):
+        return group_id_from_session_id(text)
+    return normalize_session_id(text, "unknown")
+
+
+def _known_group_config_ids(config: Optional[dict] = None) -> list[str]:
+    cfg = normalize_group_send_config(config)
+    ids = set(cfg.get("allowed_group_ids") or [])
+    ids.update((cfg.get("groups") or {}).keys())
+    for sid in _group_buffer_session_ids():
+        group_id = group_id_from_session_id(sid)
+        if group_id:
+            ids.add(group_id)
+    return sorted(item for item in ids if item)
+
+
 @router.get("/api/sessions")
 async def get_sessions():
     return {"current": DEFAULT_SESSION_ID, "sessions": _list_sessions()}
@@ -3332,6 +4589,13 @@ async def delete_session(session_id: str):
     if media_job_queue:
         media_job_queue.clear(sid)
     _clear_media_followup_keys(sid)
+    await group_chat_buffer.clear(sid)
+    group_image_cache.clear(sid)
+    group_send_limiter.clear(sid)
+    group_repetition_detector.clear(sid)
+    group_activity_tracker.clear(sid)
+    if group_reply_scheduler:
+        await group_reply_scheduler.clear(sid)
 
     db = next(get_db())
     try:
@@ -3350,6 +4614,65 @@ async def delete_session(session_id: str):
 @router.get("/api/status")
 async def get_status(session_id: Optional[str] = Query(None)):
     sid = _session_id_from_query(session_id)
+    if _is_group_session_id(sid):
+        group_panel = group_chat_buffer.status(sid)
+        qid_to_nickname = group_memory_manager.qid_to_nickname(sid)
+        model_window = group_chat_buffer.get_model_window(sid, qid_to_nickname=qid_to_nickname, limit=50)
+        latest = group_panel.get("latest") or {}
+        buffered_events = group_panel.get("buffered_events", 0)
+        group_runtime = group_chat_runtime_status()
+        group_scheduler = _ensure_group_reply_scheduler().status(sid)
+        group_image_status = group_image_cache.status(sid)
+        group_send_status = _refresh_group_send_limiter().status(sid)
+        group_memory_status = group_memory_manager.status(sid)
+        group_repetition_status = group_repetition_detector.status(sid)
+        group_activity_status = group_activity_tracker.status(sid)
+        return {
+            "session_id": sid,
+            "status": "GROUP_CHAT",
+            "buffer_version": group_panel.get("buffer_version", 0),
+            "msg_index_today": buffered_events,
+            "hot_until": None,
+            "hot_duration_minutes": None,
+            "last_action": None,
+            "last_text": latest.get("text"),
+            "last_snapshot_result": "group_chat_buffered",
+            "gate": {
+                "pending_job_id": None,
+                "buffered_events": buffered_events,
+                "stale_jobs_count": 0,
+                "sent_jobs_count": 0,
+                "user_composing": {"active": False},
+            },
+            "snapshot": {
+                "session_id": sid,
+                "snapshot_id": None,
+                "buffer_version": group_panel.get("buffer_version", 0),
+                "status": "GROUP_CHAT",
+                "buffered_events": buffered_events,
+                "memory_sources": ["group_buffer"],
+                "context_note": "群聊窗口，不使用私聊 HOT/COLD",
+            },
+            "llm": {
+                "last_llm_raw": None,
+                "parse_status": None,
+                "decision_result": None,
+                "last_send": None,
+                "group_runtime": group_runtime,
+            },
+            "media": [],
+            "media_jobs": media_job_queue.status(sid) if media_job_queue else {"enabled": False, "session_id": sid},
+            "meme": None,
+            "onebot": onebot_manager.status(),
+            "group_runtime": group_runtime,
+            "group_scheduler": group_scheduler,
+            "group_send": group_send_status,
+            "group_memory": group_memory_status,
+            "group_repetition": group_repetition_status,
+            "group_activity": group_activity_status,
+            "group_image_cache": group_image_status,
+            "group_buffer": {**group_panel, "model_window": model_window},
+        }
     runtime = _runtime_for_session(sid)
     gate = runtime.gate
     graph = runtime.graph
@@ -3495,10 +4818,26 @@ async def clear_conversation(
         if media_job_queue:
             media_job_queue.clear()
         _clear_media_followup_keys()
+        await group_chat_buffer.clear()
+        group_image_cache.clear()
+        group_send_limiter.clear()
+        group_repetition_detector.clear()
+        group_activity_tracker.clear()
+        if group_reply_scheduler:
+            await group_reply_scheduler.clear()
     else:
-        runtime = _runtime_for_session(sid)
-        if runtime_manager:
-            await runtime_manager.clear_session(sid)
+        if _is_group_session_id(sid):
+            await group_chat_buffer.clear(sid)
+            group_image_cache.clear(sid)
+            group_send_limiter.clear(sid)
+            group_repetition_detector.clear(sid)
+            group_activity_tracker.clear(sid)
+            if group_reply_scheduler:
+                await group_reply_scheduler.clear(sid)
+        else:
+            _runtime_for_session(sid)
+            if runtime_manager:
+                await runtime_manager.clear_session(sid)
         _clear_media_followup_keys(sid)
 
     db = next(get_db())
@@ -3514,6 +4853,9 @@ async def clear_conversation(
         db.commit()
     finally:
         db.close()
+
+    await _emit_conversation_changed("conversation_cleared", session_id=sid)
+    return {"status": "ok", "session_id": None if all_sessions else sid, "all_sessions": all_sessions}
 
 
 @router.get("/api/raw-logs")
@@ -3557,6 +4899,3 @@ async def get_raw_logs(
         ]
     finally:
         db.close()
-
-    await _emit_conversation_changed("conversation_cleared", session_id=sid)
-    return {"status": "ok", "session_id": None if all_sessions else sid, "all_sessions": all_sessions}

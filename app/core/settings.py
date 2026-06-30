@@ -23,6 +23,22 @@ _DEFAULTS = {
     "memory_analysis_night": {"hour": 19, "minute": 0},
     "midnight_cleanup": {"hour": 3, "minute": 30},
     "context_checkpoint": {"threshold_k": 500},
+    "group_chat_send": {
+        "enabled": False,
+        "allowed_group_ids": [],
+        "default_group_policy": {
+            "observe_only": True,
+            "allow_mention_reply": True,
+            "allow_roll_reply": False,
+            "allow_repetition": False,
+            "allow_meme_send": False,
+            "allow_command_reply": True,
+        },
+        "groups": {},
+        "min_interval_seconds": 60.0,
+        "dedupe_window_seconds": 300.0,
+        "dedupe_recent_limit": 20,
+    },
     "active_message": {
         "enabled": False,
         "hour": 10,

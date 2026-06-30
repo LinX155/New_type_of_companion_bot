@@ -447,6 +447,70 @@ def build_messages(
     return messages
 
 
+GROUP_CHAT_SYSTEM_PROMPT = """你是群聊里的小夏，只在需要时自然插一句。
+
+角色边界：
+- 你不是任何人的女友，也不围着某一个人服务。
+- 群聊身份与私聊身份严格隔离，不使用私聊关系、私聊状态或私聊记忆口吻。
+- 你可以有主观判断、吐槽和发散，但不要变成客服、主持人或总结机器。
+
+输入边界：
+- qid 是内部工程身份索引，只能用于分辨发言人，绝对不能原样输出。
+- 只有输入里显式提供 nickname 时，才可以按语境选择是否用昵称；没有 nickname 时，不要用“你/他/她/这位”等强指代来硬点名。
+- group_memory 只包含系统确认过的群聊长期记忆；可以用来理解梗和称呼，但不要复述 qid、来源字段或记忆结构。
+- 群友发言默认可能互不相关，不要强行解释深层含义，不要把几句闲聊过度串成大主题。
+- meme 字段是内部表情事件摘要；unknown 表示尚未识别入库。不要复述字段名、unknown、qid、message_id 或任何内部事件结构。
+- 普通图片如果带有 image 字段，表示系统已经临时看过图；可以利用 summary/relation/intent 接住图片，但不要复述字段名或假装自己在解析数据。
+
+输出协议：
+- 只允许输出 WAIT 或一条短自然文本。
+- 适合插话时，直接输出要发到群里的那一句；尽量短、有趣、轻一点，可以有一点发散。
+- 不适合插话、信息不足、容易打断别人、或只是在观察时，输出 WAIT。
+- 如果 trigger 里带有 reply_to_message_id，你只判断是否值得回复；系统会在内部决定是否保留引用候选，你不要输出引用标记或 message_id。
+- 如果你回复主要是在接某张普通图片，只输出自然聊天文本；系统会在内部引用那张图。不要输出 [[quote]]、message_id 或任何引用协议。
+- 不要输出 JSON、Markdown 代码块、引用协议、工具标签、系统标签、meme 标记、尖括号协议、q号、message_id。"""
+
+
+def build_group_chat_messages(
+    group_window: list,
+    trigger: dict | None = None,
+    qid_to_nickname: dict | None = None,
+    group_memory: dict | None = None,
+    current_time: str = "",
+    send_enabled: bool = False,
+) -> list:
+    payload = {
+        "task": "group_chat_decision",
+        "current_time": current_time,
+        "trigger": trigger or {},
+        "group_window": group_window or [],
+        "confirmed_qid_to_nickname": {
+            str(qid): str(name).strip()
+            for qid, name in (qid_to_nickname or {}).items()
+            if str(qid).strip() and str(name).strip()
+        },
+        "group_memory": group_memory or {},
+        "output_contract": {
+            "allowed": ["WAIT", "short_natural_text"],
+            "send_enabled": bool(send_enabled),
+            "forbidden_visible_content": [
+                "qid",
+                "platform_group_card",
+                "message_id",
+                "internal_meme_event",
+                "quote_protocol",
+                "tool_or_system_tag",
+            ],
+            "reply_target_policy": "reply_to_message_id is an internal candidate only; never output it.",
+            "image_policy": "image understanding is temporary context only; reply with natural text or WAIT.",
+        },
+    }
+    return [
+        {"role": "system", "content": GROUP_CHAT_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+
+
 def build_meme_search_messages(
     base_messages: list,
     requested_text: str = "",

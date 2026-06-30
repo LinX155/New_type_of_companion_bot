@@ -2,6 +2,7 @@ import React from 'react';
 import SoulEditor from './SoulEditor';
 import MemorySchedule from './MemorySchedule';
 import ContextCheckpointConfig from './ContextCheckpointConfig';
+import GroupChatOpsConfig from './GroupChatOpsConfig';
 
 const SettingsPanel: React.FC = () => (
   <div style={{
@@ -14,6 +15,7 @@ const SettingsPanel: React.FC = () => (
   }}>
     <SoulEditor />
     <MemorySchedule />
+    <GroupChatOpsConfig />
     <ContextCheckpointConfig />
   </div>
 );

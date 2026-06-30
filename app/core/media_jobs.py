@@ -329,6 +329,23 @@ class MediaJobQueue:
         if not self.meme_steal_analyzer:
             return {**base, "status": "skipped", "reason": "meme_steal_analyzer is not configured"}
 
+        duplicate_check_error = None
+        try:
+            duplicate_payload = await self._find_existing_meme_duplicate(local_path)
+        except Exception as exc:  # noqa: BLE001
+            duplicate_payload = None
+            duplicate_check_error = str(exc)
+        if duplicate_payload:
+            return {
+                **base,
+                "status": "duplicate",
+                "analysis": None,
+                "save_result": duplicate_payload,
+                "duplicate_checked_before_analysis": True,
+            }
+        if duplicate_check_error:
+            base["duplicate_check_error"] = duplicate_check_error
+
         llm = None
         try:
             llm = self._llm_for_job(job)
@@ -365,6 +382,23 @@ class MediaJobQueue:
             "analysis": analysis.model_dump(mode="json"),
             "save_result": save_payload,
         }
+
+    async def _find_existing_meme_duplicate(self, local_path: str) -> Optional[dict]:
+        saver = self.meme_steal_saver
+        if not saver or not hasattr(saver, "find_duplicate"):
+            return None
+        result = await saver.find_duplicate(local_path)
+        if not result:
+            return None
+        if hasattr(result, "to_internal_payload"):
+            payload = result.to_internal_payload()
+        elif isinstance(result, dict):
+            payload = result
+        else:
+            return None
+        if payload.get("status") == "duplicate" and payload.get("file_stem"):
+            return payload
+        return None
 
     def _base_payload(
         self,
@@ -446,6 +480,8 @@ class MediaJobQueue:
     def _remember_prompt_payloads(self, payloads: list[dict]):
         for payload in payloads:
             if payload.get("internal_event_harness") != "image_understanding_result":
+                continue
+            if payload.get("is_sticker"):
                 continue
             prompt_payload = self._payload_for_prompt(payload)
             if prompt_payload:
