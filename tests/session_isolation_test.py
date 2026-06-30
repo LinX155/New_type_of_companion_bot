@@ -262,6 +262,61 @@ class SessionIsolationTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_runtime_manager_keeps_mimo_web_search_chat_scope_only(self):
+        async def scenario():
+            async def noop_on_decision(_ctx):
+                return None
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                manager = SessionRuntimeManager(
+                    root_dir=tmp_dir,
+                    base_llm_client=LLMClient(
+                        api_key="test-key",
+                        base_url="https://custom-compatible-gateway.example/v1",
+                        model="mimo-v2.5",
+                        thinking_enabled=False,
+                        mimo_web_search_mode="adaptive",
+                    ),
+                    base_memory_manager=MemoryFileManager(tmp_dir),
+                    meme_catalog=MemeCatalog(str(Path(tmp_dir) / "memes")),
+                    media_job_queue=None,
+                    on_decision=noop_on_decision,
+                    hot_duration_minutes=30,
+                )
+
+                session_id = qq_private_session_id("10001")
+                main_llm = manager.get(session_id).graph.llm
+                internal_llm = manager.make_internal_llm_for_session(session_id)
+                background_llm = manager.make_background_llm_for_session(session_id)
+
+                main_kwargs = main_llm._build_kwargs(
+                    messages=[{"role": "user", "content": "今天外面天气怎么样"}],
+                    temperature=1.0,
+                    max_tokens=None,
+                    stream=False,
+                )
+                internal_kwargs = internal_llm._build_kwargs(
+                    messages=[{"role": "user", "content": "整理记忆"}],
+                    temperature=0.2,
+                    max_tokens=None,
+                    stream=False,
+                )
+                background_kwargs = background_llm._build_kwargs(
+                    messages=[{"role": "user", "content": "批处理"}],
+                    temperature=0.2,
+                    max_tokens=None,
+                    stream=False,
+                )
+
+                self.assertEqual(main_kwargs["extra_body"]["tools"][0]["type"], "web_search")
+                self.assertTrue(main_llm.get_cache_debug()["mimo_web_search_enabled"])
+                self.assertNotIn("tools", internal_kwargs["extra_body"])
+                self.assertEqual(internal_llm.get_cache_debug()["mimo_web_search_disabled_reason"], "scope_not_chat_session")
+                self.assertNotIn("tools", background_kwargs["extra_body"])
+                self.assertEqual(background_llm.get_cache_debug()["mimo_web_search_disabled_reason"], "scope_not_chat_session")
+
+        asyncio.run(scenario())
+
     def test_runtime_manager_rebuilds_runtime_clients_after_llm_config_change(self):
         async def scenario():
             async def noop_on_decision(_ctx):

@@ -493,7 +493,7 @@ class ActiveMessageSettingsTest(unittest.TestCase):
                 self.tomorrow_topics = (
                     "# 明日话题\n\n"
                     "## 未闭合话题\n"
-                    "- [pending] [2026-06-24]: 用户期待我写卡片。\n\n"
+                    "- [pending] [2099-06-24]: 用户期待我写卡片。\n\n"
                     "## 昨日记忆\n\n"
                     "## 生活感消息备选\n"
                 )
@@ -534,7 +534,7 @@ class ActiveMessageSettingsTest(unittest.TestCase):
                 "minute": 0,
                 "daily_limit": 1,
                 "sessions": {
-                    "qq_private_1": {"next_active_at": "2026-06-25 08:00"},
+                    "qq_private_1": {"next_active_at": "2099-06-25 08:00"},
                 },
             }
         }
@@ -588,7 +588,7 @@ class ActiveMessageSettingsTest(unittest.TestCase):
                 routes.run_active_message_once(
                     session_id="qq_private_1",
                     scheduled_source="next",
-                    scheduled_time="2026-06-25 08:00",
+                    scheduled_time="2099-06-25 08:00",
                 )
             )
 

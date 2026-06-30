@@ -37,7 +37,10 @@ VALID_MEME_CATEGORIES = {
 
 PROTOCOL_PREFIXES = ("emoji:", "meme:", "search_meme:")
 HARNESS_ITEM_KEYS = ("text", "meme", "search_meme")
-MEME_MARKER_RE = re.compile(r"(?<!&)&{1,2}([^&\r\n]{1,120})&{1,2}(?!&)")
+MEME_MARKER_RE = re.compile(
+    r"(?:(?<!&)&{1,2}(?P<amp_body>[^&\r\n]{1,120})&{1,2}(?!&)"
+    r"|(?<!\|)\|\|(?P<pipe_body>[^\|\r\n]{1,120})\|\|(?!\|))"
+)
 ACTIVE_SCHEDULE_MARKER_RE = re.compile(
     r"(?<!&)&&\s*(?P<kind>next|daily)\s*:\s*(?P<time>[^&\r\n]{1,64})&&",
     re.IGNORECASE,
@@ -51,6 +54,12 @@ MALFORMED_MEME_MARKER_RE = re.compile(
     r"&&\s*(?P<open_category>[A-Za-z_][A-Za-z0-9_]{1,32})\s*:[^&\r\n]{0,120}(?:\|\|\||$)"
     r"|(?:^|[\s\[\(])(?P<close_category>[A-Za-z_][A-Za-z0-9_]{1,32})\s*:[^&\r\n]{0,120}&&"
     r")(?!&)"
+)
+MALFORMED_PIPE_MEME_OPEN_RE = re.compile(
+    r"(?<!\|)\|\|\s*(?P<category>[A-Za-z_][A-Za-z0-9_]{1,32})\s*:[^\|\r\n]{0,120}(?:\|{1,3}|$)"
+)
+MALFORMED_PIPE_MEME_CLOSE_RE = re.compile(
+    r"(?:^|[\s\[\(])(?P<category>[A-Za-z_][A-Za-z0-9_]{1,32})\s*:[^\|\r\n]{0,120}\|\|(?!\|)"
 )
 INTERNAL_SENTINEL_RE = re.compile(r"\[\[[A-Z][A-Z0-9_:\-]{2,}\]\]")
 INTERNAL_QUOTE_TAG_RE = re.compile(r"\[{1,2}\s*/?\s*quote\s*\]\]?", re.IGNORECASE)
@@ -393,7 +402,7 @@ def _items_from_marker_text(text: str) -> list[SendItem]:
     valid_match: Optional[re.Match[str]] = None
     valid_request = ""
     for match in matches:
-        parsed = _parse_marker_body(match.group(1))
+        parsed = _parse_marker_body(_marker_body(match))
         if not parsed:
             continue
         valid_match = match
@@ -424,9 +433,17 @@ def _parse_marker_body(body: str) -> Optional[tuple[str, str]]:
     return category, keywords.strip()
 
 
+def _marker_body(match: re.Match[str]) -> str:
+    return match.group("amp_body") or match.group("pipe_body") or ""
+
+
+def _is_pipe_marker(match: re.Match[str]) -> bool:
+    return bool(match.group("pipe_body"))
+
+
 def _remove_marker_spans(text: str) -> str:
     return MEME_MARKER_RE.sub(
-        lambda match: "" if _should_strip_marker_body(match.group(1)) else match.group(0),
+        lambda match: "" if _should_strip_marker_body(_marker_body(match)) else match.group(0),
         text or "",
     )
 
@@ -728,7 +745,7 @@ def _strip_optional_prefix(content: str, prefix: str) -> str:
 
 def contains_visible_meme_marker(text: str) -> bool:
     for match in MEME_MARKER_RE.finditer(text or ""):
-        if _parse_marker_body(match.group(1)):
+        if _parse_marker_body(_marker_body(match)):
             return True
     return False
 
@@ -757,11 +774,29 @@ def contains_malformed_active_schedule_marker(text: str) -> bool:
 
 
 def contains_malformed_visible_meme_marker(text: str) -> bool:
-    for match in MALFORMED_MEME_MARKER_RE.finditer(text or ""):
+    source = text or ""
+    for match in MALFORMED_MEME_MARKER_RE.finditer(source):
         category = match.group("open_category") or match.group("close_category")
         if category in VALID_MEME_CATEGORIES:
             return True
+    valid_pipe_spans = [
+        (match.start(), match.end())
+        for match in MEME_MARKER_RE.finditer(source)
+        if _is_pipe_marker(match) and _parse_marker_body(_marker_body(match))
+    ]
+    for match in MALFORMED_PIPE_MEME_OPEN_RE.finditer(source):
+        category = match.group("category")
+        if category in VALID_MEME_CATEGORIES and not _position_in_spans(match.start(), valid_pipe_spans):
+            return True
+    for match in MALFORMED_PIPE_MEME_CLOSE_RE.finditer(source):
+        category = match.group("category")
+        if category in VALID_MEME_CATEGORIES and not _position_in_spans(match.start(), valid_pipe_spans):
+            return True
     return False
+
+
+def _position_in_spans(position: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= position < end for start, end in spans)
 
 
 def classify_visible_text(text: str, mode: VisibleSafetyMode = "bubble") -> VisibleSafetyResult:

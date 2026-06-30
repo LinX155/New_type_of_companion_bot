@@ -16,6 +16,7 @@ class ProviderRuntimeConfig:
     thinking_enabled: bool
     temperature: float
     transient_retry_delays: tuple[float, ...]
+    mimo_web_search_mode: str
 
     @classmethod
     def from_llm_client(cls, client: LLMClient) -> "ProviderRuntimeConfig":
@@ -26,6 +27,7 @@ class ProviderRuntimeConfig:
             thinking_enabled=client.thinking_enabled,
             temperature=client.temperature,
             transient_retry_delays=tuple(client.transient_retry_delays),
+            mimo_web_search_mode=client.mimo_web_search_mode,
         )
 
     def identity_payload(self) -> dict:
@@ -36,6 +38,7 @@ class ProviderRuntimeConfig:
             "thinking_enabled": self.thinking_enabled,
             "temperature": self.temperature,
             "transient_retry_delays": list(self.transient_retry_delays),
+            "mimo_web_search_mode": self.mimo_web_search_mode,
         }
 
     def identity_hash(self) -> str:
@@ -93,6 +96,7 @@ class ProviderRuntime:
             runtime_id=self.runtime_id,
             client_scope=scope,
             provider_config_hash=self.identity_hash,
+            mimo_web_search_mode=self.config.mimo_web_search_mode,
             shared_client_getter=self.get_client,
             shared_client_reset=self.reset_client,
         )

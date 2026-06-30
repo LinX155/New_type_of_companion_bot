@@ -77,6 +77,7 @@ ENTER_CHAT: 来了。你刚刚那几句我一起看了。
 - `ENTER_CHAT:`：COLD 状态下进入热聊的显式信号，冒号后是本轮可见回复。
 - 普通自然语言：HOT 中的正常聊天输出。
 - `&&category:keywords&&`：表情包占位，只给系统解析，用户不会看到。
+- `||category:keywords||`：仅作为 MiMo 偶发 marker 漂移的兼容输入，协议层会归一化成同一类内部表情检索；提示词和文档推荐写法仍是 `&&...&&`。
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌──────────────┐
@@ -92,6 +93,7 @@ ENTER_CHAT: 来了。你刚刚那几句我一起看了。
 - 短自然回复会被系统归一化成内部轻回应。
 - 展开回复会被系统归一化成内部普通回复。
 - 带 `&&category:keywords&&` 的回复会在发送层触发表情检索和二轮选图。
+- 未解析的 `&&...&&` / `||...||` marker 都会被最终可见闸门拦截，不进入用户气泡、历史、记忆或 checkpoint。
 - COLD 下展开文字回复需要使用 `ENTER_CHAT:`；普通短回应或纯表情占位可以保持 COLD。
 
 ---
@@ -413,4 +415,4 @@ start.bat
 
 ---
 
-🚧 当前状态：核心 WebUI 与 QQ / NapCat 私聊主链路已接通；用户可见输出隔离、ProviderRuntime scope、context checkpoint、普通图片 inline 理解、表情包后台入库和表情包二轮选图已落地。当前未完成项以开发计划为准。
+🚧 当前状态：核心 WebUI 与 QQ / NapCat 私聊主链路已接通；用户可见输出隔离、ProviderRuntime scope、Kimi / MiMo / DeepSeek provider 适配、MiMo 联网模式配置、context checkpoint、普通图片 inline 理解、表情包后台入库和表情包二轮选图已落地。当前未完成项以开发计划为准。

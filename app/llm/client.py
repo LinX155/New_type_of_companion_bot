@@ -13,6 +13,10 @@ from app.core.provider_identity import is_valid_provider_user_id, provider_user_
 
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_TRANSIENT_RETRY_DELAYS = (1.0, 3.0, 8.0)
+DEFAULT_MIMO_WEB_SEARCH_MODE = "off"
+MIMO_WEB_SEARCH_MODES = {"off", "adaptive", "force"}
+MIMO_WEB_SEARCH_MAX_KEYWORD = 5
+MIMO_WEB_SEARCH_LIMIT = 5
 TRANSIENT_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504, 529}
 TRANSIENT_ERROR_CLASS_MARKERS = (
     "apiconnectionerror",
@@ -78,6 +82,7 @@ class LLMClient:
         runtime_id: Optional[str] = None,
         client_scope: str = "standalone",
         provider_config_hash: Optional[str] = None,
+        mimo_web_search_mode: Optional[str] = None,
         shared_client_getter: Optional[Callable[[], AsyncOpenAI]] = None,
         shared_client_reset: Optional[Callable[[], None]] = None,
     ):
@@ -97,6 +102,11 @@ class LLMClient:
         self.llm_runtime_id = runtime_id or "standalone"
         self.client_scope = client_scope or "standalone"
         self.provider_config_hash = provider_config_hash
+        self.mimo_web_search_mode = self._normalize_mimo_web_search_mode(
+            mimo_web_search_mode
+            if mimo_web_search_mode is not None
+            else os.getenv("MIMO_WEB_SEARCH_MODE") or os.getenv("LLM_MIMO_WEB_SEARCH_MODE") or os.getenv("LLM_MIMO_WEB_SEARCH")
+        )
         self._shared_client_getter = shared_client_getter
         self._shared_client_reset = shared_client_reset
         self._prompt_cache_key_disabled_reason: Optional[str] = None
@@ -138,11 +148,15 @@ class LLMClient:
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
         extra_body = self._thinking_extra_body()
-        if not self.thinking_enabled:
-            kwargs["temperature"] = temperature
-        provider_user_id = self._provider_user_id_for_request()
-        if provider_user_id:
-            extra_body["user_id"] = provider_user_id
+        request_temperature = self._temperature_for_request(temperature)
+        if request_temperature is not None:
+            kwargs["temperature"] = request_temperature
+        provider_user_id, provider_identity_field = self._provider_identity_for_request()
+        if provider_user_id and provider_identity_field:
+            extra_body[provider_identity_field] = provider_user_id
+        web_search_tool = self._mimo_web_search_tool_for_request()
+        if web_search_tool:
+            extra_body["tools"] = [web_search_tool]
         kwargs["extra_body"] = extra_body
         if self.cache_affinity_enabled:
             kwargs["extra_headers"] = self._cache_affinity_headers()
@@ -248,7 +262,8 @@ class LLMClient:
         max_tokens: Optional[int],
         stream: bool,
     ) -> dict:
-        provider_user_id = self._provider_user_id_for_request()
+        provider_user_id, provider_identity_field = self._provider_identity_for_request()
+        web_search_tool = self._mimo_web_search_tool_for_request()
         disabled_reason = self._prompt_cache_key_disabled_reason
         if not self.cache_affinity_enabled:
             disabled_reason = "cache_affinity_disabled"
@@ -256,9 +271,11 @@ class LLMClient:
             "llm_runtime_id": self.llm_runtime_id,
             "client_scope": self.client_scope,
             "provider_config_hash": self.provider_config_hash,
+            "provider_profile": self._provider_profile(),
             "model": self.model,
             "thinking_enabled": self.thinking_enabled,
             "temperature": temperature,
+            "temperature_sent": self._temperature_for_request(temperature),
             "max_tokens": max_tokens,
             "stream": stream,
             "message_count": len(messages or []),
@@ -273,6 +290,13 @@ class LLMClient:
             "prompt_cache_key_retry": False,
             "prompt_cache_key_included_final": None,
             "provider_user_id_sent": bool(provider_user_id),
+            "provider_identity_field": provider_identity_field,
+            "mimo_web_search_mode": self.mimo_web_search_mode,
+            "mimo_web_search_enabled": bool(web_search_tool),
+            "mimo_web_search_force_search": web_search_tool.get("force_search") if web_search_tool else None,
+            "mimo_web_search_max_keyword": web_search_tool.get("max_keyword") if web_search_tool else None,
+            "mimo_web_search_limit": web_search_tool.get("limit") if web_search_tool else None,
+            "mimo_web_search_disabled_reason": self._mimo_web_search_disabled_reason(),
         }
 
     def _transient_retry_exhausted_message(self, exc: Exception, attempts: int) -> str:
@@ -428,6 +452,7 @@ class LLMClient:
             "output_tokens",
             "input_token_details",
             "output_token_details",
+            "web_search_usage",
         ):
             if hasattr(usage, key):
                 value = getattr(usage, key)
@@ -452,6 +477,8 @@ class LLMClient:
             "function_call",
             "name",
             "tool_call_id",
+            "annotations",
+            "error_message",
         ):
             if hasattr(message, key):
                 value = getattr(message, key)
@@ -494,16 +521,24 @@ class LLMClient:
     def _envelope_from_response(self, response: Any) -> LLMResponseEnvelope:
         message = response.choices[0].message
         usage = self._serialize_usage(getattr(response, "usage", None))
+        raw_message = self._serialize_message(message) or {}
         assistant_message = self._serialize_assistant_message_for_history(message)
         reasoning_content = self._extract_reasoning_content(assistant_message)
         content = assistant_message.get("content")
         content = str(content) if content is not None else None
+        raw_response_meta = self._serialize_response_meta(response) or {}
+        for key in ("annotations", "error_message"):
+            value = raw_message.get(key)
+            if value:
+                raw_response_meta[key] = self._to_plain_data(value)
+        if usage and usage.get("web_search_usage"):
+            raw_response_meta["web_search_usage"] = usage.get("web_search_usage")
         envelope = LLMResponseEnvelope(
             assistant_message=assistant_message,
             content=content,
             reasoning_content=reasoning_content,
             usage=usage,
-            raw_response_meta=self._serialize_response_meta(response),
+            raw_response_meta=raw_response_meta or None,
         )
         self._last_usage = usage
         self._last_assistant_message = assistant_message
@@ -530,20 +565,25 @@ class LLMClient:
         return value
 
     def get_transcript_identity(self) -> str:
+        _, provider_identity_field = self._provider_identity_for_request()
         return self._identity_hash({
             "base_url": self.base_url,
             "model": self.model,
+            "provider_profile": self._provider_profile(),
             "thinking_enabled": self.thinking_enabled,
             "temperature": self.temperature,
             "provider_user_id": self._provider_user_id_for_request(),
+            "provider_identity_field": provider_identity_field,
+            "mimo_web_search_mode": self.mimo_web_search_mode,
         })
 
     def get_cache_debug(self) -> dict:
-        provider_user_id = self._provider_user_id_for_request()
+        provider_user_id, provider_identity_field = self._provider_identity_for_request()
         return {
             "llm_runtime_id": self.llm_runtime_id,
             "client_scope": self.client_scope,
             "provider_config_hash": self.provider_config_hash,
+            "provider_profile": self._provider_profile(),
             "cache_affinity_enabled": self.cache_affinity_enabled,
             "cache_session_id": self.cache_session_id if self.cache_affinity_enabled else None,
             "prompt_cache_key": self._prompt_cache_key() if self.cache_affinity_enabled else None,
@@ -552,6 +592,10 @@ class LLMClient:
             "provider_user_id_configured": bool(self.provider_user_id),
             "provider_user_id_sent": bool(provider_user_id),
             "provider_user_id_hash": provider_user_id_hash(provider_user_id),
+            "provider_identity_field": provider_identity_field,
+            "mimo_web_search_mode": self.mimo_web_search_mode,
+            "mimo_web_search_enabled": bool(self._mimo_web_search_tool_for_request()),
+            "mimo_web_search_disabled_reason": self._mimo_web_search_disabled_reason(),
         }
 
     def reset_cache_session(self):
@@ -571,6 +615,7 @@ class LLMClient:
             "base_url": self.base_url,
             "model": self.model,
             "session_id": self.cache_session_id,
+            "mimo_web_search_mode": self.mimo_web_search_mode,
         })
 
     def _new_cache_session_id(self) -> str:
@@ -600,6 +645,7 @@ class LLMClient:
         thinking_enabled: Optional[bool] = None,
         temperature: Optional[float] = None,
         provider_user_id: Optional[str] = None,
+        mimo_web_search_mode: Optional[str] = None,
     ):
         if api_key is not None:
             self.api_key = api_key
@@ -613,6 +659,8 @@ class LLMClient:
             self.temperature = self._normalize_temperature(temperature)
         if provider_user_id is not None:
             self.provider_user_id = self._normalize_provider_user_id(provider_user_id)
+        if mimo_web_search_mode is not None:
+            self.mimo_web_search_mode = self._normalize_mimo_web_search_mode(mimo_web_search_mode)
         # Reset client to use new config
         self._reset_transport_client()
         self.reset_cache_session()
@@ -633,13 +681,28 @@ class LLMClient:
         return user_id if is_valid_provider_user_id(user_id) else None
 
     def _provider_user_id_for_request(self) -> Optional[str]:
+        return self._provider_identity_for_request()[0]
+
+    def _provider_identity_for_request(self) -> tuple[Optional[str], Optional[str]]:
         if not self.provider_user_id:
-            return None
+            return None, None
         if self._is_minimax_provider():
+            return None, None
+        if self._is_kimi_model():
+            return self.provider_user_id, "safety_identifier"
+        return self.provider_user_id, "user_id"
+
+    def _temperature_for_request(self, temperature: float) -> Optional[float]:
+        if self._is_kimi_model():
             return None
-        return self.provider_user_id
+        if self.thinking_enabled:
+            return None
+        return temperature
 
     def _thinking_extra_body(self) -> dict:
+        if self._is_kimi_model():
+            thinking_type = "enabled" if self.thinking_enabled else "disabled"
+            return {"thinking": {"type": thinking_type}}
         if self.thinking_enabled:
             if self._is_minimax_provider():
                 return {
@@ -653,9 +716,50 @@ class LLMClient:
             }
         return {"thinking": {"type": "disabled"}}
 
+    def _normalize_mimo_web_search_mode(self, value: Any) -> str:
+        mode = str(value or DEFAULT_MIMO_WEB_SEARCH_MODE).strip().lower()
+        if mode in {"true", "on", "enabled", "enable"}:
+            return "adaptive"
+        if mode in {"false", "none", "disabled", "disable"}:
+            return "off"
+        return mode if mode in MIMO_WEB_SEARCH_MODES else DEFAULT_MIMO_WEB_SEARCH_MODE
+
+    def _mimo_web_search_tool_for_request(self) -> Optional[dict]:
+        if self._mimo_web_search_disabled_reason():
+            return None
+        return {
+            "type": "web_search",
+            "force_search": "true" if self.mimo_web_search_mode == "force" else "false",
+            "max_keyword": MIMO_WEB_SEARCH_MAX_KEYWORD,
+            "limit": MIMO_WEB_SEARCH_LIMIT,
+        }
+
+    def _mimo_web_search_disabled_reason(self) -> Optional[str]:
+        if self.mimo_web_search_mode == "off":
+            return "mode_off"
+        if not self._is_mimo_web_search_provider():
+            return "not_mimo_provider"
+        if self.client_scope != "chat_session":
+            return "scope_not_chat_session"
+        return None
+
+    def _is_mimo_web_search_provider(self) -> bool:
+        identity = f"{self.base_url or ''} {self.model or ''}".lower()
+        return "xiaomimimo" in identity or "mimo" in identity
+
     def _is_minimax_provider(self) -> bool:
         identity = f"{self.base_url or ''} {self.model or ''}".lower()
         return "minimax" in identity or "minimaxi" in identity
+
+    def _is_kimi_model(self) -> bool:
+        return "kimi" in str(self.model or "").lower()
+
+    def _provider_profile(self) -> str:
+        if self._is_kimi_model():
+            return "kimi"
+        if self._is_minimax_provider():
+            return "minimax"
+        return "openai_compatible"
 
 
 def json_dumps_stable(payload: dict) -> str:

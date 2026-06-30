@@ -16,7 +16,11 @@ from app.core.protocol import (
     parse_meme_selection_output,
 )
 from app.core.state import ChatStatus, ColdStartMeta, ConversationSnapshot
-from app.api.routes import _normalize_temperature_for_provider, _temperature_max_for_provider
+from app.api.routes import (
+    _normalize_mimo_web_search_mode,
+    _normalize_temperature_for_provider,
+    _temperature_max_for_provider,
+)
 from app.llm.client import LLMClient, LLMResponseEnvelope
 from app.llm.prompts import (
     build_context_checkpoint_messages,
@@ -1263,6 +1267,43 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertNotIn("user_id", kwargs["extra_body"])
         self.assertFalse(client.get_cache_debug()["provider_user_id_sent"])
 
+    def test_llm_client_uses_kimi_profile_from_model_name_only(self):
+        client = LLMClient(
+            api_key="test-key",
+            base_url="https://custom-compatible-gateway.example/v1",
+            model="vendor-kimi-k2-6",
+            provider_user_id="u_0123456789abcdef0123456789abcdef",
+            thinking_enabled=True,
+        )
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = client._build_kwargs(messages, temperature=0.2, max_tokens=None, stream=False)
+        cache_debug = client.get_cache_debug()
+
+        self.assertNotIn("temperature", kwargs)
+        self.assertEqual(kwargs["extra_body"]["thinking"], {"type": "enabled"})
+        self.assertEqual(kwargs["extra_body"]["safety_identifier"], "u_0123456789abcdef0123456789abcdef")
+        self.assertNotIn("user_id", kwargs["extra_body"])
+        self.assertNotIn("reasoning_effort", kwargs["extra_body"])
+        self.assertEqual(cache_debug["provider_profile"], "kimi")
+        self.assertEqual(cache_debug["provider_identity_field"], "safety_identifier")
+        self.assertTrue(cache_debug["provider_user_id_sent"])
+
+    def test_llm_client_kimi_profile_omits_temperature_when_thinking_disabled(self):
+        client = LLMClient(
+            api_key="test-key",
+            base_url="https://custom-compatible-gateway.example/v1",
+            model="kimi-k2-0905-preview",
+            provider_user_id="u_0123456789abcdef0123456789abcdef",
+            thinking_enabled=False,
+        )
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = client._build_kwargs(messages, temperature=0.6, max_tokens=None, stream=False)
+
+        self.assertNotIn("temperature", kwargs)
+        self.assertEqual(kwargs["extra_body"]["thinking"], {"type": "disabled"})
+        self.assertEqual(kwargs["extra_body"]["safety_identifier"], "u_0123456789abcdef0123456789abcdef")
+        self.assertNotIn("reasoning_effort", kwargs["extra_body"])
+
     def test_minimax_m3_temperature_range_matches_official_openai_compatible_range(self):
         self.assertEqual(_temperature_max_for_provider("https://api.minimax.io/v1", "MiniMax-M3"), 2.0)
         self.assertEqual(_temperature_max_for_provider("https://api.minimaxi.com/v1", "MiniMax-M3"), 2.0)
@@ -1270,6 +1311,11 @@ class PromptAppendOnlyTest(unittest.TestCase):
             _normalize_temperature_for_provider(3.0, "https://api.minimax.io/v1", "MiniMax-M3"),
             2.0,
         )
+
+    def test_kimi_temperature_range_uses_model_name_only(self):
+        self.assertEqual(_temperature_max_for_provider("https://custom-compatible-gateway.example/v1", "vendor-kimi-k2-6"), 1.0)
+        self.assertEqual(_normalize_temperature_for_provider(2.0, "https://custom-compatible-gateway.example/v1", "vendor-kimi-k2-6"), 1.0)
+        self.assertEqual(_temperature_max_for_provider("https://api.kimi-proxy.example/v1", "deepseek-chat"), 2.0)
 
     def test_llm_client_sends_deepseek_provider_user_id_outside_messages(self):
         client = LLMClient(
@@ -1302,6 +1348,79 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertEqual(kwargs["extra_body"]["user_id"], "u_0123456789abcdef0123456789abcdef")
         self.assertNotIn("u_0123456789abcdef0123456789abcdef", json.dumps(messages, ensure_ascii=False))
         self.assertTrue(client.get_cache_debug()["provider_user_id_sent"])
+
+    def test_llm_client_injects_mimo_adaptive_web_search_for_chat_scope(self):
+        client = LLMClient(
+            api_key="test-key",
+            base_url="https://custom-compatible-gateway.example/v1",
+            model="mimo-v2.5",
+            thinking_enabled=False,
+            client_scope="chat_session",
+            mimo_web_search_mode="adaptive",
+        )
+        messages = [{"role": "user", "content": "今天有什么新闻"}]
+        kwargs = client._build_kwargs(messages, temperature=1.0, max_tokens=None, stream=False)
+        tool = kwargs["extra_body"]["tools"][0]
+        debug = client.get_cache_debug()
+
+        self.assertEqual(tool["type"], "web_search")
+        self.assertEqual(tool["force_search"], "false")
+        self.assertEqual(tool["max_keyword"], 5)
+        self.assertEqual(tool["limit"], 5)
+        self.assertTrue(debug["mimo_web_search_enabled"])
+        self.assertIsNone(debug["mimo_web_search_disabled_reason"])
+
+    def test_llm_client_injects_mimo_force_web_search_for_chat_scope(self):
+        client = LLMClient(
+            api_key="test-key",
+            base_url="https://api.xiaomimimo.com/v1",
+            model="mimo-v2.5",
+            thinking_enabled=False,
+            client_scope="chat_session",
+            mimo_web_search_mode="force",
+        )
+        kwargs = client._build_kwargs([{"role": "user", "content": "查一下"}], temperature=1.0, max_tokens=None, stream=False)
+
+        self.assertEqual(kwargs["extra_body"]["tools"][0]["force_search"], "true")
+
+    def test_llm_client_omits_mimo_web_search_outside_chat_scope(self):
+        client = LLMClient(
+            api_key="test-key",
+            base_url="https://custom-compatible-gateway.example/v1",
+            model="mimo-v2.5",
+            thinking_enabled=False,
+            client_scope="internal_session",
+            mimo_web_search_mode="adaptive",
+        )
+        kwargs = client._build_kwargs([{"role": "user", "content": "ping"}], temperature=0.2, max_tokens=None, stream=False)
+        debug = client.get_cache_debug()
+
+        self.assertNotIn("tools", kwargs["extra_body"])
+        self.assertFalse(debug["mimo_web_search_enabled"])
+        self.assertEqual(debug["mimo_web_search_disabled_reason"], "scope_not_chat_session")
+
+    def test_llm_client_omits_mimo_web_search_for_non_mimo_provider(self):
+        client = LLMClient(
+            api_key="test-key",
+            base_url="https://api.deepseek.com",
+            model="deepseek-chat",
+            thinking_enabled=False,
+            client_scope="chat_session",
+            mimo_web_search_mode="adaptive",
+        )
+        kwargs = client._build_kwargs([{"role": "user", "content": "ping"}], temperature=1.0, max_tokens=None, stream=False)
+        debug = client.get_cache_debug()
+
+        self.assertNotIn("tools", kwargs["extra_body"])
+        self.assertFalse(debug["mimo_web_search_enabled"])
+        self.assertEqual(debug["mimo_web_search_disabled_reason"], "not_mimo_provider")
+
+    def test_mimo_web_search_mode_normalization(self):
+        self.assertEqual(_normalize_mimo_web_search_mode("adaptive"), "adaptive")
+        self.assertEqual(_normalize_mimo_web_search_mode("force"), "force")
+        self.assertEqual(_normalize_mimo_web_search_mode("enabled"), "adaptive")
+        self.assertEqual(_normalize_mimo_web_search_mode("disabled"), "off")
+        self.assertEqual(_normalize_mimo_web_search_mode("unknown"), "off")
 
     def test_repeated_buffer_event_is_not_duplicated(self):
         async def scenario():
@@ -1580,6 +1699,8 @@ class PromptAppendOnlyTest(unittest.TestCase):
         self.assertTrue(classify_visible_text("Tom & Jerry & Co 也太经典了", mode="bubble").ok)
         self.assertTrue(classify_visible_text("笑死了 &&amused:laugh&&", mode="model_raw").ok)
         self.assertFalse(classify_visible_text("笑死了 &&amused:laugh&&", mode="bubble").ok)
+        self.assertTrue(classify_visible_text("笑死了 ||amused:scrolling||", mode="model_raw").ok)
+        self.assertFalse(classify_visible_text("笑死了 ||amused:scrolling||", mode="bubble").ok)
         self.assertTrue(classify_visible_text("好 &&next:2026-06-28 10:00&&", mode="model_raw").ok)
         self.assertFalse(classify_visible_text("好 &&next:2026-06-28 10:00&&", mode="bubble").ok)
         self.assertFalse(classify_visible_text("好 &&daily:99:99&&", mode="model_raw").ok)
@@ -1723,8 +1844,27 @@ class PromptAppendOnlyTest(unittest.TestCase):
                 self.assertEqual(items[1].harness_value(), "amused:laugh")
                 self.assertNotIn("&", "".join(item.harness_value() for item in items))
 
+    def test_main_harness_accepts_pipe_meme_marker_variant(self):
+        result = parse_and_validate_main_output("笑死了 ||amused:scrolling|| 真的")
+
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual(result.decision.action, Action.REACT)
+        items = result.decision.all_items()
+        self.assertEqual([item.type for item in items], [
+            SendItemType.TEXT,
+            SendItemType.SEARCH_MEME,
+            SendItemType.TEXT,
+        ])
+        self.assertEqual(items[1].harness_value(), "amused:scrolling")
+        self.assertNotIn("||", "".join(item.harness_value() for item in items))
+
     def test_main_harness_rejects_dangling_meme_markers(self):
-        for text in ("晚安 &&resting:zzz|||", "confused:pout&&"):
+        for text in (
+            "晚安 &&resting:zzz|||",
+            "confused:pout&&",
+            "晚安 ||resting:zzz|||",
+            "confused:pout||",
+        ):
             with self.subTest(text=text):
                 result = parse_and_validate_main_output(text)
 

@@ -78,10 +78,13 @@ TEMPERATURE_MIN = 0.0
 DEEPSEEK_TEMPERATURE_MAX = 2.0
 MIMO_TEMPERATURE_MAX = 1.5
 MINIMAX_TEMPERATURE_MAX = 2.0
+KIMI_TEMPERATURE_MAX = 1.0
 DEFAULT_TEMPERATURE = 1.0
 DISPLAY_SPLIT_DISABLE_ITEM_COUNT = 4
 DISPLAY_SPLIT_MIN_CHINESE_CHARS = 8
 DISPLAY_SPLIT_TRIGGERS = ("...", "——", "？", "，", ",")
+MIMO_WEB_SEARCH_MODES = {"off", "adaptive", "force"}
+DEFAULT_MIMO_WEB_SEARCH_MODE = "off"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -99,6 +102,8 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _temperature_max_for_provider(base_url: str, model: str) -> float:
+    if "kimi" in str(model or "").lower():
+        return KIMI_TEMPERATURE_MAX
     identity = f"{base_url or ''} {model or ''}".lower()
     if "minimax" in identity or "minimaxi" in identity:
         return MINIMAX_TEMPERATURE_MAX
@@ -118,6 +123,15 @@ def _normalize_temperature_for_provider(value, base_url: str, model: str) -> flo
         temperature = DEFAULT_TEMPERATURE
     max_temperature = _temperature_max_for_provider(base_url, model)
     return max(TEMPERATURE_MIN, min(max_temperature, temperature))
+
+
+def _normalize_mimo_web_search_mode(value) -> str:
+    mode = str(value or DEFAULT_MIMO_WEB_SEARCH_MODE).strip().lower()
+    if mode in {"true", "on", "enabled", "enable"}:
+        return "adaptive"
+    if mode in {"false", "none", "disabled", "disable"}:
+        return "off"
+    return mode if mode in MIMO_WEB_SEARCH_MODES else DEFAULT_MIMO_WEB_SEARCH_MODE
 
 
 # NapCat exposes set_input_status.event_type as a raw number and its public docs
@@ -174,6 +188,12 @@ def _load_default_llm_config() -> dict:
     if _persisted.get("model"):
         config["model"] = _persisted["model"]
     config["thinking_enabled"] = _persisted.get("thinking_enabled", True)
+    config["mimo_web_search_mode"] = _normalize_mimo_web_search_mode(
+        _persisted.get("mimo_web_search_mode")
+        or os.getenv("MIMO_WEB_SEARCH_MODE")
+        or os.getenv("LLM_MIMO_WEB_SEARCH_MODE")
+        or os.getenv("LLM_MIMO_WEB_SEARCH")
+    )
     if "temperature" in _persisted:
         config["temperature"] = _persisted.get("temperature")
     config["temperature"] = _normalize_temperature_for_provider(
@@ -227,6 +247,7 @@ class ApiConfig(BaseModel):
     model: str
     thinking_enabled: bool = True
     temperature: float = DEFAULT_TEMPERATURE
+    mimo_web_search_mode: str = DEFAULT_MIMO_WEB_SEARCH_MODE
 
 
 class ChatMessage(BaseModel):
@@ -1587,12 +1608,14 @@ async def _wait_until_user_not_composing(
 @router.post("/api/config")
 async def update_config(config: ApiConfig):
     temperature = _normalize_temperature_for_provider(config.temperature, config.base_url, config.model)
+    mimo_web_search_mode = _normalize_mimo_web_search_mode(config.mimo_web_search_mode)
     llm_client.update_config(
         api_key=config.api_key,
         base_url=config.base_url,
         model=config.model,
         thinking_enabled=config.thinking_enabled,
         temperature=temperature,
+        mimo_web_search_mode=mimo_web_search_mode,
     )
     if runtime_manager:
         runtime_manager.reconfigure_llm_clients(reason="llm_config_changed")
@@ -1604,12 +1627,14 @@ async def update_config(config: ApiConfig):
         "model": config.model,
         "thinking_enabled": config.thinking_enabled,
         "temperature": temperature,
+        "mimo_web_search_mode": mimo_web_search_mode,
     })
     return {
         "status": "ok",
         "temperature": temperature,
         "temperature_min": TEMPERATURE_MIN,
         "temperature_max": _temperature_max_for_provider(config.base_url, config.model),
+        "mimo_web_search_mode": mimo_web_search_mode,
     }
 
 
@@ -1623,6 +1648,7 @@ async def get_config():
         "temperature": llm_client.temperature,
         "temperature_min": TEMPERATURE_MIN,
         "temperature_max": _temperature_max_for_provider(llm_client.base_url, llm_client.model),
+        "mimo_web_search_mode": llm_client.mimo_web_search_mode,
     }
 
 

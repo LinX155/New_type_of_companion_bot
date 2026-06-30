@@ -4,12 +4,41 @@ const API_BASE = '';
 const TEMPERATURE_MIN = 1;
 const DEEPSEEK_TEMPERATURE_MAX = 2;
 const MIMO_TEMPERATURE_MAX = 1.5;
+const KIMI_TEMPERATURE_MAX = 1;
+const MIMO_WEB_SEARCH_MODES = ['off', 'adaptive', 'force'] as const;
+
+type MimoWebSearchMode = typeof MIMO_WEB_SEARCH_MODES[number];
 
 const getTemperatureMax = (baseUrl: string, model: string) => {
+  const modelName = `${model || ''}`.toLowerCase();
+  if (modelName.includes('kimi')) return KIMI_TEMPERATURE_MAX;
   const identity = `${baseUrl || ''} ${model || ''}`.toLowerCase();
   if (identity.includes('xiaomimimo') || identity.includes('mimo')) return MIMO_TEMPERATURE_MAX;
   if (identity.includes('deepseek')) return DEEPSEEK_TEMPERATURE_MAX;
   return DEEPSEEK_TEMPERATURE_MAX;
+};
+
+const temperatureProviderLabel = (temperatureMax: number, model: string) => {
+  if (`${model || ''}`.toLowerCase().includes('kimi')) return 'Kimi';
+  if (temperatureMax === MIMO_TEMPERATURE_MAX) return 'MiMo';
+  return 'DeepSeek/默认';
+};
+
+const isMimoProvider = (baseUrl: string, model: string) => {
+  const identity = `${baseUrl || ''} ${model || ''}`.toLowerCase();
+  return identity.includes('xiaomimimo') || identity.includes('mimo');
+};
+
+const normalizeMimoWebSearchMode = (value: string): MimoWebSearchMode => {
+  const mode = `${value || 'off'}`.toLowerCase();
+  if (MIMO_WEB_SEARCH_MODES.includes(mode as MimoWebSearchMode)) return mode as MimoWebSearchMode;
+  return 'off';
+};
+
+const mimoWebSearchLabel = (mode: MimoWebSearchMode) => {
+  if (mode === 'adaptive') return '自适应';
+  if (mode === 'force') return '强制';
+  return '关闭';
 };
 
 const clampTemperature = (value: number, max: number) => {
@@ -23,9 +52,11 @@ const ApiConfig: React.FC = () => {
   const [model, setModel] = useState('deepseek-v4-flash');
   const [thinkingEnabled, setThinkingEnabled] = useState(false);
   const [temperature, setTemperature] = useState(TEMPERATURE_MIN);
+  const [mimoWebSearchMode, setMimoWebSearchMode] = useState<MimoWebSearchMode>('off');
   const [savedApi, setSavedApi] = useState(false);
   const [dirty, setDirty] = useState(false);
   const temperatureMax = getTemperatureMax(baseUrl, model);
+  const mimoProvider = isMimoProvider(baseUrl, model);
 
   useEffect(() => {
     fetch(`${API_BASE}/api/config`)
@@ -36,6 +67,9 @@ const ApiConfig: React.FC = () => {
         if (data.model) setModel(data.model);
         if (data.thinking_enabled !== undefined) setThinkingEnabled(data.thinking_enabled);
         if (data.temperature !== undefined) setTemperature(Number(data.temperature) || TEMPERATURE_MIN);
+        if (data.mimo_web_search_mode !== undefined) {
+          setMimoWebSearchMode(normalizeMimoWebSearchMode(data.mimo_web_search_mode));
+        }
       })
       .catch(() => {});
   }, []);
@@ -54,11 +88,15 @@ const ApiConfig: React.FC = () => {
         model,
         thinking_enabled: thinkingValue,
         temperature: clampTemperature(temperatureValue, temperatureMax),
+        mimo_web_search_mode: mimoWebSearchMode,
       }),
     });
     const data = await response.json().catch(() => null);
     if (data?.temperature !== undefined) {
       setTemperature(Number(data.temperature) || TEMPERATURE_MIN);
+    }
+    if (data?.mimo_web_search_mode !== undefined) {
+      setMimoWebSearchMode(normalizeMimoWebSearchMode(data.mimo_web_search_mode));
     }
   };
 
@@ -139,7 +177,7 @@ const ApiConfig: React.FC = () => {
             />
             <div style={{ display: 'flex', justifyContent: 'space-between', color: '#7f8c8d', fontSize: '12px' }}>
               <span>最低 {TEMPERATURE_MIN.toFixed(0)}</span>
-              <span>{temperatureMax === MIMO_TEMPERATURE_MAX ? 'MiMo' : 'DeepSeek/默认'} 最高 {temperatureMax.toFixed(1)}</span>
+              <span>{temperatureProviderLabel(temperatureMax, model)} 最高 {temperatureMax.toFixed(1)}</span>
             </div>
             <div style={{ color: thinkingEnabled ? '#b26a00' : '#7f8c8d', fontSize: '12px' }}>
               {thinkingEnabled
@@ -188,6 +226,41 @@ const ApiConfig: React.FC = () => {
                 }} />
               </span>
             </label>
+          </div>
+
+          <div style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '8px',
+            padding: '12px',
+            background: '#f8f9fa',
+            borderRadius: '6px',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
+              <div>
+                <div style={{ fontWeight: 500, fontSize: '14px' }}>MiMo 联网模式</div>
+                <div style={{ color: mimoProvider ? '#7f8c8d' : '#b26a00', fontSize: '12px', marginTop: '2px' }}>
+                  {mimoProvider
+                    ? '仅主聊天生效；记忆、看图、主动消息和调度线程不携带联网工具。'
+                    : '当前模型不是 MiMo，保存后也不会向请求体注入 web_search。'}
+                </div>
+              </div>
+              <select
+                value={mimoWebSearchMode}
+                onChange={e => {
+                  setMimoWebSearchMode(normalizeMimoWebSearchMode(e.target.value));
+                  setDirty(true);
+                }}
+                style={{ minWidth: '120px', padding: '8px', border: '1px solid #ddd', borderRadius: '6px', fontSize: '14px' }}
+              >
+                {MIMO_WEB_SEARCH_MODES.map(mode => (
+                  <option key={mode} value={mode}>{mimoWebSearchLabel(mode)}</option>
+                ))}
+              </select>
+            </div>
+            <div style={{ color: '#7f8c8d', fontSize: '12px' }}>
+              自适应会发送 force_search=false；强制只建议接口验证时临时使用。
+            </div>
           </div>
 
           <button

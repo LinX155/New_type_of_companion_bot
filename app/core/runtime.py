@@ -175,6 +175,7 @@ class SessionRuntimeManager:
             "model": self.base_llm_client.model,
             "thinking_enabled": self.base_llm_client.thinking_enabled,
             "temperature": self.base_llm_client.temperature,
+            "mimo_web_search_mode": self.base_llm_client.mimo_web_search_mode,
         }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
