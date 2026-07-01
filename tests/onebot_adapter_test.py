@@ -1,6 +1,7 @@
 import unittest
 import asyncio
 import tempfile
+import json
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -402,6 +403,7 @@ class OneBotAdapterTest(unittest.TestCase):
                 originals = {
                     "_record_incoming_event": routes._record_incoming_event,
                     "_record_group_memory_command_response": routes._record_group_memory_command_response,
+                    "_group_internal_llm_for_session": routes._group_internal_llm_for_session,
                     "_emit_conversation_changed": routes._emit_conversation_changed,
                     "_emit_state": routes._emit_state,
                     "_emit_message": routes._emit_message,
@@ -441,8 +443,29 @@ class OneBotAdapterTest(unittest.TestCase):
                     sends.append((session_id, trigger, decision))
                     return {"status": "sent", "test": True}
 
+                class FakeGroupLLM:
+                    api_key = "test-key"
+
+                    async def chat_completion(self, **_kwargs):
+                        return json.dumps({
+                            "group_memory_md": """# 群聊记忆
+
+## 群友身份
+- 550808201: 小夏
+
+## 共同记忆
+
+## 个人相关记忆
+- <550808201><2026-07-01><群聊/mem本人><昵称=小夏>
+"""
+                        }, ensure_ascii=False)
+
+                    def get_last_call_debug(self):
+                        return {"llm_runtime_id": "test-runtime", "client_scope": "internal_session"}
+
                 routes._record_incoming_event = fake_record
                 routes._record_group_memory_command_response = fake_command_log
+                routes._group_internal_llm_for_session = lambda _sid: FakeGroupLLM()
                 routes._emit_conversation_changed = fake_emit
                 routes._emit_state = fake_state
                 routes._emit_message = fake_message
@@ -465,6 +488,7 @@ class OneBotAdapterTest(unittest.TestCase):
                 finally:
                     routes._record_incoming_event = originals["_record_incoming_event"]
                     routes._record_group_memory_command_response = originals["_record_group_memory_command_response"]
+                    routes._group_internal_llm_for_session = originals["_group_internal_llm_for_session"]
                     routes._emit_conversation_changed = originals["_emit_conversation_changed"]
                     routes._emit_state = originals["_emit_state"]
                     routes._emit_message = originals["_emit_message"]
@@ -637,9 +661,10 @@ class OneBotAdapterTest(unittest.TestCase):
                     routes.group_chat_buffer = originals["group_chat_buffer"]
                     routes.group_memory_manager = originals["group_memory_manager"]
 
-                self.assertEqual(manager.qid_to_nickname("qq_group_123456"), {"550808201": "小夏"})
+                self.assertEqual(manager.qid_to_nickname("qq_group_123456"), {})
                 self.assertEqual(messages, [])
-                self.assertEqual(states[-1]["group_memory_observation"]["status"], "identity_observed")
+                self.assertEqual(states[-1]["group_memory_observation"]["status"], "identity_candidate")
+                self.assertEqual(states[-1]["group_memory_observation"]["nickname"], "小夏")
 
         asyncio.run(scenario())
 
@@ -828,6 +853,21 @@ class OneBotAdapterTest(unittest.TestCase):
             self.assertEqual(routes._scheduler_session_ids(), ["qq_private_10001", "webui_default"])
         finally:
             routes._list_sessions = original_list_sessions
+
+    def test_group_scheduler_session_ids_include_only_group_sessions(self):
+        original_list_sessions = routes._list_sessions
+        original_group_buffer_sessions = routes._group_buffer_session_ids
+        routes._list_sessions = lambda: [
+            {"session_id": "qq_private_10001"},
+            {"session_id": "qq_group_123456"},
+            {"session_id": "webui_default"},
+        ]
+        routes._group_buffer_session_ids = lambda: ["qq_group_777888"]
+        try:
+            self.assertEqual(routes._group_scheduler_session_ids(), ["qq_group_123456", "qq_group_777888"])
+        finally:
+            routes._list_sessions = original_list_sessions
+            routes._group_buffer_session_ids = original_group_buffer_sessions
 
     def test_group_status_uses_readonly_buffer_without_runtime_dispatch(self):
         async def scenario():

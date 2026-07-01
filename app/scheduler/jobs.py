@@ -13,6 +13,8 @@ from ..llm.client import LLMClient
 from ..core.settings import load_settings
 from ..llm.prompts import (
     build_context_checkpoint_messages,
+    build_group_memory_analysis_messages,
+    build_group_midnight_cleanup_messages,
     build_memory_analysis_messages,
     build_midnight_cleanup_messages,
 )
@@ -38,6 +40,16 @@ MEMORY_ANALYSIS_EVENT_ROLES = {
     "assistant_text": "assistant",
     "assistant_react": "assistant",
 }
+GROUP_MEMORY_EVENT_ROLES = {
+    "message.text": "user",
+    "message.image": "user",
+    "message.sticker": "user",
+    "command.mem": "user",
+    "command.forget": "user",
+    "onebot_group_send": "assistant",
+    "group_memory_command": "assistant",
+    "group_repetition": "assistant",
+}
 ACTIVE_DAILY_JOB_PREFIX = "active_daily:"
 ACTIVE_NEXT_JOB_PREFIX = "active_next:"
 ACTIVE_MESSAGE_TOPIC_TIME_RE = re.compile(
@@ -58,6 +70,8 @@ class SchedulerManager:
         self.active_message_setting_callback: Optional[Callable[[str, dict], tuple[bool, str]]] = None
         self.group_activity_callback: Optional[Callable[[], Awaitable[dict]]] = None
         self.session_ids_provider: Optional[Callable[[], list[str]]] = None
+        self.group_session_ids_provider: Optional[Callable[[], list[str]]] = None
+        self.group_memory = None
         self.context_checkpoint_callback: Optional[Callable[[str, str, list[dict]], None]] = None
         self._job_configs = {
             "memory_analysis_day": {
@@ -230,6 +244,12 @@ class SchedulerManager:
     def set_session_ids_provider(self, callback: Callable[[], list[str]]):
         self.session_ids_provider = callback
 
+    def set_group_session_ids_provider(self, callback: Callable[[], list[str]]):
+        self.group_session_ids_provider = callback
+
+    def set_group_memory_manager(self, manager):
+        self.group_memory = manager
+
     def set_llm_client_factory(self, callback: Callable[[str], LLMClient]):
         self.llm_client_factory = callback
 
@@ -241,6 +261,12 @@ class SchedulerManager:
             return ["default"]
         session_ids = self.session_ids_provider() or []
         return sorted({sid for sid in session_ids if sid}) or ["default"]
+
+    def _group_session_ids(self) -> list[str]:
+        if not self.group_session_ids_provider:
+            return []
+        session_ids = self.group_session_ids_provider() or []
+        return sorted({sid for sid in session_ids if sid and str(sid).startswith("qq_group_")})
 
     def _llm_for_session(self, session_id: str) -> Optional[LLMClient]:
         if self.llm_client_factory:
@@ -275,6 +301,10 @@ class SchedulerManager:
             ok, error = await self._run_memory_analysis_for_session(base_job_id, session_id)
             if not ok:
                 failures.append({"session_id": session_id, "error": error})
+        for session_id in self._group_session_ids():
+            ok, error = await self._run_group_memory_analysis_for_session(base_job_id, session_id)
+            if not ok:
+                failures.append({"session_id": session_id, "job_type": "group_memory_analysis", "error": error})
         return {"status": "completed" if not failures else "partial_failed", "failures": failures}
 
     async def _run_memory_analysis_for_session(self, base_job_id: str, session_id: str):
@@ -344,6 +374,10 @@ class SchedulerManager:
             checkpoint_ok, checkpoint_error = await self._run_context_checkpoint_for_session(checkpoint_job_id, session_id)
             if not checkpoint_ok:
                 failures.append({"session_id": session_id, "job_type": "context_checkpoint", "error": checkpoint_error})
+        for session_id in self._group_session_ids():
+            ok, error = await self._run_group_midnight_cleanup_for_session(base_job_id, session_id)
+            if not ok:
+                failures.append({"session_id": session_id, "job_type": "group_midnight_cleanup", "error": error})
         return {"status": "completed" if not failures else "partial_failed", "failures": failures}
 
     async def _run_midnight_cleanup_for_session(self, base_job_id: str, session_id: str):
@@ -381,6 +415,74 @@ class SchedulerManager:
 
             self._finish_job(log_id, "completed", self._job_note(llm=llm))
             return True, None
+        except Exception as e:
+            self._finish_job(log_id, "failed", self._job_note(error=str(e), llm=llm))
+            return False, str(e)
+
+    async def _run_group_memory_analysis_for_session(self, base_job_id: str, session_id: str):
+        job_id = f"{base_job_id}_group_{session_id}"
+        log_id = self._start_job(job_id, "group_memory_analysis", session_id=session_id)
+        llm = None
+        try:
+            if self.group_memory is None:
+                raise RuntimeError("group memory manager is not configured")
+            llm = self._llm_for_session(session_id)
+            if llm is None:
+                raise RuntimeError("LLM client is not configured for group memory analysis")
+
+            now = datetime.now()
+            date_str = now.strftime("%Y-%m-%d")
+            transcript = self._load_group_transcript_for_date(now, session_id)
+            if not transcript:
+                self.group_memory.read_dm_file(session_id, date_str)
+                self._finish_job(log_id, "completed", json.dumps({"status": "skipped", "reason": "no_group_visible_events"}, ensure_ascii=False))
+                return True, None
+
+            result = await self.group_memory.analyze_daily_memory_via_llm(
+                transcript,
+                session_id=session_id,
+                llm_client=llm,
+                date_str=date_str,
+                current_time=now,
+            )
+            llm_debug = self._llm_call_debug(llm)
+            if llm_debug:
+                result = {**result, "llm_call_debug": llm_debug}
+            self._record_group_memory_audit(session_id, job_id, "group_memory_analysis", result)
+            status = "failed" if result.get("status") in {"error", "write_failed"} else "completed"
+            note = self._job_note(llm=llm) or json.dumps({k: v for k, v in result.items() if k != "raw_output"}, ensure_ascii=False)[:4000]
+            self._finish_job(log_id, status, note)
+            return status != "failed", result.get("reason")
+        except Exception as e:
+            self._finish_job(log_id, "failed", self._job_note(error=str(e), llm=llm))
+            return False, str(e)
+
+    async def _run_group_midnight_cleanup_for_session(self, base_job_id: str, session_id: str):
+        job_id = f"{base_job_id}_group_{session_id}"
+        log_id = self._start_job(job_id, "group_midnight_cleanup", session_id=session_id)
+        llm = None
+        try:
+            if self.group_memory is None:
+                raise RuntimeError("group memory manager is not configured")
+            llm = self._llm_for_session(session_id)
+            if llm is None:
+                raise RuntimeError("LLM client is not configured for group midnight cleanup")
+
+            target_day = datetime.now() - timedelta(days=1)
+            date_str = target_day.strftime("%Y-%m-%d")
+            result = await self.group_memory.cleanup_via_llm(
+                session_id=session_id,
+                llm_client=llm,
+                date_str=date_str,
+            )
+            llm_debug = self._llm_call_debug(llm)
+            if llm_debug:
+                result = {**result, "llm_call_debug": llm_debug}
+            self._record_group_memory_audit(session_id, job_id, "group_midnight_cleanup", result)
+            status = "failed" if result.get("status") in {"error", "write_failed"} else "completed"
+            note = self._job_note(llm=llm) or json.dumps({k: v for k, v in result.items() if k != "raw_output"}, ensure_ascii=False)[:4000]
+            self._finish_job(log_id, status, note)
+            return status != "failed", result.get("reason")
         except Exception as e:
             self._finish_job(log_id, "failed", self._job_note(error=str(e), llm=llm))
             return False, str(e)
@@ -567,6 +669,28 @@ class SchedulerManager:
         finally:
             db.close()
 
+    def _record_group_memory_audit(self, session_id: str, job_id: str, event_type: str, payload: dict):
+        db = SessionLocal()
+        try:
+            raw_output = str((payload or {}).get("raw_output") or "")
+            safe_payload = {key: value for key, value in (payload or {}).items() if key != "raw_output"}
+            db.add(RawChatLog(
+                event_id=f"{event_type}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}",
+                session_id=session_id,
+                event_type=event_type,
+                platform="qq_group",
+                raw_payload=json.dumps(safe_payload, ensure_ascii=False),
+                llm_raw_output=raw_output,
+                parsed_payload=json.dumps(safe_payload, ensure_ascii=False),
+                job_id=job_id,
+                action=event_type,
+                status=str((payload or {}).get("status") or "debug"),
+                error_message=str((payload or {}).get("reason") or "")[:2000] or None,
+            ))
+            db.commit()
+        finally:
+            db.close()
+
     async def _run_active_message(self):
         cfg = self._job_configs["active_message"]
         expected_time = f"{cfg['hour']:02d}:{cfg['minute']:02d}"
@@ -629,6 +753,85 @@ class SchedulerManager:
             return transcript
         finally:
             db.close()
+
+    def _load_group_transcript_for_date(self, day: datetime, session_id: str) -> list[dict]:
+        start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(RawChatLog)
+                .filter(RawChatLog.session_id == session_id)
+                .filter(RawChatLog.created_at >= start)
+                .filter(RawChatLog.created_at < end)
+                .filter(RawChatLog.event_type.in_(tuple(GROUP_MEMORY_EVENT_ROLES.keys())))
+                .order_by(RawChatLog.created_at)
+                .all()
+            )
+            transcript = []
+            for row in rows:
+                item = self._raw_group_log_to_memory_transcript_item(row)
+                if item:
+                    transcript.append(item)
+            return transcript
+        finally:
+            db.close()
+
+    def _raw_group_log_to_memory_transcript_item(self, row) -> Optional[dict]:
+        role = GROUP_MEMORY_EVENT_ROLES.get(row.event_type)
+        if not role:
+            return None
+        payload = self._safe_json_loads(row.raw_payload)
+        text = (row.input_text or row.final_text or "").strip()
+        if not text and isinstance(payload, dict):
+            nested = payload.get("payload")
+            if isinstance(nested, dict):
+                text = str(nested.get("text") or nested.get("response") or "").strip()
+        if not text:
+            return None
+        if self._contains_platform_identity(text):
+            return None
+
+        qid = ""
+        if isinstance(payload, dict):
+            qid = str(payload.get("sender_qid") or "").strip()
+            raw = payload.get("raw")
+            if not qid and isinstance(raw, dict):
+                qid = str(raw.get("qq_user_id") or "").strip()
+            if not qid and "qq_user_id" in payload:
+                qid = str(payload.get("qq_user_id") or "").strip()
+
+        item = {
+            "role": role,
+            "event_type": row.event_type,
+            "text": text,
+            "created_at": row.created_at.isoformat() if row.created_at else "",
+            "action": row.action,
+        }
+        if qid and re.fullmatch(r"\d{4,}", qid):
+            item["qid"] = qid
+        if row.item_type:
+            item["item_type"] = row.item_type
+        return item
+
+    def _safe_json_loads(self, value) -> dict:
+        if not value:
+            return {}
+        try:
+            data = json.loads(value)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _contains_platform_identity(self, text: str) -> bool:
+        return any(token in str(text or "") for token in (
+            "sender_card",
+            "sender_nickname",
+            "群名片",
+            "平台昵称",
+            "QQ昵称",
+            "qq昵称",
+        ))
 
     def _conversation_event_to_memory_transcript_item(self, row) -> Optional[dict]:
         role = MEMORY_ANALYSIS_EVENT_ROLES.get(row.event_type)

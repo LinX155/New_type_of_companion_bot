@@ -368,6 +368,7 @@ def init_gate():
         )
         queue.set_llm_client_factory(runtime_manager.make_internal_llm_for_session)
         scheduler_manager.set_llm_client_factory(runtime_manager.make_background_llm_for_session)
+        scheduler_manager.set_group_memory_manager(group_memory_manager)
         default_runtime = runtime_manager.get(DEFAULT_SESSION_ID)
         event_gate = default_runtime.gate
         companion_graph = default_runtime.graph
@@ -381,6 +382,7 @@ def init_gate():
         scheduler_manager.set_active_message_setting_callback(_apply_active_message_setting)
         scheduler_manager.set_group_activity_callback(run_group_activity_update)
         scheduler_manager.set_session_ids_provider(_scheduler_session_ids)
+        scheduler_manager.set_group_session_ids_provider(_group_scheduler_session_ids)
         scheduler_manager.set_context_checkpoint_callback(_apply_context_checkpoint_to_runtime)
         _refresh_active_message_jobs(active_cfg)
         scheduler_manager.start()
@@ -462,6 +464,21 @@ def _runtime_for_session(session_id: Optional[str]) -> SessionRuntime:
 
 def _internal_llm_for_session(session_id: Optional[str]) -> LLMClient:
     init_gate()
+    sid = normalize_session_id(session_id or DEFAULT_SESSION_ID)
+    if runtime_manager:
+        return runtime_manager.make_internal_llm_for_session(sid)
+    return LLMClient(
+        api_key=llm_client.api_key,
+        base_url=llm_client.base_url,
+        model=llm_client.model,
+        thinking_enabled=llm_client.thinking_enabled,
+        temperature=llm_client.temperature,
+        cache_affinity_enabled=False,
+        provider_user_id="",
+    )
+
+
+def _group_internal_llm_for_session(session_id: Optional[str]) -> LLMClient:
     sid = normalize_session_id(session_id or DEFAULT_SESSION_ID)
     if runtime_manager:
         return runtime_manager.make_internal_llm_for_session(sid)
@@ -577,6 +594,12 @@ def _list_sessions() -> list[dict]:
 
 def _scheduler_session_ids() -> list[str]:
     return [item["session_id"] for item in _list_sessions() if not _is_group_session_id(item["session_id"])]
+
+
+def _group_scheduler_session_ids() -> list[str]:
+    ids = {item["session_id"] for item in _list_sessions() if _is_group_session_id(item["session_id"])}
+    ids.update(_group_buffer_session_ids())
+    return sorted(ids)
 
 
 def _clear_media_followup_keys(session_id: Optional[str] = None):
@@ -1638,6 +1661,16 @@ def _record_onebot_group_send(
             error_message=error_message,
         )
         db.add(log)
+        if status == "sent" and not str(send_key or "").startswith("group_memory_"):
+            event_type = "assistant_react" if item_type in {"meme", "emoji", "image"} else "assistant_text"
+            conv = ConversationEvent(
+                session_id=session_id,
+                event_type=event_type,
+                text=content,
+                is_visible=True,
+                action="onebot_group_send",
+            )
+            db.add(conv)
         db.commit()
     except Exception as exc:
         print(f"DB error: {exc}")
@@ -2155,6 +2188,7 @@ async def handle_onebot_payload(payload: dict) -> None:
         group_image_refs = group_image_cache.remember_event(event)
         group_meme_jobs = _enqueue_group_sticker_jobs(event, group_window)
         group_memory_observation = _observe_group_memory_event(event)
+        group_memory_thread = _schedule_group_memory_thread(event)
         group_activity_update = _maybe_update_group_activity(event.session_id)
         group_repetition = None
         group_memory_command = None
@@ -2197,6 +2231,7 @@ async def handle_onebot_payload(payload: dict) -> None:
             "group_meme_jobs": group_meme_jobs,
             "group_reply_trigger": group_reply_trigger,
             "group_memory_observation": group_memory_observation,
+            "group_memory_thread": group_memory_thread,
             "group_memory_command": group_memory_command,
             "group_repetition": group_repetition,
             "group_activity_update": group_activity_update,
@@ -2259,7 +2294,7 @@ def _observe_group_memory_event(event: ChatEvent) -> Optional[dict]:
         sender_qid=sender_qid,
         timestamp=event.timestamp,
     )
-    if result.get("status") in {"identity_observed", "write_failed"}:
+    if result.get("status") in {"identity_candidate", "write_failed"}:
         _record_group_memory_observation(event, result)
     return result
 
@@ -2283,6 +2318,99 @@ def _record_group_memory_observation(event: ChatEvent, payload: dict):
             }),
             action="group.memory.observe",
             status="ok" if payload.get("status") == "identity_observed" else "error",
+        )
+        db.add(log)
+        db.commit()
+    except Exception as exc:
+        print(f"DB error: {exc}")
+    finally:
+        db.close()
+
+
+def _schedule_group_memory_thread(event: ChatEvent) -> Optional[dict]:
+    if event.event_type != EventType.TEXT:
+        return None
+    raw = event.raw if isinstance(event.raw, dict) else {}
+    sender_qid = str(raw.get("qq_user_id") or event.user_id or "").strip()
+    if not sender_qid:
+        return {"status": "skipped", "reason": "missing_sender_qid"}
+    self_id = str(raw.get("qq_self_id") or "").strip()
+    if self_id and self_id == sender_qid:
+        return {"status": "skipped", "reason": "self_message"}
+    if not getattr(llm_client, "api_key", ""):
+        return {"status": "skipped", "reason": "llm_not_configured"}
+    task = asyncio.create_task(_run_group_memory_thread_for_event(event.session_id, event.event_id, event.timestamp))
+    task.add_done_callback(_log_group_memory_task_error)
+    return {
+        "status": "queued",
+        "event_id": event.event_id,
+        "session_id": normalize_session_id(event.session_id),
+    }
+
+
+def _log_group_memory_task_error(task: asyncio.Task):
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        print(f"[group_memory] background task failed: {exc}")
+
+
+async def _run_group_memory_thread_for_event(
+    session_id: str,
+    source_event_id: str,
+    event_time: Optional[datetime] = None,
+) -> dict:
+    sid = normalize_session_id(session_id)
+    llm = None
+    try:
+        llm = _group_internal_llm_for_session(sid)
+        window = group_chat_buffer.get_window(sid, limit=60)
+        result = await group_memory_manager.analyze_window_via_llm(
+            window,
+            session_id=sid,
+            llm_client=llm,
+            current_time=event_time or datetime.now(),
+        )
+        if hasattr(llm, "get_last_call_debug"):
+            debug = llm.get_last_call_debug()
+            if debug:
+                result["llm_call_debug"] = debug
+        if hasattr(llm, "get_cache_debug"):
+            result["llm_debug"] = llm.get_cache_debug()
+    except Exception as exc:
+        result = {"status": "error", "reason": str(exc)}
+    _record_group_memory_analysis(sid, source_event_id, result)
+    state_payload = {key: value for key, value in result.items() if key != "raw_output"}
+    await _emit_state({
+        "result": "group_memory_analysis",
+        "session_id": sid,
+        "source_event_id": source_event_id,
+        **state_payload,
+    })
+    return result
+
+
+def _record_group_memory_analysis(session_id: str, source_event_id: str, payload: dict):
+    db = next(get_db())
+    try:
+        raw_output = str(payload.get("raw_output") or "")
+        safe_payload = {key: value for key, value in (payload or {}).items() if key != "raw_output"}
+        log = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id=normalize_session_id(session_id),
+            event_type="group_memory_analysis",
+            platform="qq_group",
+            raw_payload=_json_dumps({
+                "source_event_id": source_event_id,
+                **safe_payload,
+            }),
+            llm_raw_output=raw_output,
+            parsed_payload=_json_dumps(safe_payload),
+            action="group.memory.analysis",
+            status=str(payload.get("status") or "debug"),
+            error_message=str(payload.get("reason") or "")[:2000] or None,
         )
         db.add(log)
         db.commit()
@@ -2413,19 +2541,22 @@ def _record_group_repetition_event(event: ChatEvent, payload: dict):
 async def _handle_group_memory_command_event(event: ChatEvent) -> dict:
     raw = event.raw if isinstance(event.raw, dict) else {}
     sender_qid = str(raw.get("qq_user_id") or event.user_id or "").strip()
+    llm = _group_internal_llm_for_session(event.session_id)
     if event.event_type == EventType.COMMAND_MEM:
-        success, response_text, payload = group_memory_manager.apply_mem_command(
+        success, response_text, payload = await group_memory_manager.apply_mem_command_via_llm(
             event.text or "",
             session_id=event.session_id,
             sender_qid=sender_qid,
+            llm_client=llm,
             timestamp=event.timestamp,
         )
         action = "group.command.mem"
     elif event.event_type == EventType.COMMAND_FORGET:
-        success, response_text, payload = group_memory_manager.apply_forget_command(
+        success, response_text, payload = await group_memory_manager.apply_forget_command_via_llm(
             event.text or "",
             session_id=event.session_id,
             sender_qid=sender_qid,
+            llm_client=llm,
         )
         action = "group.command.forget"
     else:
@@ -2446,6 +2577,13 @@ async def _handle_group_memory_command_event(event: ChatEvent) -> dict:
         },
     )
     sent = send_result.get("status") == "sent"
+    if hasattr(llm, "get_last_call_debug"):
+        try:
+            debug = llm.get_last_call_debug()
+            if debug:
+                payload = {**payload, "llm_call_debug": debug}
+        except Exception:
+            pass
     _record_group_memory_command_response(
         event,
         action,
@@ -2513,6 +2651,9 @@ def _record_group_memory_command_response(
                 "sender_qid": raw.get("qq_user_id"),
                 "group_id": raw.get("qq_group_id"),
                 "payload": payload,
+                "queue_wait_ms": payload.get("queue_wait_ms"),
+                "llm_runtime_id": ((payload.get("llm_call_debug") or {}).get("llm_runtime_id") if isinstance(payload.get("llm_call_debug"), dict) else None),
+                "client_scope": ((payload.get("llm_call_debug") or {}).get("client_scope") if isinstance(payload.get("llm_call_debug"), dict) else None),
                 "send_result": send_result,
                 "visible_recorded": visible,
             }),
@@ -4594,6 +4735,7 @@ async def delete_session(session_id: str):
     group_send_limiter.clear(sid)
     group_repetition_detector.clear(sid)
     group_activity_tracker.clear(sid)
+    group_memory_manager.clear(sid)
     if group_reply_scheduler:
         await group_reply_scheduler.clear(sid)
 
@@ -4823,6 +4965,7 @@ async def clear_conversation(
         group_send_limiter.clear()
         group_repetition_detector.clear()
         group_activity_tracker.clear()
+        group_memory_manager.clear()
         if group_reply_scheduler:
             await group_reply_scheduler.clear()
     else:
@@ -4832,6 +4975,7 @@ async def clear_conversation(
             group_send_limiter.clear(sid)
             group_repetition_detector.clear(sid)
             group_activity_tracker.clear(sid)
+            group_memory_manager.clear(sid)
             if group_reply_scheduler:
                 await group_reply_scheduler.clear(sid)
         else:

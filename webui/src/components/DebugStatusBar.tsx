@@ -101,6 +101,14 @@ const DebugStatusBar: React.FC<Props> = ({ status }) => {
     buffered_events: gate?.buffered_events ?? snapshot?.buffered_events ?? null,
     pending_job_id: gate?.pending_job_id ?? null,
     user_composing: gate?.user_composing ?? null,
+    group_memory: status.group_memory ? {
+      path: status.group_memory.path ?? null,
+      dm_path: status.group_memory.dm_path ?? null,
+      latest_dm_path: status.group_memory.latest_dm_path ?? null,
+      latest_daytime_memory: status.group_memory.latest_daytime_memory ?? null,
+      latest_midnight_cleanup: status.group_memory.latest_midnight_cleanup ?? null,
+      latest_command: status.group_memory.latest_command ?? null,
+    } : null,
   };
 
   const execPayload = {

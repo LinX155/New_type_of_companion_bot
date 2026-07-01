@@ -98,6 +98,13 @@ class FakeOneBotManager:
 
 
 class SendGateTest(unittest.TestCase):
+    def setUp(self):
+        self._original_runtime_manager = routes.runtime_manager
+        routes.runtime_manager = None
+
+    def tearDown(self):
+        routes.runtime_manager = self._original_runtime_manager
+
     def test_successful_mem_command_resets_provider_transcript(self):
         async def scenario():
             reset_reasons = []
