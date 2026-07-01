@@ -243,13 +243,13 @@ def evaluate_group_send_policy(
         return {**result, "ok": False, "reason": "group_send_disabled"}
     if group_id not in set(normalized["allowed_group_ids"]):
         return {**result, "ok": False, "reason": "group_not_whitelisted"}
-    if policy.get("observe_only"):
-        return {**result, "ok": False, "reason": "group_observe_only"}
-
     reason = str(trigger_reason or "").strip()
     reason_block = _trigger_policy_block_reason(policy, reason)
     if reason_block:
         return {**result, "ok": False, "reason": reason_block}
+
+    if policy.get("observe_only") and not _is_command_reply_trigger(reason):
+        return {**result, "ok": False, "reason": "group_observe_only"}
 
     if _is_meme_item(item_type) and not policy.get("allow_meme_send"):
         return {**result, "ok": False, "reason": "group_meme_send_disabled"}
@@ -289,6 +289,10 @@ def _trigger_policy_block_reason(policy: dict, trigger_reason: str) -> Optional[
     if trigger_reason == "active_message" and not policy.get("allow_active_message"):
         return "group_active_message_disabled"
     return None
+
+
+def _is_command_reply_trigger(trigger_reason: str) -> bool:
+    return trigger_reason in {"group.command.mem", "group.command.forget"}
 
 
 def _is_meme_item(item_type: Optional[str]) -> bool:

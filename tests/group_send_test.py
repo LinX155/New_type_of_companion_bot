@@ -84,6 +84,64 @@ class GroupSendLimiterTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "group_observe_only")
 
+    def test_observe_only_allows_group_memory_command_receipts(self):
+        config = normalize_group_send_config({
+            "enabled": True,
+            "allowed_group_ids": ["123456"],
+            "groups": {
+                "123456": {
+                    "observe_only": True,
+                    "allow_command_reply": True,
+                }
+            },
+        })
+
+        ordinary = evaluate_group_send_policy(
+            config,
+            "qq_group_123456",
+            trigger_reason="mention",
+            item_type="text",
+        )
+        mem_receipt = evaluate_group_send_policy(
+            config,
+            "qq_group_123456",
+            trigger_reason="group.command.mem",
+            item_type="text",
+        )
+        forget_receipt = evaluate_group_send_policy(
+            config,
+            "qq_group_123456",
+            trigger_reason="group.command.forget",
+            item_type="text",
+        )
+
+        self.assertFalse(ordinary["ok"])
+        self.assertEqual(ordinary["reason"], "group_observe_only")
+        self.assertTrue(mem_receipt["ok"])
+        self.assertTrue(forget_receipt["ok"])
+
+    def test_command_receipts_can_still_be_disabled_in_observe_only(self):
+        config = normalize_group_send_config({
+            "enabled": True,
+            "allowed_group_ids": ["123456"],
+            "groups": {
+                "123456": {
+                    "observe_only": True,
+                    "allow_command_reply": False,
+                }
+            },
+        })
+
+        result = evaluate_group_send_policy(
+            config,
+            "qq_group_123456",
+            trigger_reason="group.command.mem",
+            item_type="text",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "group_command_reply_disabled")
+
     def test_group_policy_blocks_disabled_trigger_types(self):
         config = normalize_group_send_config({
             "enabled": True,
@@ -208,6 +266,48 @@ class GroupSendRouteTest(unittest.TestCase):
             self.assertEqual(result["status"], "skipped")
             self.assertEqual(result["reason"], "group_send_disabled")
             self.assertEqual(fake_onebot.group_text_calls, [])
+
+        asyncio.run(scenario())
+
+    def test_group_command_receipt_sends_during_observe_only(self):
+        async def scenario():
+            fake_onebot = FakeOneBot()
+            sent_logs = []
+            states = []
+            originals = _patch_route_globals(fake_onebot, sent_logs, states, {
+                "group_chat_send": {
+                    "enabled": True,
+                    "allowed_group_ids": ["123456"],
+                    "groups": {
+                        "123456": {
+                            "observe_only": True,
+                            "allow_command_reply": True,
+                        }
+                    },
+                    "min_interval_seconds": 0,
+                }
+            })
+            try:
+                await routes.group_chat_buffer.append(_group_event())
+                result = await routes._send_group_reply_candidate(
+                    "qq_group_123456",
+                    {
+                        "trigger_id": "group_mem_receipt_test",
+                        "reason": "group.command.mem",
+                        "source_message_id": "99112233",
+                    },
+                    {
+                        "should_send_candidate": True,
+                        "final_text": "已写入这条群聊记忆。",
+                        "reply_to_message_id": "99112233",
+                    },
+                )
+            finally:
+                _restore_route_globals(originals)
+
+            self.assertEqual(result["status"], "sent")
+            self.assertEqual(fake_onebot.group_text_calls, [("123456", "已写入这条群聊记忆。", "99112233")])
+            self.assertEqual(sent_logs[0]["status"], "sent")
 
         asyncio.run(scenario())
 

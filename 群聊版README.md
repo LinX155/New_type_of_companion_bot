@@ -55,6 +55,7 @@
   - `DEFAULT_GROUP_SEND_CONFIG`
 - WebUI 群聊运营开关：`webui/src/components/GroupChatOpsConfig.tsx`
   - `允许主动消息` 默认关闭，需要显式开启。
+  - `观察期 / 只读` 不拦 `/mem` / `/forget` 写记忆；命令回执由 `允许命令回执` 单独控制。
 - 群聊运营开关 API：`app/api/routes.py`
   - `GET /api/group-chat/config`
   - `POST /api/group-chat/config`

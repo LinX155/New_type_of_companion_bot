@@ -221,7 +221,7 @@ const GroupChatOpsConfig: React.FC = () => {
           {checkboxLabel('允许复读', allowRepetition, setAllowRepetition, observeOnly)}
           {checkboxLabel('允许发表情包', allowMeme, setAllowMeme, observeOnly)}
           {checkboxLabel('允许主动消息', allowActiveMessage, setAllowActiveMessage, observeOnly)}
-          {checkboxLabel('允许命令回执', allowCommand, setAllowCommand, observeOnly)}
+          {checkboxLabel('允许命令回执', allowCommand, setAllowCommand)}
         </div>
       </div>
 
