@@ -87,7 +87,7 @@ class ActiveMessageSettingsTest(unittest.TestCase):
             {"due": True, "source": "global", "time": "10:00"},
         )
 
-    def test_active_message_config_drops_group_sessions(self):
+    def test_active_message_config_preserves_group_sessions(self):
         config = routes._normalize_active_message_config({
             "enabled": True,
             "sessions": {
@@ -96,21 +96,198 @@ class ActiveMessageSettingsTest(unittest.TestCase):
             },
         })
 
-        self.assertEqual(config["sessions"], {"qq_private_1": {"daily_time": "08:30"}})
+        self.assertEqual(config["sessions"], {
+            "qq_private_1": {"daily_time": "08:30"},
+            "qq_group_123456": {"daily_time": "09:30"},
+        })
 
-    def test_active_message_once_skips_group_without_runtime_dispatch(self):
+    def test_active_message_once_dispatches_group_through_group_send_path(self):
+        class FakeLLM:
+            api_key = "test"
+
+            async def chat_completion(self, **_kwargs):
+                return json.dumps({"action": "REPLY", "text": "发布会那事有后续吗"}, ensure_ascii=False)
+
+        class FakeGroupMemory:
+            def __init__(self):
+                self.topics = (
+                    "# 明日话题\n\n"
+                    "## 未闭合话题\n"
+                    "- [pending] [2026-07-01]: 群里还在等发布会后续\n\n"
+                    "## 昨日记忆\n\n"
+                    "## 生活感消息备选\n"
+                )
+
+            def read_tomorrow_topics(self, _sid):
+                return self.topics
+
+            def write_tomorrow_topics(self, _sid, content):
+                self.topics = content
+                return True
+
+            def qid_to_nickname(self, _sid):
+                return {}
+
+            def prompt_context(self, _sid, qids=None):
+                return {"qid_to_nickname": {}, "summary": ""}
+
+        class FakeGroupBuffer:
+            def status(self, _sid):
+                return {"buffer_version": 7}
+
+            def get_model_window(self, *_args, **_kwargs):
+                return [{"qid": "550808201", "text": "刚才聊发布会"}]
+
+            def get_window(self, *_args, **_kwargs):
+                return [{"sender_qid": "550808201", "text": "小夏明天来群里提醒一下"}]
+
+        original_load_settings = routes.load_settings
+        original_group_memory = routes.group_memory_manager
+        original_group_buffer = routes.group_chat_buffer
+        original_group_llm = routes._group_internal_llm_for_session
+        original_send = routes._send_group_reply_candidate
+        original_sent_today = routes._active_messages_sent_today
+        original_unanswered = routes._has_unanswered_active_message
+        original_read_soul = routes._read_group_soul
+        original_record = routes._record_group_active_message
+        original_llm_started = routes._emit_llm_started
+        original_llm_finished = routes._emit_llm_finished
+        sent = []
+        fake_memory = FakeGroupMemory()
+
+        async def fake_send(sid, trigger, decision):
+            sent.append({"sid": sid, "trigger": trigger, "decision": decision})
+            return {"status": "sent", "sent_count": 1, "reason": None}
+
+        async def noop_emit(*_args, **_kwargs):
+            return None
+
+        routes.load_settings = lambda: {"active_message": {"enabled": True, "daily_limit": 1, "sessions": {}}}
+        routes.group_memory_manager = fake_memory
+        routes.group_chat_buffer = FakeGroupBuffer()
+        routes._group_internal_llm_for_session = lambda _sid: FakeLLM()
+        routes._send_group_reply_candidate = fake_send
+        routes._active_messages_sent_today = lambda _sid: 0
+        routes._has_unanswered_active_message = lambda _sid: False
+        routes._read_group_soul = lambda: "# GROUP_SOUL"
+        routes._record_group_active_message = lambda *_args, **_kwargs: None
+        routes._emit_llm_started = noop_emit
+        routes._emit_llm_finished = noop_emit
+        try:
+            result = asyncio.run(routes.run_active_message_once(manual=True, session_id="qq_group_123456"))
+        finally:
+            routes.load_settings = original_load_settings
+            routes.group_memory_manager = original_group_memory
+            routes.group_chat_buffer = original_group_buffer
+            routes._group_internal_llm_for_session = original_group_llm
+            routes._send_group_reply_candidate = original_send
+            routes._active_messages_sent_today = original_sent_today
+            routes._has_unanswered_active_message = original_unanswered
+            routes._read_group_soul = original_read_soul
+            routes._record_group_active_message = original_record
+            routes._emit_llm_started = original_llm_started
+            routes._emit_llm_finished = original_llm_finished
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(sent[0]["sid"], "qq_group_123456")
+        self.assertEqual(sent[0]["trigger"]["reason"], "active_message")
+        self.assertTrue(sent[0]["trigger"]["require_current_buffer_version"])
+        self.assertEqual(sent[0]["decision"]["items"], [{"text": "发布会那事有后续吗"}])
+        self.assertIn("[used]", fake_memory.topics)
+
+    def test_active_message_once_drops_group_when_buffer_changes_before_send(self):
+        class FakeLLM:
+            api_key = "test"
+
+            async def chat_completion(self, **_kwargs):
+                return json.dumps({"action": "REPLY", "text": "这事还有后续吗"}, ensure_ascii=False)
+
+        class FakeGroupMemory:
+            def __init__(self):
+                self.topics = (
+                    "# 明日话题\n\n"
+                    "## 未闭合话题\n"
+                    "- [pending] [2026-07-01]: 群里还在等后续\n\n"
+                    "## 昨日记忆\n\n"
+                    "## 生活感消息备选\n"
+                )
+
+            def read_tomorrow_topics(self, _sid):
+                return self.topics
+
+            def write_tomorrow_topics(self, _sid, content):
+                self.topics = content
+                return True
+
+            def qid_to_nickname(self, _sid):
+                return {}
+
+            def prompt_context(self, _sid, qids=None):
+                return {"qid_to_nickname": {}}
+
+        class FakeGroupBuffer:
+            def __init__(self):
+                self.calls = 0
+
+            def status(self, _sid):
+                self.calls += 1
+                return {"buffer_version": 7 if self.calls <= 1 else 8}
+
+            def get_model_window(self, *_args, **_kwargs):
+                return []
+
+        original_load_settings = routes.load_settings
         original_runtime_for_session = routes._runtime_for_session
+        original_group_memory = routes.group_memory_manager
+        original_group_buffer = routes.group_chat_buffer
+        original_group_llm = routes._group_internal_llm_for_session
+        original_send = routes._send_group_reply_candidate
+        original_sent_today = routes._active_messages_sent_today
+        original_unanswered = routes._has_unanswered_active_message
+        original_read_soul = routes._read_group_soul
+        original_record = routes._record_group_active_message
+        original_llm_started = routes._emit_llm_started
+        original_llm_finished = routes._emit_llm_finished
 
         def fail_runtime(_sid):
-            raise AssertionError("group readonly session must not enter active message runtime")
+            raise AssertionError("group active message must not initialize private runtime")
 
+        async def fail_send(*_args, **_kwargs):
+            raise AssertionError("stale group active message must not send")
+
+        async def noop_emit(*_args, **_kwargs):
+            return None
+
+        routes.load_settings = lambda: {"active_message": {"enabled": True, "daily_limit": 1, "sessions": {}}}
         routes._runtime_for_session = fail_runtime
+        routes.group_memory_manager = FakeGroupMemory()
+        routes.group_chat_buffer = FakeGroupBuffer()
+        routes._group_internal_llm_for_session = lambda _sid: FakeLLM()
+        routes._send_group_reply_candidate = fail_send
+        routes._active_messages_sent_today = lambda _sid: 0
+        routes._has_unanswered_active_message = lambda _sid: False
+        routes._read_group_soul = lambda: ""
+        routes._record_group_active_message = lambda *_args, **_kwargs: None
+        routes._emit_llm_started = noop_emit
+        routes._emit_llm_finished = noop_emit
         try:
-            result = asyncio.run(routes.run_active_message_once(session_id="qq_group_123456"))
+            result = asyncio.run(routes.run_active_message_once(manual=True, session_id="qq_group_123456"))
         finally:
+            routes.load_settings = original_load_settings
             routes._runtime_for_session = original_runtime_for_session
+            routes.group_memory_manager = original_group_memory
+            routes.group_chat_buffer = original_group_buffer
+            routes._group_internal_llm_for_session = original_group_llm
+            routes._send_group_reply_candidate = original_send
+            routes._active_messages_sent_today = original_sent_today
+            routes._has_unanswered_active_message = original_unanswered
+            routes._read_group_soul = original_read_soul
+            routes._record_group_active_message = original_record
+            routes._emit_llm_started = original_llm_started
+            routes._emit_llm_finished = original_llm_finished
 
-        self.assertEqual(result, {"status": "skipped", "reason": "group_readonly_session"})
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reason"], "stale_dropped")
 
     def test_scheduled_status_enforces_priority_and_stale_jobs(self):
         next_time = (datetime.now() + timedelta(days=1)).replace(hour=9, minute=30, second=0, microsecond=0)
@@ -394,9 +571,9 @@ class ActiveMessageSettingsTest(unittest.TestCase):
             self.assertEqual(
                 rows,
                 [
-                    {"session_id": "qq_private_daily", "next_time_to_activate": "2026-06-24 08:15"},
-                    {"session_id": "qq_private_global", "next_time_to_activate": "2026-06-24 10:00"},
-                    {"session_id": "qq_private_next", "next_time_to_activate": "2026-06-25 09:30"},
+                    {"session_id": "qq_private_daily", "platform": "qq", "next_time_to_activate": "2026-06-24 08:15"},
+                    {"session_id": "qq_private_global", "platform": "qq", "next_time_to_activate": "2026-06-24 10:00"},
+                    {"session_id": "qq_private_next", "platform": "qq", "next_time_to_activate": "2026-06-25 09:30"},
                 ],
             )
         finally:

@@ -36,6 +36,7 @@ from ..core.graph import CompanionGraph
 from ..core.group_buffer import GroupChatBuffer
 from ..core.group_activity import GroupActivityTracker
 from ..core.group_chat import (
+    build_group_chat_repair_messages,
     classify_group_visible_text,
     group_chat_runtime_status,
     known_message_ids_from_group_window,
@@ -57,6 +58,7 @@ from ..core.group_send import (
 from ..core.media_jobs import MediaJob, MediaJobQueue
 from ..core.protocol import (
     classify_visible_text,
+    parse_meme_selection_output,
 )
 from ..core.repetition_guard import (
     RECENT_REPETITION_WINDOW,
@@ -79,13 +81,18 @@ from ..llm.client import LLMClient
 from ..llm.prompts import (
     build_active_message_messages,
     build_active_message_setting_messages,
+    build_group_active_message_messages,
     build_group_chat_messages,
+    build_meme_search_messages,
 )
 from ..memory.files import MemoryFileManager, TOMORROW_TOPICS_TEMPLATE
 from ..memes.catalog import MemeCatalog
+from ..memes.renderer import MemeRenderer
+from ..memes.search import MemeSearch
 from ..memes.steal import MemeStealAnalyzer, MemeStealSaver
 from ..scheduler.jobs import SchedulerManager
 from ..storage.context_checkpoints import (
+    latest_context_checkpoint_for_session,
     load_conversation_context,
     normalize_context_checkpoint_config,
 )
@@ -99,6 +106,7 @@ router = APIRouter()
 
 # 全局实例（MVP 阶段简化）
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+GROUP_SOUL_PATH = os.path.join(ROOT_DIR, "GROUP_SOUL.md")
 DEFAULT_SESSION_ID = WEBUI_DEFAULT_SESSION_ID
 TEMPERATURE_MIN = 0.0
 DEEPSEEK_TEMPERATURE_MAX = 2.0
@@ -138,6 +146,14 @@ def _temperature_max_for_provider(base_url: str, model: str) -> float:
     if "deepseek" in identity:
         return DEEPSEEK_TEMPERATURE_MAX
     return DEEPSEEK_TEMPERATURE_MAX
+
+
+def _read_group_soul() -> str:
+    try:
+        with open(GROUP_SOUL_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
 
 
 def _normalize_temperature_for_provider(value, base_url: str, model: str) -> float:
@@ -233,6 +249,8 @@ def _load_default_llm_config() -> dict:
 llm_client = LLMClient(**_load_default_llm_config())
 memory_manager = MemoryFileManager()
 meme_catalog = MemeCatalog()
+group_meme_search = MemeSearch(meme_catalog)
+group_meme_renderer = MemeRenderer(meme_catalog)
 meme_steal_analyzer = MemeStealAnalyzer(meme_catalog, ROOT_DIR)
 meme_steal_saver = MemeStealSaver(meme_catalog, ROOT_DIR)
 scheduler_manager = SchedulerManager(memory_manager, llm_client)
@@ -247,7 +265,7 @@ group_chat_buffer = GroupChatBuffer()
 group_image_cache = GroupImageUnderstandingCache()
 group_memory_manager = GroupMemoryManager(ROOT_DIR)
 group_repetition_detector = GroupRepetitionDetector()
-group_activity_tracker = GroupActivityTracker()
+group_activity_tracker = GroupActivityTracker(base_dir=ROOT_DIR)
 group_send_limiter = GroupSendLimiter()
 group_reply_scheduler: Optional[GroupReplyScheduler] = None
 session_registry = SessionRegistry(ROOT_DIR)
@@ -264,6 +282,7 @@ ACTIVE_MESSAGE_DEFAULTS = {
     "sessions": {},
 }
 ACTIVE_MESSAGE_NEXT_FALLBACK_TEXT = "到你说的时间了，我来找你一下。"
+GROUP_ACTIVE_MESSAGE_NEXT_FALLBACK_TEXT = "到点了，我来群里冒个泡。"
 ACTIVE_MESSAGE_NEXT_RETRY_DELAY_SECONDS = max(
     0.0,
     _env_float("ACTIVE_MESSAGE_NEXT_RETRY_DELAY_SECONDS", 180.0),
@@ -330,6 +349,7 @@ class GroupChatOpsConfig(BaseModel):
     allow_roll_reply: Optional[bool] = None
     allow_repetition: Optional[bool] = None
     allow_meme_send: Optional[bool] = None
+    allow_active_message: Optional[bool] = None
     allow_command_reply: Optional[bool] = None
 
 
@@ -1638,44 +1658,85 @@ def _record_onebot_group_send(
     status: str,
     error_message: Optional[str] = None,
     reply_to_message_id: Optional[str] = None,
+    send_index: Optional[int] = None,
+    send_count: Optional[int] = None,
+    audit: Optional[dict] = None,
 ):
     db = next(get_db())
     try:
+        audit_payload = audit if isinstance(audit, dict) else {}
+        visible_commit = {
+            "attempted": status == "sent",
+            "committed": False,
+            "event_type": None,
+            "action": None,
+            "reason": None,
+        }
+        payload = {
+            "target_group_id": target_group_id,
+            "item_type": item_type,
+            "reply_to_message_id": reply_to_message_id,
+            "onebot_message_id": _onebot_response_message_id(response),
+            "response": response,
+        }
+        if audit_payload:
+            payload["audit"] = audit_payload
         log = RawChatLog(
             event_id=f"{send_key}:onebot",
             session_id=session_id,
             event_type="onebot_group_send",
             platform="qq_group",
             user_id=target_group_id,
-            raw_payload=_json_dumps({
-                "target_group_id": target_group_id,
-                "item_type": item_type,
-                "reply_to_message_id": reply_to_message_id,
-                "onebot_message_id": _onebot_response_message_id(response),
-                "response": response,
-            }),
             final_text=content,
             item_type=item_type,
+            send_index=send_index,
+            send_count=send_count,
             send_key=send_key,
             status=status,
             error_message=error_message,
         )
         db.add(log)
-        if status == "sent" and not str(send_key or "").startswith("group_memory_"):
-            event_type = "assistant_react" if item_type in {"meme", "emoji", "image"} else "assistant_text"
+        if status == "sent":
+            event_type = _group_visible_event_type_for_item(item_type)
+            action = _group_visible_action_for_send(send_key, audit_payload)
+            visible_commit.update({
+                "committed": True,
+                "event_type": event_type,
+                "action": action,
+            })
             conv = ConversationEvent(
                 session_id=session_id,
                 event_type=event_type,
                 text=content,
                 is_visible=True,
-                action="onebot_group_send",
+                action=action,
             )
             db.add(conv)
+        else:
+            visible_commit["reason"] = error_message or status or "not_sent"
+        payload["visible_history_commit"] = visible_commit
+        log.raw_payload = _json_dumps(payload)
         db.commit()
     except Exception as exc:
         print(f"DB error: {exc}")
     finally:
         db.close()
+
+
+def _group_visible_event_type_for_item(item_type: str) -> str:
+    return "assistant_react" if str(item_type or "").lower() in {"meme", "emoji", "image"} else "assistant_text"
+
+
+def _group_visible_action_for_send(send_key: str, audit: Optional[dict] = None) -> str:
+    audit = audit if isinstance(audit, dict) else {}
+    reason = str(audit.get("trigger_reason") or audit.get("reason") or "").strip()
+    if reason in {"group.command.mem", "group.command.forget"}:
+        return reason
+    if reason == "group_repetition":
+        return "group.repetition"
+    if reason == "active_message" or str(send_key or "").startswith("group_active_"):
+        return "active_message"
+    return "onebot_group_send"
 
 
 def _record_onebot_input_status(
@@ -2631,15 +2692,6 @@ def _record_group_memory_command_response(
     try:
         session_id = normalize_session_id(event.session_id)
         raw = event.raw if isinstance(event.raw, dict) else {}
-        if visible:
-            conv = ConversationEvent(
-                session_id=session_id,
-                event_type="assistant_system",
-                text=response_text,
-                is_visible=True,
-                action=action,
-            )
-            db.add(conv)
         log = RawChatLog(
             event_id=f"evt_{uuid.uuid4().hex[:8]}",
             session_id=session_id,
@@ -2656,6 +2708,7 @@ def _record_group_memory_command_response(
                 "client_scope": ((payload.get("llm_call_debug") or {}).get("client_scope") if isinstance(payload.get("llm_call_debug"), dict) else None),
                 "send_result": send_result,
                 "visible_recorded": visible,
+                "visible_history_source": "onebot_group_send" if visible else None,
             }),
             action=action,
             final_text=response_text,
@@ -2800,6 +2853,7 @@ async def _prepare_group_image_understanding_for_window(
                 "media_cache_hit": cache_hit,
                 "media_cache_write": cache_write,
                 "reply_target_candidate": bool(compact.get("reply_target_candidate")) if isinstance(compact, dict) else False,
+                "result": compact if isinstance(compact, dict) else None,
             }
             debug_items.append(item_debug)
             _record_group_image_understanding_log(sid, item_debug)
@@ -2914,20 +2968,205 @@ def _record_group_image_understanding_log(session_id: str, payload: dict):
         db.close()
 
 
+def _group_send_decision_audit(decision: dict) -> dict:
+    if not isinstance(decision, dict):
+        return {}
+    items = decision.get("items") if isinstance(decision.get("items"), list) else []
+    return {
+        "status": decision.get("status"),
+        "action": decision.get("action"),
+        "should_send_candidate": bool(decision.get("should_send_candidate")),
+        "parse_status": decision.get("parse_status"),
+        "safety_reason": decision.get("safety_reason"),
+        "errors": decision.get("errors") or [],
+        "reply_to_message_id": decision.get("reply_to_message_id"),
+        "item_count": len(items) if items else (1 if (decision.get("final_text") or decision.get("content")) else 0),
+        "item_types": [
+            str((item or {}).get("type") or ("meme" if "meme" in item else "text" if "text" in item else ""))
+            for item in items
+            if isinstance(item, dict)
+        ],
+        "has_meme_selector": bool(decision.get("meme_selector")),
+        "meme_selector_status": _group_meme_selector_status(decision.get("meme_selector")),
+        "side_effects_present": bool(decision.get("side_effects")),
+        "repair_attempted": bool((decision.get("repair") or {}).get("attempted")) if isinstance(decision.get("repair"), dict) else False,
+    }
+
+
+def _group_meme_selector_status(value) -> Optional[str]:
+    if not isinstance(value, dict):
+        return None
+    results = value.get("results")
+    if isinstance(results, list) and results:
+        statuses = [str(item.get("status") or "") for item in results if isinstance(item, dict)]
+        return ",".join(status for status in statuses if status) or None
+    if value.get("attempted") is False:
+        return "not_attempted"
+    return str(value.get("status") or "") or None
+
+
+def _group_send_audit_payload(
+    *,
+    send_key: str,
+    trigger: dict,
+    decision: dict,
+    expected_buffer_version: Optional[int] = None,
+    send_index: Optional[int] = None,
+    send_count: Optional[int] = None,
+    item_type: Optional[str] = None,
+) -> dict:
+    trigger = trigger if isinstance(trigger, dict) else {}
+    return {
+        "trace_type": "group_visible_send",
+        "send_key": send_key,
+        "trigger_id": str(trigger.get("trigger_id") or ""),
+        "trigger_reason": str(trigger.get("reason") or ""),
+        "source_message_id": str(trigger.get("source_message_id") or ""),
+        "reply_to_message_id": str(trigger.get("reply_to_message_id") or ""),
+        "source_buffer_version": _safe_int(trigger.get("source_buffer_version")),
+        "request_buffer_version": _safe_int(trigger.get("request_buffer_version")),
+        "expected_buffer_version": expected_buffer_version,
+        "send_index": send_index,
+        "send_count": send_count,
+        "item_type": item_type,
+        "decision": _group_send_decision_audit(decision),
+    }
+
+
+def _record_group_send_chain_audit(
+    session_id: str,
+    *,
+    send_key: str,
+    trigger: dict,
+    decision: dict,
+    send_result: dict,
+    expected_buffer_version: Optional[int] = None,
+):
+    payload = {
+        **_group_send_audit_payload(
+            send_key=send_key,
+            trigger=trigger,
+            decision=decision,
+            expected_buffer_version=expected_buffer_version,
+        ),
+        "send_result": send_result,
+        "status": str((send_result or {}).get("status") or "debug"),
+        "drop_reason": (send_result or {}).get("reason"),
+        "sent_count": (send_result or {}).get("sent_count"),
+        "total_count": (send_result or {}).get("total_count"),
+        "item_statuses": [
+            {
+                "send_key": item.get("send_key"),
+                "item_type": item.get("item_type"),
+                "status": item.get("status"),
+                "reason": item.get("reason"),
+                "onebot_message_id": item.get("onebot_message_id"),
+                "visible_history_commit": item.get("visible_history_commit"),
+            }
+            for item in ((send_result or {}).get("items") or [])
+            if isinstance(item, dict)
+        ],
+    }
+    db = next(get_db())
+    try:
+        db.add(RawChatLog(
+            event_id=f"{send_key}:audit",
+            session_id=normalize_session_id(session_id),
+            event_type="group_send_audit",
+            platform="qq_group",
+            raw_payload=_json_dumps(payload),
+            parsed_payload=_json_dumps(_group_send_decision_audit(decision)),
+            action=str((decision or {}).get("action") or payload.get("trigger_reason") or ""),
+            final_text=str((decision or {}).get("final_text") or "")[:2000] or None,
+            item_type="mixed" if int((send_result or {}).get("total_count") or 0) > 1 else None,
+            send_key=send_key,
+            status=payload["status"],
+            error_message=str(payload.get("drop_reason") or "")[:2000] or None,
+        ))
+        db.commit()
+    except Exception as exc:
+        print(f"DB error: {exc}")
+    finally:
+        db.close()
+
+
 async def _send_group_reply_candidate(session_id: str, trigger: dict, decision: dict) -> dict:
     sid = normalize_session_id(session_id)
     group_id = group_id_from_session_id(sid)
     send_key = f"{str(trigger.get('trigger_id') or 'group_reply')}:group_send"
-    item_type, content = _group_candidate_send_item(decision)
+    send_items = _group_candidate_send_items(decision)
+    item_type, content = send_items[0] if send_items else (SendItemType.TEXT.value, "")
     reply_to_message_id = str(decision.get("reply_to_message_id") or "").strip() or None
-    if not content:
+    expected_buffer_version = _group_trigger_expected_buffer_version(trigger)
+    audit_base = _group_send_audit_payload(
+        send_key=send_key,
+        trigger=trigger,
+        decision=decision,
+        expected_buffer_version=expected_buffer_version,
+        send_count=len(send_items),
+    )
+    if trigger.get("require_current_buffer_version") and expected_buffer_version is not None:
+        current_buffer_version = int(group_chat_buffer.status(sid).get("buffer_version") or 0)
+        if current_buffer_version != expected_buffer_version:
+            result = {
+                "status": "skipped",
+                "reason": "stale_group_buffer_changed",
+                "session_id": sid,
+                "group_id": group_id,
+                "send_key": send_key,
+                "expected_buffer_version": expected_buffer_version,
+                "current_buffer_version": current_buffer_version,
+            }
+            _record_onebot_group_send(
+                sid,
+                send_key,
+                group_id,
+                item_type,
+                content,
+                None,
+                result["status"],
+                result["reason"],
+                reply_to_message_id,
+                send_count=len(send_items),
+                audit={**audit_base, "drop_reason": result["reason"], "current_buffer_version": current_buffer_version},
+            )
+            _record_group_send_chain_audit(
+                sid,
+                send_key=send_key,
+                trigger=trigger,
+                decision=decision,
+                send_result=result,
+                expected_buffer_version=expected_buffer_version,
+            )
+            return result
+    if not send_items:
         result = {
             "status": "skipped",
             "reason": "empty_group_candidate",
             "session_id": sid,
             "send_key": send_key,
         }
-        _record_onebot_group_send(sid, send_key, group_id, item_type, content, None, result["status"], result["reason"], reply_to_message_id)
+        _record_onebot_group_send(
+            sid,
+            send_key,
+            group_id,
+            item_type,
+            content,
+            None,
+            result["status"],
+            result["reason"],
+            reply_to_message_id,
+            send_count=0,
+            audit={**audit_base, "drop_reason": result["reason"]},
+        )
+        _record_group_send_chain_audit(
+            sid,
+            send_key=send_key,
+            trigger=trigger,
+            decision=decision,
+            send_result=result,
+            expected_buffer_version=expected_buffer_version,
+        )
         return result
 
     known_window = group_chat_buffer.get_model_window(sid, limit=50)
@@ -2936,6 +3175,193 @@ async def _send_group_reply_candidate(session_id: str, trigger: dict, decision: 
         known_window,
         extra_message_ids=[trigger.get("source_message_id"), trigger.get("reply_to_message_id"), reply_to_message_id],
     )
+    limiter = _refresh_group_send_limiter()
+    item_results = []
+    for index, (item_type, content) in enumerate(send_items):
+        item_send_key = send_key if len(send_items) == 1 else f"{send_key}:{index + 1}"
+        item_result = await _send_one_group_candidate_item(
+            sid=sid,
+            group_id=group_id,
+            send_key=item_send_key,
+            item_type=item_type,
+            content=content,
+            reply_to_message_id=reply_to_message_id,
+            trigger_reason=str(trigger.get("reason") or ""),
+            known_qids=known_qids,
+            known_message_ids=known_message_ids,
+            limiter=limiter,
+            enforce_limiter=(index == 0),
+            send_index=index,
+            send_count=len(send_items),
+            audit={
+                **audit_base,
+                "send_index": index,
+                "send_count": len(send_items),
+                "item_type": item_type,
+            },
+        )
+        item_results.append(item_result)
+
+    sent_items = [item for item in item_results if item.get("status") == "sent"]
+    error_items = [item for item in item_results if item.get("status") == "error"]
+    if sent_items:
+        status = "sent"
+        reason = None
+    elif error_items:
+        status = "error"
+        reason = error_items[0].get("reason") or "onebot_group_send_error"
+    else:
+        status = "skipped"
+        reason = item_results[0].get("reason") if item_results else "empty_group_candidate"
+
+    result = {
+        "status": status,
+        "reason": reason,
+        "session_id": sid,
+        "group_id": group_id,
+        "send_key": send_key,
+        "items": item_results,
+        "onebot_message_id": sent_items[-1].get("onebot_message_id") if sent_items else None,
+        "sent_count": len(sent_items),
+        "total_count": len(send_items),
+    }
+    _apply_group_active_message_setting_side_effect_after_send(sid, trigger, decision, result)
+    _record_group_send_chain_audit(
+        sid,
+        send_key=send_key,
+        trigger=trigger,
+        decision=decision,
+        send_result=result,
+        expected_buffer_version=expected_buffer_version,
+    )
+    await _emit_state({"result": "group_reply_send", **result})
+    return result
+
+
+def _group_trigger_expected_buffer_version(trigger: dict) -> Optional[int]:
+    for key in ("source_buffer_version", "request_buffer_version"):
+        value = trigger.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _group_decision_active_message_setting(decision: dict) -> Optional[dict]:
+    if not isinstance(decision, dict):
+        return None
+    side_effects = decision.get("side_effects")
+    if not isinstance(side_effects, dict):
+        return None
+    setting = side_effects.get("active_message_setting")
+    return setting if isinstance(setting, dict) else None
+
+
+def _apply_group_active_message_setting_side_effect_after_send(
+    session_id: str,
+    trigger: dict,
+    decision: dict,
+    send_result: dict,
+):
+    setting = _group_decision_active_message_setting(decision)
+    if not setting:
+        return
+
+    payload = {
+        "active_schedule_marker_detected": True,
+        "active_message_setting": setting,
+        "sent_item_count": int(send_result.get("sent_count") or 0),
+        "visibility": "internal_debug_only",
+        "applied_after_visible_send": bool(send_result.get("status") == "sent" and send_result.get("sent_count")),
+        "send_result": send_result,
+        "trigger": trigger,
+    }
+    if send_result.get("status") != "sent" or not send_result.get("sent_count"):
+        _record_group_active_message_setting_side_effect(session_id, decision, "skipped", {**payload, "reason": "no_visible_send"})
+        return
+
+    allowed, reason = _group_active_message_setting_side_effect_allowed(session_id)
+    if not allowed:
+        _record_group_active_message_setting_side_effect(session_id, decision, "skipped", {**payload, "reason": reason})
+        return
+
+    try:
+        success, response_text = _apply_active_message_setting(session_id, setting)
+    except Exception as exc:  # noqa: BLE001
+        _record_group_active_message_setting_side_effect(
+            session_id,
+            decision,
+            "error",
+            {**payload, "active_schedule_applied": False, "reason": "apply_exception", "error": str(exc)[:500]},
+        )
+        return
+
+    _record_group_active_message_setting_side_effect(
+        session_id,
+        decision,
+        "applied" if success else "error",
+        {
+            **payload,
+            "active_schedule_applied": success,
+            "response_text": response_text,
+            "reason": "applied" if success else "apply_failed",
+        },
+    )
+
+
+def _group_active_message_setting_side_effect_allowed(session_id: str) -> tuple[bool, str]:
+    for entry in reversed(group_chat_buffer.get_window(session_id, limit=5)):
+        text = str(entry.get("text") or "").strip()
+        if looks_like_active_message_setting_request(text):
+            return True, "recent_group_message_requested_active_message_setting"
+    return False, "recent_group_messages_did_not_request_active_message_setting"
+
+
+def _record_group_active_message_setting_side_effect(
+    session_id: str,
+    decision: dict,
+    status: str,
+    payload: dict,
+):
+    db = next(get_db())
+    try:
+        log = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id=normalize_session_id(session_id),
+            event_type="group_active_message.setting_side_effect",
+            raw_payload=_json_dumps(payload),
+            parsed_payload=_json_dumps(decision),
+            action=str(decision.get("action") or ""),
+            status=status,
+        )
+        db.add(log)
+        db.commit()
+    except Exception as exc:
+        print(f"DB error: {exc}")
+    finally:
+        db.close()
+
+
+async def _send_one_group_candidate_item(
+    *,
+    sid: str,
+    group_id: str,
+    send_key: str,
+    item_type: str,
+    content: str,
+    reply_to_message_id: Optional[str],
+    trigger_reason: str,
+    known_qids: list[str],
+    known_message_ids: list[str],
+    limiter: GroupSendLimiter,
+    enforce_limiter: bool,
+    send_index: Optional[int] = None,
+    send_count: Optional[int] = None,
+    audit: Optional[dict] = None,
+) -> dict:
     if item_type == SendItemType.TEXT.value:
         safety = classify_group_visible_text(
             content,
@@ -2949,20 +3375,51 @@ async def _send_group_reply_candidate(session_id: str, trigger: dict, decision: 
                 "session_id": sid,
                 "group_id": group_id,
                 "send_key": send_key,
+                "item_type": item_type,
+                "content": content,
                 "safety": safety.__dict__,
+                "visible_history_commit": {"committed": False, "reason": safety.reason or "unsafe_group_visible_text"},
             }
-            _record_onebot_group_send(sid, send_key, group_id, item_type, content, None, result["status"], result["reason"], reply_to_message_id)
-            await _emit_state({"result": "group_reply_send", **result})
+            _record_onebot_group_send(
+                sid,
+                send_key,
+                group_id,
+                item_type,
+                content,
+                None,
+                result["status"],
+                result["reason"],
+                reply_to_message_id,
+                send_index=send_index,
+                send_count=send_count,
+                audit={**(audit or {}), "drop_reason": result["reason"]},
+            )
             return result
 
-    limiter = _refresh_group_send_limiter()
-    gate = limiter.evaluate(
-        sid,
-        item_type=item_type,
-        content=content,
-        reply_to_message_id=reply_to_message_id,
-        trigger_reason=str(trigger.get("reason") or ""),
-    )
+    if enforce_limiter:
+        gate = limiter.evaluate(
+            sid,
+            item_type=item_type,
+            content=content,
+            reply_to_message_id=reply_to_message_id,
+            trigger_reason=trigger_reason,
+        )
+    else:
+        policy = evaluate_group_send_policy(
+            limiter.config,
+            sid,
+            trigger_reason=trigger_reason,
+            item_type=item_type,
+        )
+        gate = {
+            "ok": bool(policy.get("ok")),
+            "reason": policy.get("reason"),
+            "session_id": sid,
+            "group_id": policy.get("group_id") or group_id,
+            "config": limiter.config,
+            "policy": policy,
+            "same_candidate_sequence": True,
+        }
     group_id = str(gate.get("group_id") or group_id)
     if not gate.get("ok"):
         result = {
@@ -2971,10 +3428,25 @@ async def _send_group_reply_candidate(session_id: str, trigger: dict, decision: 
             "session_id": sid,
             "group_id": group_id,
             "send_key": send_key,
+            "item_type": item_type,
+            "content": content,
             "gate": gate,
+            "visible_history_commit": {"committed": False, "reason": gate.get("reason") or "group_send_blocked"},
         }
-        _record_onebot_group_send(sid, send_key, group_id, item_type, content, None, result["status"], result["reason"], reply_to_message_id)
-        await _emit_state({"result": "group_reply_send", **result})
+        _record_onebot_group_send(
+            sid,
+            send_key,
+            group_id,
+            item_type,
+            content,
+            None,
+            result["status"],
+            result["reason"],
+            reply_to_message_id,
+            send_index=send_index,
+            send_count=send_count,
+            audit={**(audit or {}), "drop_reason": result["reason"], "send_gate": gate},
+        )
         return result
 
     try:
@@ -2988,9 +3460,24 @@ async def _send_group_reply_candidate(session_id: str, trigger: dict, decision: 
                     "session_id": sid,
                     "group_id": group_id,
                     "send_key": send_key,
+                    "item_type": item_type,
+                    "content": content,
+                    "visible_history_commit": {"committed": False, "reason": "meme_not_found"},
                 }
-                _record_onebot_group_send(sid, send_key, group_id, item_type, content, None, result["status"], result["reason"], reply_to_message_id)
-                await _emit_state({"result": "group_reply_send", **result})
+                _record_onebot_group_send(
+                    sid,
+                    send_key,
+                    group_id,
+                    item_type,
+                    content,
+                    None,
+                    result["status"],
+                    result["reason"],
+                    reply_to_message_id,
+                    send_index=send_index,
+                    send_count=send_count,
+                    audit={**(audit or {}), "drop_reason": result["reason"]},
+                )
                 return result
             response = await onebot_manager.send_group_image(
                 group_id,
@@ -3021,11 +3508,30 @@ async def _send_group_reply_candidate(session_id: str, trigger: dict, decision: 
             "session_id": sid,
             "group_id": group_id,
             "send_key": send_key,
+            "item_type": item_type,
+            "content": content,
             "onebot_message_id": _onebot_response_message_id(response),
             "gate": gate,
+            "visible_history_commit": {
+                "committed": True,
+                "event_type": _group_visible_event_type_for_item(item_type),
+                "action": _group_visible_action_for_send(send_key, audit),
+            },
         }
-        _record_onebot_group_send(sid, send_key, group_id, item_type, content, response, result["status"], None, reply_to_message_id)
-        await _emit_state({"result": "group_reply_send", **result})
+        _record_onebot_group_send(
+            sid,
+            send_key,
+            group_id,
+            item_type,
+            content,
+            response,
+            result["status"],
+            None,
+            reply_to_message_id,
+            send_index=send_index,
+            send_count=send_count,
+            audit={**(audit or {}), "send_gate": gate},
+        )
         return result
     except Exception as exc:
         result = {
@@ -3034,25 +3540,63 @@ async def _send_group_reply_candidate(session_id: str, trigger: dict, decision: 
             "session_id": sid,
             "group_id": group_id,
             "send_key": send_key,
+            "item_type": item_type,
+            "content": content,
             "error_message": str(exc),
             "gate": gate,
+            "visible_history_commit": {"committed": False, "reason": "onebot_group_send_error"},
         }
-        _record_onebot_group_send(sid, send_key, group_id, item_type, content, None, result["status"], str(exc), reply_to_message_id)
-        await _emit_state({"result": "group_reply_send", **result})
+        _record_onebot_group_send(
+            sid,
+            send_key,
+            group_id,
+            item_type,
+            content,
+            None,
+            result["status"],
+            str(exc),
+            reply_to_message_id,
+            send_index=send_index,
+            send_count=send_count,
+            audit={**(audit or {}), "drop_reason": result["reason"], "send_gate": gate},
+        )
         return result
 
 
-def _group_candidate_send_item(decision: dict) -> tuple[str, str]:
+def _group_candidate_send_items(decision: dict) -> list[tuple[str, str]]:
     item_type = str(decision.get("item_type") or SendItemType.TEXT.value).strip().lower()
     content = str(decision.get("content") or decision.get("final_text") or "").strip()
     items = decision.get("items")
+    result: list[tuple[str, str]] = []
     if isinstance(items, list) and items:
-        first = items[0] if isinstance(items[0], dict) else {}
-        item_type = str(first.get("type") or item_type).strip().lower()
-        content = str(first.get("content") or first.get("text") or content).strip()
+        for raw_item in items:
+            first = raw_item if isinstance(raw_item, dict) else {}
+            candidate_type = str(first.get("type") or "").strip().lower()
+            if "search_meme" in first or candidate_type == SendItemType.SEARCH_MEME.value:
+                continue
+            if "meme" in first:
+                value = str(first.get("meme") or "").strip()
+                if value:
+                    result.append((SendItemType.MEME.value, value))
+                continue
+            if "text" in first:
+                value = str(first.get("text") or "").strip()
+                if value:
+                    result.append((SendItemType.TEXT.value, value))
+                continue
+            if candidate_type:
+                value = str(first.get("content") or "").strip()
+                if value:
+                    result.append((candidate_type, value))
+        return result
     if content.startswith("meme:") or content.startswith(":meme:"):
         item_type = SendItemType.MEME.value
-    return item_type or SendItemType.TEXT.value, content
+    return [(item_type or SendItemType.TEXT.value, content)] if content else []
+
+
+def _group_candidate_send_item(decision: dict) -> tuple[str, str]:
+    items = _group_candidate_send_items(decision)
+    return items[0] if items else (SendItemType.TEXT.value, "")
 
 
 def _meme_stem_from_group_content(content: str) -> str:
@@ -3121,6 +3665,8 @@ async def _run_group_reply_decision(session_id: str, trigger: dict, model_window
         model_window=named_window,
     )
     known_qids = known_qids_from_group_window(enhanced_window, qid_to_nickname=qid_to_nickname)
+    group_context_checkpoint = latest_context_checkpoint_for_session(sid) or {}
+    group_context_checkpoint_text = str(group_context_checkpoint.get("checkpoint_text") or "").strip()
     messages = build_group_chat_messages(
         group_window=enhanced_window,
         trigger={
@@ -3129,8 +3675,18 @@ async def _run_group_reply_decision(session_id: str, trigger: dict, model_window
         },
         qid_to_nickname=qid_to_nickname,
         group_memory=group_memory_context,
+        group_context_checkpoint_text=group_context_checkpoint_text,
+        group_soul=_read_group_soul(),
         current_time=current_time,
         send_enabled=bool(send_policy.get("ok")),
+    )
+    _record_group_prompt_cache_debug(
+        sid,
+        messages=messages,
+        trigger=trigger,
+        buffer_version=trigger.get("request_buffer_version"),
+        context_checkpoint=group_context_checkpoint,
+        llm_debug=llm.get_cache_debug(),
     )
     known_message_ids = known_message_ids_from_group_window(
         enhanced_window,
@@ -3139,31 +3695,55 @@ async def _run_group_reply_decision(session_id: str, trigger: dict, model_window
     raw_output = ""
     await _emit_llm_started({"session_id": sid})
     try:
-        raw_output = await llm.chat_completion(messages=messages, temperature=0.8, max_tokens=160)
-        parsed = parse_group_chat_output(
-            raw_output,
+        raw_output = await llm.chat_completion(messages=messages, temperature=0.8, max_tokens=180)
+        parsed, repair_debug = await _parse_group_chat_output_with_repair(
+            llm=llm,
+            base_messages=messages,
+            raw_output=raw_output,
             known_qids=known_qids,
             known_message_ids=known_message_ids,
         )
-        final_text = parsed.decision.text_bubbles()[0] if parsed.should_send else None
+        if parsed.ok:
+            resolved_decision, meme_selector_debug = await _resolve_group_meme_items(
+                llm=llm,
+                base_messages=messages,
+                decision=parsed.decision,
+                allow_meme_send=bool((send_policy.get("policy") or {}).get("allow_meme_send")),
+            )
+        else:
+            resolved_decision = parsed.decision
+            meme_selector_debug = {"attempted": False, "results": []}
+        should_send = _group_decision_should_send(resolved_decision)
+        text_bubbles = resolved_decision.text_bubbles()
+        final_text = text_bubbles[0] if should_send and text_bubbles else None
         reply_to_message_id = _select_group_reply_target(
             trigger=trigger,
             model_window=enhanced_window,
-            should_send=parsed.should_send,
+            should_send=should_send,
         )
-        status = "candidate_ready_not_sent" if parsed.should_send else ("guarded" if parsed.errors else "wait")
+        status = (
+            "candidate_ready_not_sent"
+            if should_send
+            else ("guarded" if parsed.errors else "wait")
+        )
         result = {
             "status": status,
-            "action": parsed.decision.action.value,
-            "should_send_candidate": parsed.should_send,
+            "action": resolved_decision.action.value,
+            "should_send_candidate": should_send,
             "send_layer_enabled": True,
             "send_config_enabled": send_config["enabled"],
             "group_whitelisted": group_id in set(send_config["allowed_group_ids"]),
             "send_policy": send_policy,
             "final_text": final_text,
+            "items": [item.to_harness_item() for item in resolved_decision.all_items()],
             "reply_to_message_id": reply_to_message_id,
             "image_understanding": image_debug,
             "parse_status": parsed.status,
+            "parsed_items": [item.to_harness_item() for item in parsed.decision.all_items()],
+            "side_effects": resolved_decision.side_effects,
+            "meme_selector": meme_selector_debug,
+            "repair": repair_debug,
+            "context_checkpoint": _checkpoint_debug_summary(group_context_checkpoint),
             "safety_reason": parsed.safety.reason,
             "errors": parsed.errors,
             "llm_debug": llm.get_cache_debug(),
@@ -3189,6 +3769,7 @@ async def _run_group_reply_decision(session_id: str, trigger: dict, model_window
             "reply_to_message_id": None,
             "image_understanding": image_debug,
             "parse_status": "error",
+            "context_checkpoint": _checkpoint_debug_summary(group_context_checkpoint),
             "safety_reason": None,
             "errors": [str(exc)],
             "llm_debug": llm.get_cache_debug(),
@@ -3204,6 +3785,223 @@ async def _run_group_reply_decision(session_id: str, trigger: dict, model_window
         return result
     finally:
         await _emit_llm_finished({"session_id": sid}, reason="group_reply_decision_finished")
+
+
+async def _parse_group_chat_output_with_repair(
+    *,
+    llm,
+    base_messages: list,
+    raw_output: str,
+    known_qids: list[str],
+    known_message_ids: list[str],
+):
+    parsed = parse_group_chat_output(
+        raw_output,
+        known_qids=known_qids,
+        known_message_ids=known_message_ids,
+    )
+    repair_debug = {
+        "attempted": False,
+        "status": None,
+        "raw_output": None,
+        "errors": [],
+    }
+    if parsed.ok or not (raw_output or "").strip():
+        return parsed, repair_debug
+
+    repair_debug["attempted"] = True
+    repair_messages = build_group_chat_repair_messages(
+        base_messages=base_messages,
+        errors=parsed.errors,
+        original_raw=raw_output,
+        original_decision=parsed.decision,
+    )
+    try:
+        repaired_raw = await llm.chat_completion(messages=repair_messages, temperature=0.6, max_tokens=180)
+    except Exception as exc:
+        repair_debug["status"] = "repair_error"
+        repair_debug["errors"] = [str(exc)]
+        return parsed, repair_debug
+
+    repaired = parse_group_chat_output(
+        repaired_raw,
+        known_qids=known_qids,
+        known_message_ids=known_message_ids,
+    )
+    repair_debug["raw_output"] = repaired_raw
+    repair_debug["status"] = "repair_ok" if repaired.ok else "repair_failed"
+    repair_debug["errors"] = repaired.errors
+    return repaired, repair_debug
+
+
+def _group_decision_should_send(decision: ActionDecision) -> bool:
+    if decision.action not in (Action.REPLY, Action.LIGHT_ACK, Action.REACT):
+        return False
+    return any(item.type != SendItemType.SEARCH_MEME for item in decision.all_items())
+
+
+async def _resolve_group_meme_items(
+    *,
+    llm,
+    base_messages: list,
+    decision: ActionDecision,
+    allow_meme_send: bool,
+) -> tuple[ActionDecision, dict]:
+    debug = {
+        "attempted": False,
+        "allow_meme_send": bool(allow_meme_send),
+        "results": [],
+    }
+    items = decision.all_items()
+    if not items:
+        return decision, debug
+
+    resolved_items: list[SendItem] = []
+    changed = False
+    for item in items:
+        if item.type != SendItemType.SEARCH_MEME:
+            resolved_items.append(item)
+            continue
+
+        changed = True
+        if not allow_meme_send:
+            debug["results"].append({
+                "request": item.harness_value(),
+                "status": "disabled_by_group_policy",
+            })
+            continue
+
+        debug["attempted"] = True
+        resolved, item_debug = await _resolve_group_search_meme_item(
+            llm=llm,
+            base_messages=base_messages,
+            item=item,
+        )
+        debug["results"].append(item_debug)
+        if resolved:
+            resolved_items.append(resolved)
+
+    if not changed:
+        return decision, debug
+    if not resolved_items:
+        return ActionDecision(action=Action.WAIT, items=None, side_effects=decision.side_effects), debug
+    action = Action.REACT if any(item.type != SendItemType.TEXT for item in resolved_items) else Action.REPLY
+    return ActionDecision(action=action, items=resolved_items, side_effects=decision.side_effects), debug
+
+
+async def _resolve_group_search_meme_item(*, llm, base_messages: list, item: SendItem) -> tuple[Optional[SendItem], dict]:
+    request_text = item.harness_value()
+    parsed = group_meme_renderer.parse_react_text(item.content)
+    category = parsed.get("category", "")
+    keywords = parsed.get("keywords", "")
+    candidates = group_meme_search.search(category, keywords, top_k=5)
+    search_results = [{
+        "request": request_text,
+        "category": category,
+        "keywords": keywords,
+        "candidates": candidates,
+    }]
+    debug = {
+        "request": request_text,
+        "category": category,
+        "keywords": keywords,
+        "candidates": candidates,
+        "status": None,
+        "selected": None,
+        "raw_output": None,
+    }
+    if not candidates:
+        debug["status"] = "no_candidates"
+        return None, debug
+
+    messages = build_meme_search_messages(base_messages=base_messages, search_results=search_results)
+    try:
+        raw_output = await llm.chat_completion(messages=messages, temperature=0.6, max_tokens=80)
+    except Exception as exc:
+        debug["status"] = "selector_error"
+        debug["error"] = str(exc)
+        return None, debug
+
+    debug["raw_output"] = raw_output
+    selected = parse_meme_selection_output(raw_output, set(candidates))
+    if selected and group_meme_renderer.render_meme(selected):
+        debug["status"] = "hit"
+    else:
+        selected = _first_renderable_group_meme_candidate(candidates)
+        debug["status"] = "fallback" if selected else "miss"
+
+    if not selected:
+        return None, debug
+
+    debug["selected"] = selected
+    return SendItem(type=SendItemType.MEME, content=selected), debug
+
+
+def _first_renderable_group_meme_candidate(candidates: list[str]) -> Optional[str]:
+    for stem in candidates:
+        if group_meme_renderer.render_meme(stem):
+            return stem
+    return None
+
+
+def _checkpoint_debug_summary(checkpoint: Optional[dict]) -> dict:
+    if not isinstance(checkpoint, dict) or not checkpoint.get("id"):
+        return {"loaded": False}
+    text = str(checkpoint.get("checkpoint_text") or "")
+    return {
+        "loaded": bool(text.strip()),
+        "id": checkpoint.get("id"),
+        "covered_until_event_id": checkpoint.get("covered_until_event_id"),
+        "source_prompt_debug_id": checkpoint.get("source_prompt_debug_id"),
+        "estimated_tokens_before": checkpoint.get("estimated_tokens_before"),
+        "prompt_tokens_before": checkpoint.get("prompt_tokens_before"),
+        "created_at": checkpoint.get("created_at"),
+        "text_chars": len(text),
+    }
+
+
+def _record_group_prompt_cache_debug(
+    session_id: str,
+    *,
+    messages: list,
+    trigger: dict,
+    buffer_version=None,
+    context_checkpoint: Optional[dict] = None,
+    llm_debug: Optional[dict] = None,
+):
+    serialized = _json_dumps(messages or [])
+    estimated_tokens = max(1, len(serialized) // 4)
+    payload = {
+        "scope": "group",
+        "prompt_kind": "group_chat_decision",
+        "estimated_tokens": estimated_tokens,
+        "estimated_prompt_tokens": estimated_tokens,
+        "message_count": len(messages or []),
+        "role_sequence": [str(item.get("role") or "") for item in (messages or []) if isinstance(item, dict)],
+        "serialized_chars": len(serialized),
+        "trigger_reason": str((trigger or {}).get("reason") or ""),
+        "group_context_checkpoint": _checkpoint_debug_summary(context_checkpoint),
+        "bounded_window": True,
+        "llm_cache_debug": llm_debug or {},
+    }
+    db = next(get_db())
+    try:
+        log = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id=session_id,
+            event_type="prompt_cache_debug",
+            platform="qq_group",
+            raw_payload=_json_dumps(payload),
+            buffer_version=_safe_int(buffer_version),
+            job_id=str((trigger or {}).get("trigger_id") or ""),
+            status="debug",
+        )
+        db.add(log)
+        db.commit()
+    except Exception as exc:
+        print(f"DB error: {exc}")
+    finally:
+        db.close()
 
 
 def _record_group_reply_decision_log(
@@ -3783,6 +4581,273 @@ async def _send_active_message_fixed_text(
     return result
 
 
+def _group_active_buffer_version(session_id: str) -> int:
+    try:
+        return int(group_chat_buffer.status(session_id).get("buffer_version") or 0)
+    except Exception:
+        return 0
+
+
+def _group_active_decision_payload(decision: ActionDecision) -> dict:
+    items = []
+    for item in decision.all_items():
+        if item.type == SendItemType.TEXT:
+            items.append({"text": item.content})
+        elif item.type == SendItemType.EMOJI:
+            value = item.harness_value()
+            if value:
+                items.append({"text": value})
+    text_bubbles = [str(item.get("text") or "").strip() for item in items if str(item.get("text") or "").strip()]
+    return {
+        "should_send_candidate": bool(text_bubbles),
+        "action": decision.action.value,
+        "items": items,
+        "final_text": text_bubbles[0] if text_bubbles else None,
+        "side_effects": decision.side_effects,
+    }
+
+
+async def _send_group_active_message_fixed_text(
+    *,
+    sid: str,
+    start_buffer_version: int,
+    text: str,
+    raw_output: str,
+    due_status: dict,
+    clear_next: bool = False,
+    extra_result: Optional[dict] = None,
+) -> dict:
+    decision_payload = {
+        "should_send_candidate": True,
+        "action": Action.REPLY.value,
+        "items": [{"text": text}],
+        "final_text": text,
+    }
+    trigger = {
+        "trigger_id": f"group_active_{uuid.uuid4().hex[:8]}",
+        "reason": "active_message",
+        "source": "active_message",
+        "source_buffer_version": start_buffer_version,
+        "request_buffer_version": start_buffer_version,
+        "require_current_buffer_version": True,
+    }
+    send_result = await _send_group_reply_candidate(sid, trigger, decision_payload)
+    _record_group_active_message(
+        sid,
+        trigger_id=str(trigger["trigger_id"]),
+        raw_output=raw_output,
+        decision_payload=decision_payload,
+        send_result=send_result,
+        due_status=due_status,
+    )
+    result = {
+        "status": send_result.get("status"),
+        "reason": send_result.get("reason"),
+        "action": Action.REPLY.value,
+        "schedule": due_status,
+        "send": send_result,
+    }
+    if extra_result:
+        result.update(extra_result)
+    if send_result.get("status") == "sent" and clear_next and not _clear_active_message_next_time(sid):
+        result["next_clear_error"] = "failed_to_clear_next_active_time"
+    return result
+
+
+async def _run_group_active_message_once(
+    manual: bool = False,
+    session_id: Optional[str] = None,
+    scheduled_source: Optional[str] = None,
+    scheduled_time: Optional[str] = None,
+) -> dict:
+    sid = normalize_session_id(session_id or "")
+    if not _is_group_session_id(sid):
+        return {"status": "skipped", "reason": "not_group_session"}
+
+    config = _normalize_active_message_config(load_settings().get("active_message"))
+    now = datetime.now()
+    if not config["enabled"]:
+        return {"status": "skipped", "reason": "disabled"}
+
+    due_status = {"due": True, "source": "manual", "time": now.strftime("%H:%M")}
+    if not manual:
+        due_status = _active_message_scheduled_status(
+            config=config,
+            session_id=sid,
+            source=scheduled_source or "global",
+            scheduled_time=scheduled_time,
+        )
+        if due_status.get("source") == "global":
+            return {"status": "skipped", "reason": "group_global_default_disabled", "schedule": due_status}
+        if not due_status["due"]:
+            return {"status": "skipped", "reason": due_status["reason"], "schedule": due_status}
+
+    if _active_messages_sent_today(sid) >= config["daily_limit"]:
+        return {"status": "skipped", "reason": "daily_limit"}
+    if _has_unanswered_active_message(sid):
+        return {"status": "skipped", "reason": "unanswered_backoff"}
+
+    start_buffer_version = _group_active_buffer_version(sid)
+    topics = group_memory_manager.read_tomorrow_topics(sid)
+    topics, expired_count = expire_stale_candidates(topics)
+    if expired_count and not group_memory_manager.write_tomorrow_topics(sid, topics):
+        return {"status": "error", "reason": "failed_to_expire_candidates"}
+
+    candidate = select_pending_candidate(topics)
+    if not candidate:
+        if due_status.get("source") == "next":
+            return await _send_group_active_message_fixed_text(
+                sid=sid,
+                start_buffer_version=start_buffer_version,
+                text=GROUP_ACTIVE_MESSAGE_NEXT_FALLBACK_TEXT,
+                raw_output="system:group_next_active_at_without_candidate",
+                due_status=due_status,
+                clear_next=True,
+                extra_result={"fallback_reason": "no_candidate"},
+            )
+        return {"status": "skipped", "reason": "no_candidate", "schedule": due_status}
+
+    active_llm = _group_internal_llm_for_session(sid)
+    if not getattr(active_llm, "api_key", ""):
+        return {"status": "skipped", "reason": "llm_not_configured", "schedule": due_status}
+
+    qid_to_nickname = group_memory_manager.qid_to_nickname(sid)
+    group_window = group_chat_buffer.get_model_window(sid, qid_to_nickname=qid_to_nickname, limit=20)
+    messages = build_group_active_message_messages(
+        candidate_section=candidate.section,
+        candidate_text=candidate.text,
+        group_soul=_read_group_soul(),
+        group_memory=group_memory_manager.prompt_context(sid),
+        group_window=group_window,
+        current_time=now.strftime("%Y-%m-%d %H:%M"),
+    )
+    is_next_schedule = due_status.get("source") == "next"
+    max_llm_attempts = 1 + (ACTIVE_MESSAGE_NEXT_LLM_RETRY_COUNT if is_next_schedule else 0)
+    target = {"session_id": sid}
+    llm_started = False
+    raw_output = None
+    last_llm_error = None
+    try:
+        await _emit_llm_started(target)
+        llm_started = True
+        for attempt_index in range(max_llm_attempts):
+            if attempt_index > 0:
+                await _active_message_next_retry_sleep()
+            if _group_active_buffer_version(sid) != start_buffer_version:
+                return {
+                    "status": "skipped",
+                    "reason": "stale_dropped",
+                    "schedule": due_status,
+                    "llm_attempts": attempt_index,
+                }
+            try:
+                raw_output = await active_llm.chat_completion(messages=messages, temperature=0.3)
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_llm_error = exc
+                if not is_next_schedule:
+                    raise
+        if raw_output is None:
+            if is_next_schedule:
+                if _group_active_buffer_version(sid) != start_buffer_version:
+                    return {
+                        "status": "skipped",
+                        "reason": "stale_dropped",
+                        "schedule": due_status,
+                        "llm_attempts": max_llm_attempts,
+                    }
+                return await _send_group_active_message_fixed_text(
+                    sid=sid,
+                    start_buffer_version=start_buffer_version,
+                    text=GROUP_ACTIVE_MESSAGE_NEXT_FALLBACK_TEXT,
+                    raw_output=f"system:group_next_active_at_llm_retry_exhausted:{last_llm_error or 'unknown error'}",
+                    due_status=due_status,
+                    clear_next=True,
+                    extra_result={
+                        "fallback_reason": "llm_retry_exhausted",
+                        "llm_attempts": max_llm_attempts,
+                    },
+                )
+            raise last_llm_error or RuntimeError("group active message LLM call failed")
+
+        decision = parse_active_decision(raw_output)
+        if _group_active_buffer_version(sid) != start_buffer_version:
+            return {"status": "skipped", "reason": "stale_dropped", "schedule": due_status}
+
+        if decision.action == Action.WAIT:
+            if not group_memory_manager.write_tomorrow_topics(
+                sid,
+                mark_candidate_status(group_memory_manager.read_tomorrow_topics(sid), candidate, "blocked"),
+            ):
+                return {"status": "error", "reason": "failed_to_block_candidate", "schedule": due_status}
+            _record_group_active_message(
+                sid,
+                trigger_id=f"group_active_{uuid.uuid4().hex[:8]}",
+                raw_output=raw_output,
+                decision_payload=decision.to_harness_payload(exclude_none=True),
+                send_result={"status": "skipped", "reason": "llm_wait"},
+                due_status=due_status,
+            )
+            return {"status": "skipped", "reason": "llm_wait", "schedule": due_status}
+
+        decision_payload = _group_active_decision_payload(decision)
+        if not decision_payload["should_send_candidate"]:
+            _record_group_active_message(
+                sid,
+                trigger_id=f"group_active_{uuid.uuid4().hex[:8]}",
+                raw_output=raw_output,
+                decision_payload=decision.to_harness_payload(exclude_none=True),
+                send_result={"status": "skipped", "reason": "not_visible"},
+                due_status=due_status,
+            )
+            return {"status": "skipped", "reason": "not_visible", "schedule": due_status}
+
+        trigger = {
+            "trigger_id": f"group_active_{uuid.uuid4().hex[:8]}",
+            "reason": "active_message",
+            "source": "active_message",
+            "source_buffer_version": start_buffer_version,
+            "request_buffer_version": start_buffer_version,
+            "require_current_buffer_version": True,
+        }
+        send_result = await _send_group_reply_candidate(sid, trigger, decision_payload)
+        _record_group_active_message(
+            sid,
+            trigger_id=str(trigger["trigger_id"]),
+            raw_output=raw_output,
+            decision_payload=decision_payload,
+            send_result=send_result,
+            due_status=due_status,
+        )
+        if send_result.get("status") == "sent":
+            if not group_memory_manager.write_tomorrow_topics(
+                sid,
+                mark_candidate_status(group_memory_manager.read_tomorrow_topics(sid), candidate, "used"),
+            ):
+                return {"status": "error", "reason": "failed_to_mark_used", "send": send_result, "schedule": due_status}
+            result = {
+                "status": "sent",
+                "action": decision.action.value,
+                "candidate_section": candidate.section,
+                "schedule": due_status,
+                "send": send_result,
+            }
+            if due_status.get("source") == "next" and not _clear_active_message_next_time(sid):
+                result["next_clear_error"] = "failed_to_clear_next_active_time"
+            return result
+        return {
+            "status": send_result.get("status") or "skipped",
+            "reason": send_result.get("reason") or "group_active_send_not_sent",
+            "schedule": due_status,
+            "send": send_result,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "reason": str(exc), "schedule": due_status}
+    finally:
+        if llm_started:
+            await _emit_llm_finished(target, reason="group_active_message_finished")
+
+
 async def run_active_message_once(
     manual: bool = False,
     session_id: Optional[str] = None,
@@ -3795,7 +4860,12 @@ async def run_active_message_once(
     """
     sid = normalize_session_id(session_id or DEFAULT_SESSION_ID)
     if _is_group_session_id(sid):
-        return {"status": "skipped", "reason": "group_readonly_session"}
+        return await _run_group_active_message_once(
+            manual=manual,
+            session_id=sid,
+            scheduled_source=scheduled_source,
+            scheduled_time=scheduled_time,
+        )
     runtime = _runtime_for_session(sid)
     gate = runtime.gate
     graph = runtime.graph
@@ -4072,6 +5142,49 @@ def _record_active_message(session_id: str, job_id: str, raw_output: str, decisi
         db.close()
 
 
+def _record_group_active_message(
+    session_id: str,
+    *,
+    trigger_id: str,
+    raw_output: str,
+    decision_payload: dict,
+    send_result: dict,
+    due_status: dict,
+):
+    db = next(get_db())
+    try:
+        first_item = None
+        items = decision_payload.get("items") if isinstance(decision_payload, dict) else None
+        if isinstance(items, list) and items:
+            first_item = items[0] if isinstance(items[0], dict) else None
+        raw = RawChatLog(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            session_id=normalize_session_id(session_id),
+            event_type="group_active_message",
+            llm_raw_output=raw_output,
+            parsed_payload=_json_dumps(decision_payload),
+            raw_payload=_json_dumps({
+                "trigger_id": trigger_id,
+                "schedule": due_status,
+                "send_result": send_result,
+            }),
+            action=str(decision_payload.get("action") or ""),
+            final_text=str(first_item.get("text") or "") if first_item else None,
+            item_type="text" if first_item else None,
+            send_index=0 if first_item else None,
+            send_count=len(items) if isinstance(items, list) else 0,
+            job_id=trigger_id,
+            status=str(send_result.get("status") or "unknown"),
+            error_message=str(send_result.get("reason") or "") or None,
+        )
+        db.add(raw)
+        db.commit()
+    except Exception as exc:
+        print(f"DB error: {exc}")
+    finally:
+        db.close()
+
+
 def _normalize_active_message_config(config: Optional[dict]) -> dict:
     merged = dict(ACTIVE_MESSAGE_DEFAULTS)
     if isinstance(config, dict):
@@ -4093,8 +5206,6 @@ def _normalize_active_message_sessions(value) -> dict:
     for raw_sid, raw_cfg in value.items():
         sid = normalize_session_id(str(raw_sid or ""))
         if not sid or not isinstance(raw_cfg, dict):
-            continue
-        if _is_group_session_id(sid):
             continue
         cfg = {}
         daily_time = _normalize_hhmm(raw_cfg.get("daily_time"))
@@ -4184,13 +5295,13 @@ def _active_message_monitor_rows(config: dict, now: datetime) -> list[dict]:
     rows = []
     for item in _list_sessions():
         sid = normalize_session_id(item.get("session_id") or DEFAULT_SESSION_ID)
-        if _is_group_session_id(sid):
-            continue
         topics = _read_session_tomorrow_topics(sid)
-        if not _is_non_initial_tomorrow_topics(topics):
+        has_override = _active_message_has_user_override(config, sid)
+        if not has_override and not _is_non_initial_tomorrow_topics(topics):
             continue
         rows.append({
             "session_id": sid,
+            "platform": infer_identity(sid).platform,
             "next_time_to_activate": _active_message_next_activation_time(config, sid, now),
         })
     return sorted(rows, key=lambda row: row["session_id"])
@@ -4468,9 +5579,22 @@ async def update_active_message_config(config: ActiveMessageConfig):
 @router.get("/api/active-message/status")
 async def get_active_message_status(session_id: Optional[str] = Query(None)):
     sid = _session_id_from_query(session_id)
+    config = _normalize_active_message_config(load_settings().get("active_message"))
+    if _is_group_session_id(sid):
+        topics = group_memory_manager.read_tomorrow_topics(sid)
+        return {
+            "session_id": sid,
+            "platform": infer_identity(sid).platform,
+            "config": config,
+            "schedule": _active_message_due_status(config, sid, datetime.now()),
+            "sent_today": _active_messages_sent_today(sid),
+            "has_unanswered_active_message": _has_unanswered_active_message(sid),
+            "candidates": count_candidates_by_status(topics),
+            "gate_ready": None,
+            "group_send": group_send_policy_for_session(_current_group_send_config(), sid),
+        }
     runtime = _runtime_for_session(sid)
     topics = runtime.memory.read_tomorrow_topics()
-    config = _normalize_active_message_config(load_settings().get("active_message"))
     return {
         "session_id": sid,
         "config": config,
@@ -4640,6 +5764,7 @@ async def update_group_chat_config(config_update: GroupChatOpsConfig):
         "allow_roll_reply",
         "allow_repetition",
         "allow_meme_send",
+        "allow_active_message",
         "allow_command_reply",
     }
     policy_updates = {
@@ -4769,6 +5894,7 @@ async def get_status(session_id: Optional[str] = Query(None)):
         group_memory_status = group_memory_manager.status(sid)
         group_repetition_status = group_repetition_detector.status(sid)
         group_activity_status = group_activity_tracker.status(sid)
+        group_context_checkpoint = latest_context_checkpoint_for_session(sid) or {}
         return {
             "session_id": sid,
             "status": "GROUP_CHAT",
@@ -4814,6 +5940,7 @@ async def get_status(session_id: Optional[str] = Query(None)):
             "group_activity": group_activity_status,
             "group_image_cache": group_image_status,
             "group_buffer": {**group_panel, "model_window": model_window},
+            "context_checkpoint": _checkpoint_debug_summary(group_context_checkpoint),
         }
     runtime = _runtime_for_session(sid)
     gate = runtime.gate

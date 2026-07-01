@@ -53,6 +53,64 @@ class FakeGroupLLM:
         return {"client_scope": "internal_session", "cache_affinity_enabled": False}
 
 
+class RepairingGroupLLM:
+    def __init__(self):
+        self.messages = []
+
+    async def chat_completion(self, messages, temperature=0.7, max_tokens=None, stream=False):
+        self.messages.append(messages)
+        if len(self.messages) == 1:
+            return '{"action":"REPLY","items":[{"text":"这个旧 JSON 不能直接发"}]}'
+        return "这个修正版可以发"
+
+    def get_cache_debug(self):
+        return {"client_scope": "internal_session", "cache_affinity_enabled": False}
+
+
+class MemeSelectingGroupLLM:
+    def __init__(self):
+        self.messages = []
+
+    async def chat_completion(self, messages, temperature=0.7, max_tokens=None, stream=False):
+        self.messages.append(messages)
+        if len(self.messages) == 1:
+            return "笑死，这图太会抢班了 &&amused:laugh&&"
+        return ":meme:amused_laugh_001"
+
+    def get_cache_debug(self):
+        return {"client_scope": "internal_session", "cache_affinity_enabled": False}
+
+
+class MemeOnlySelectingGroupLLM:
+    def __init__(self):
+        self.messages = []
+
+    async def chat_completion(self, messages, temperature=0.7, max_tokens=None, stream=False):
+        self.messages.append(messages)
+        if len(self.messages) == 1:
+            return "&&amused:laugh&&"
+        return ":meme:amused_laugh_001"
+
+    def get_cache_debug(self):
+        return {"client_scope": "internal_session", "cache_affinity_enabled": False}
+
+
+class FakeGroupMemeSearch:
+    def search(self, category, keywords, top_k=5):
+        return ["amused_laugh_001"] if category == "amused" else []
+
+
+class FakeGroupMemeRenderer:
+    def parse_react_text(self, text):
+        if text.startswith("search_meme:"):
+            category, keywords = text[len("search_meme:"):].split(":", 1)
+            return {"type": "search_meme", "category": category, "keywords": keywords}
+        return {"type": "text", "value": text}
+
+    def render_meme(self, file_stem):
+        return "/tmp/amused_laugh_001.png" if file_stem == "amused_laugh_001" else None
+
+
 class GroupImageDecisionTest(unittest.TestCase):
     def test_group_decision_injects_image_understanding_and_keeps_image_reply_target(self):
         async def scenario():
@@ -129,6 +187,253 @@ class GroupImageDecisionTest(unittest.TestCase):
             self.assertIn("一只猫趴在键盘旁边", json.dumps(fake_llm.messages[-1], ensure_ascii=False))
             self.assertTrue(result["image_understanding"][0]["media_cache_write"])
             self.assertTrue(any(item[0] == "media" for item in records))
+
+        asyncio.run(scenario())
+
+    def test_group_decision_repairs_invalid_protocol_before_send_candidate(self):
+        async def scenario():
+            fake_llm = RepairingGroupLLM()
+            records = []
+            originals = {
+                "_internal_llm_for_session": routes._internal_llm_for_session,
+                "_record_group_reply_decision_log": routes._record_group_reply_decision_log,
+                "_emit_llm_started": routes._emit_llm_started,
+                "_emit_llm_finished": routes._emit_llm_finished,
+                "load_settings": routes.load_settings,
+            }
+
+            async def noop_async(*_args, **_kwargs):
+                return None
+
+            routes._internal_llm_for_session = lambda _sid: fake_llm
+            routes._record_group_reply_decision_log = lambda sid, **kwargs: records.append(("decision", sid, kwargs))
+            routes._emit_llm_started = noop_async
+            routes._emit_llm_finished = noop_async
+            routes.load_settings = lambda: {
+                "group_chat_send": {
+                    "enabled": True,
+                    "groups": {
+                        "123456": {
+                            "observe_only": False,
+                            "allow_roll_reply": True,
+                        }
+                    },
+                }
+            }
+            try:
+                result = await routes._run_group_reply_decision(
+                    "qq_group_123456",
+                    {
+                        "trigger_id": "group_repair_test",
+                        "reason": "roll",
+                        "source_message_id": "99112250",
+                        "source_buffer_version": 1,
+                        "request_buffer_version": 1,
+                    },
+                    [{"qid": "550808201", "text": "这个怎么看"}],
+                )
+            finally:
+                routes._internal_llm_for_session = originals["_internal_llm_for_session"]
+                routes._record_group_reply_decision_log = originals["_record_group_reply_decision_log"]
+                routes._emit_llm_started = originals["_emit_llm_started"]
+                routes._emit_llm_finished = originals["_emit_llm_finished"]
+                routes.load_settings = originals["load_settings"]
+
+            self.assertEqual(result["status"], "candidate_ready_not_sent")
+            self.assertEqual(result["final_text"], "这个修正版可以发")
+            self.assertTrue(result["repair"]["attempted"])
+            self.assertEqual(result["repair"]["status"], "repair_ok")
+            self.assertEqual(len(fake_llm.messages), 2)
+
+        asyncio.run(scenario())
+
+    def test_group_decision_resolves_meme_marker_with_shared_selector_when_allowed(self):
+        async def scenario():
+            fake_llm = MemeSelectingGroupLLM()
+            records = []
+            originals = {
+                "_internal_llm_for_session": routes._internal_llm_for_session,
+                "_record_group_reply_decision_log": routes._record_group_reply_decision_log,
+                "_emit_llm_started": routes._emit_llm_started,
+                "_emit_llm_finished": routes._emit_llm_finished,
+                "load_settings": routes.load_settings,
+                "group_meme_search": routes.group_meme_search,
+                "group_meme_renderer": routes.group_meme_renderer,
+            }
+
+            async def noop_async(*_args, **_kwargs):
+                return None
+
+            routes._internal_llm_for_session = lambda _sid: fake_llm
+            routes._record_group_reply_decision_log = lambda sid, **kwargs: records.append(("decision", sid, kwargs))
+            routes._emit_llm_started = noop_async
+            routes._emit_llm_finished = noop_async
+            routes.group_meme_search = FakeGroupMemeSearch()
+            routes.group_meme_renderer = FakeGroupMemeRenderer()
+            routes.load_settings = lambda: {
+                "group_chat_send": {
+                    "enabled": True,
+                    "groups": {
+                        "123456": {
+                            "observe_only": False,
+                            "allow_roll_reply": True,
+                            "allow_meme_send": True,
+                        }
+                    },
+                }
+            }
+            try:
+                result = await routes._run_group_reply_decision(
+                    "qq_group_123456",
+                    {
+                        "trigger_id": "group_meme_test",
+                        "reason": "roll",
+                        "source_message_id": "99112251",
+                        "source_buffer_version": 1,
+                        "request_buffer_version": 1,
+                    },
+                    [{"qid": "550808201", "text": "这图也太抽象"}],
+                )
+            finally:
+                routes._internal_llm_for_session = originals["_internal_llm_for_session"]
+                routes._record_group_reply_decision_log = originals["_record_group_reply_decision_log"]
+                routes._emit_llm_started = originals["_emit_llm_started"]
+                routes._emit_llm_finished = originals["_emit_llm_finished"]
+                routes.load_settings = originals["load_settings"]
+                routes.group_meme_search = originals["group_meme_search"]
+                routes.group_meme_renderer = originals["group_meme_renderer"]
+
+            self.assertEqual(result["status"], "candidate_ready_not_sent")
+            self.assertEqual(result["final_text"], "笑死，这图太会抢班了")
+            self.assertEqual(result["items"], [{"text": "笑死，这图太会抢班了"}, {"meme": "amused_laugh_001"}])
+            self.assertEqual(result["meme_selector"]["results"][0]["status"], "hit")
+            self.assertEqual(result["meme_selector"]["results"][0]["selected"], "amused_laugh_001")
+            self.assertEqual(len(fake_llm.messages), 2)
+
+        asyncio.run(scenario())
+
+    def test_group_decision_drops_meme_marker_when_group_meme_send_disabled(self):
+        async def scenario():
+            fake_llm = MemeSelectingGroupLLM()
+            originals = {
+                "_internal_llm_for_session": routes._internal_llm_for_session,
+                "_record_group_reply_decision_log": routes._record_group_reply_decision_log,
+                "_emit_llm_started": routes._emit_llm_started,
+                "_emit_llm_finished": routes._emit_llm_finished,
+                "load_settings": routes.load_settings,
+                "group_meme_search": routes.group_meme_search,
+                "group_meme_renderer": routes.group_meme_renderer,
+            }
+
+            async def noop_async(*_args, **_kwargs):
+                return None
+
+            routes._internal_llm_for_session = lambda _sid: fake_llm
+            routes._record_group_reply_decision_log = lambda *args, **kwargs: None
+            routes._emit_llm_started = noop_async
+            routes._emit_llm_finished = noop_async
+            routes.group_meme_search = FakeGroupMemeSearch()
+            routes.group_meme_renderer = FakeGroupMemeRenderer()
+            routes.load_settings = lambda: {
+                "group_chat_send": {
+                    "enabled": True,
+                    "groups": {
+                        "123456": {
+                            "observe_only": False,
+                            "allow_roll_reply": True,
+                            "allow_meme_send": False,
+                        }
+                    },
+                }
+            }
+            try:
+                result = await routes._run_group_reply_decision(
+                    "qq_group_123456",
+                    {
+                        "trigger_id": "group_meme_disabled_test",
+                        "reason": "roll",
+                        "source_message_id": "99112252",
+                        "source_buffer_version": 1,
+                        "request_buffer_version": 1,
+                    },
+                    [{"qid": "550808201", "text": "这图也太抽象"}],
+                )
+            finally:
+                routes._internal_llm_for_session = originals["_internal_llm_for_session"]
+                routes._record_group_reply_decision_log = originals["_record_group_reply_decision_log"]
+                routes._emit_llm_started = originals["_emit_llm_started"]
+                routes._emit_llm_finished = originals["_emit_llm_finished"]
+                routes.load_settings = originals["load_settings"]
+                routes.group_meme_search = originals["group_meme_search"]
+                routes.group_meme_renderer = originals["group_meme_renderer"]
+
+            self.assertEqual(result["status"], "candidate_ready_not_sent")
+            self.assertEqual(result["items"], [{"text": "笑死，这图太会抢班了"}])
+            self.assertEqual(result["meme_selector"]["results"][0]["status"], "disabled_by_group_policy")
+            self.assertEqual(len(fake_llm.messages), 1)
+
+        asyncio.run(scenario())
+
+    def test_group_decision_allows_meme_only_candidate_after_selector(self):
+        async def scenario():
+            fake_llm = MemeOnlySelectingGroupLLM()
+            originals = {
+                "_internal_llm_for_session": routes._internal_llm_for_session,
+                "_record_group_reply_decision_log": routes._record_group_reply_decision_log,
+                "_emit_llm_started": routes._emit_llm_started,
+                "_emit_llm_finished": routes._emit_llm_finished,
+                "load_settings": routes.load_settings,
+                "group_meme_search": routes.group_meme_search,
+                "group_meme_renderer": routes.group_meme_renderer,
+            }
+
+            async def noop_async(*_args, **_kwargs):
+                return None
+
+            routes._internal_llm_for_session = lambda _sid: fake_llm
+            routes._record_group_reply_decision_log = lambda *args, **kwargs: None
+            routes._emit_llm_started = noop_async
+            routes._emit_llm_finished = noop_async
+            routes.group_meme_search = FakeGroupMemeSearch()
+            routes.group_meme_renderer = FakeGroupMemeRenderer()
+            routes.load_settings = lambda: {
+                "group_chat_send": {
+                    "enabled": True,
+                    "groups": {
+                        "123456": {
+                            "observe_only": False,
+                            "allow_roll_reply": True,
+                            "allow_meme_send": True,
+                        }
+                    },
+                }
+            }
+            try:
+                result = await routes._run_group_reply_decision(
+                    "qq_group_123456",
+                    {
+                        "trigger_id": "group_meme_only_test",
+                        "reason": "roll",
+                        "source_message_id": "99112253",
+                        "source_buffer_version": 1,
+                        "request_buffer_version": 1,
+                    },
+                    [{"qid": "550808201", "text": "这图也太抽象"}],
+                )
+            finally:
+                routes._internal_llm_for_session = originals["_internal_llm_for_session"]
+                routes._record_group_reply_decision_log = originals["_record_group_reply_decision_log"]
+                routes._emit_llm_started = originals["_emit_llm_started"]
+                routes._emit_llm_finished = originals["_emit_llm_finished"]
+                routes.load_settings = originals["load_settings"]
+                routes.group_meme_search = originals["group_meme_search"]
+                routes.group_meme_renderer = originals["group_meme_renderer"]
+
+            self.assertEqual(result["status"], "candidate_ready_not_sent")
+            self.assertIsNone(result["final_text"])
+            self.assertEqual(result["items"], [{"meme": "amused_laugh_001"}])
+            self.assertEqual(result["meme_selector"]["results"][0]["status"], "hit")
+            self.assertEqual(len(fake_llm.messages), 2)
 
         asyncio.run(scenario())
 

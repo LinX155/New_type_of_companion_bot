@@ -26,6 +26,15 @@ interface MemePanel {
   command_result?: string;
 }
 
+interface GroupMemoryPanel {
+  path?: string;
+  dm_path?: string;
+  latest_dm_path?: string;
+  latest_daytime_memory?: unknown;
+  latest_midnight_cleanup?: unknown;
+  latest_command?: unknown;
+}
+
 export interface DebugStatus {
   status?: string;
   last_action?: string;
@@ -33,6 +42,7 @@ export interface DebugStatus {
   llm?: LlmPanel;
   gate?: GatePanel;
   meme?: MemePanel | null;
+  group_memory?: GroupMemoryPanel | null;
 }
 
 interface Props {

@@ -35,6 +35,17 @@ GROUP_DAILY_MEMORY_TEMPLATE = """# 群聊日记忆
 
 GROUP_DAILY_MEMORY_SECTIONS = ("今日群聊大事", "群友身份候选", "共同话题与梗", "q号相关近期状态")
 
+GROUP_TOMORROW_TOPICS_TEMPLATE = """# 明日话题
+
+## 未闭合话题
+
+## 昨日记忆
+
+## 生活感消息备选
+"""
+
+GROUP_TOMORROW_TOPIC_SECTIONS = ("未闭合话题", "昨日记忆", "生活感消息备选")
+
 
 class GroupMemoryManager:
     """Group-specific memory store isolated from private MEMORY_CORE."""
@@ -55,6 +66,10 @@ class GroupMemoryManager:
     def dm_path(self, session_id: str, date_str: str) -> str:
         safe_date = _normalize_date_str(date_str)
         return os.path.join(self.dm_dir(session_id), f"{safe_date}.md")
+
+    def topic_path(self, session_id: str) -> str:
+        sid = normalize_session_id(session_id)
+        return os.path.join(self.base_dir, SESSION_ROOT_DIR, sid, "TOMORROW_TOPICS.md")
 
     def read(self, session_id: str) -> str:
         path = self.memory_path(session_id)
@@ -110,6 +125,33 @@ class GroupMemoryManager:
             return True
         except Exception as exc:
             print(f"[group_memory] dm write failed: {exc}")
+            return False
+
+    def read_tomorrow_topics(self, session_id: str) -> str:
+        path = self.topic_path(session_id)
+        if not os.path.exists(path):
+            self.write_tomorrow_topics(session_id, GROUP_TOMORROW_TOPICS_TEMPLATE)
+            return GROUP_TOMORROW_TOPICS_TEMPLATE
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                content = file.read()
+        except Exception:
+            return ""
+        if not _is_valid_group_tomorrow_topics(content):
+            content = _migrate_group_tomorrow_topics(content)
+            self.write_tomorrow_topics(session_id, content)
+        return content
+
+    def write_tomorrow_topics(self, session_id: str, content: str) -> bool:
+        path = self.topic_path(session_id)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            normalized = content if _is_valid_group_tomorrow_topics(content) else _migrate_group_tomorrow_topics(content)
+            with open(path, "w", encoding="utf-8") as file:
+                file.write(normalized.rstrip() + "\n")
+            return True
+        except Exception as exc:
+            print(f"[group_memory] tomorrow topics write failed: {exc}")
             return False
 
     def qid_to_nickname(self, session_id: str) -> dict[str, str]:
@@ -206,6 +248,12 @@ class GroupMemoryManager:
                 os.rmdir(dm_dir)
             except Exception:
                 pass
+        topic_path = self.topic_path(sid)
+        try:
+            if os.path.exists(topic_path):
+                os.remove(topic_path)
+        except Exception:
+            pass
 
     def _latest_dm_path(self, session_id: str) -> str:
         dm_dir = self.dm_dir(session_id)
@@ -308,11 +356,13 @@ class GroupMemoryManager:
         target_date = _normalize_date_str(date_str or (current_time or datetime.now()).strftime("%Y-%m-%d"))
         current_dm = self.read_dm_file(session_id, target_date)
         group_core = self.read(session_id)
+        current_topics = self.read_tomorrow_topics(session_id)
         messages = build_messages(
             date_str=target_date,
             transcript=events,
             today_group_memory_md=current_dm,
             current_group_memory_md=group_core,
+            current_tomorrow_topics_md=current_topics,
             current_time=(current_time or datetime.now()).isoformat(timespec="seconds"),
         )
         raw_output = await llm_client.chat_completion(messages=messages, temperature=0.2)
@@ -327,6 +377,17 @@ class GroupMemoryManager:
                 "raw_output": raw_output,
             }
 
+        proposed_topics = str(data.get("group_tomorrow_topics_md") or data.get("tomorrow_topics_md") or "").strip()
+        topics_updated = False
+        topics_reason = None
+        if proposed_topics:
+            if not _is_valid_group_tomorrow_topics(proposed_topics):
+                topics_reason = "invalid_group_tomorrow_topics"
+            elif proposed_topics.strip() != current_topics.strip():
+                topics_updated = self.write_tomorrow_topics(session_id, proposed_topics)
+                if not topics_updated:
+                    topics_reason = "failed_to_write_group_tomorrow_topics"
+
         merged, changes = _merge_group_daily_memory(current_dm, proposed, allowed_qids=_known_qids_from_events(events) | _known_qids_from_memory(group_core))
         if merged.strip() == current_dm.strip():
             return {
@@ -334,6 +395,9 @@ class GroupMemoryManager:
                 "note": str(data.get("note") or ""),
                 "date": target_date,
                 "path": self.dm_path(session_id, target_date),
+                "tomorrow_topics_updated": topics_updated,
+                "tomorrow_topics_reason": topics_reason,
+                "tomorrow_topics_path": self.topic_path(session_id),
                 "changes": changes,
                 "raw_output": raw_output,
             }
@@ -341,6 +405,9 @@ class GroupMemoryManager:
             return {
                 "status": "write_failed",
                 "date": target_date,
+                "tomorrow_topics_updated": topics_updated,
+                "tomorrow_topics_reason": topics_reason,
+                "tomorrow_topics_path": self.topic_path(session_id),
                 "changes": changes,
                 "raw_output": raw_output,
             }
@@ -349,6 +416,9 @@ class GroupMemoryManager:
             "note": str(data.get("note") or ""),
             "date": target_date,
             "path": self.dm_path(session_id, target_date),
+            "tomorrow_topics_updated": topics_updated,
+            "tomorrow_topics_reason": topics_reason,
+            "tomorrow_topics_path": self.topic_path(session_id),
             "changes": changes,
             "raw_output": raw_output,
         }
@@ -694,6 +764,10 @@ def _is_valid_group_daily_memory(content: str) -> bool:
     return bool(content and "# 群聊日记忆" in content and all(f"## {section}" in content for section in GROUP_DAILY_MEMORY_SECTIONS))
 
 
+def _is_valid_group_tomorrow_topics(content: str) -> bool:
+    return bool(content and "# 明日话题" in content and all(f"## {section}" in content for section in GROUP_TOMORROW_TOPIC_SECTIONS))
+
+
 def _normalize_date_str(value: str) -> str:
     text = str(value or "").strip()
     try:
@@ -719,6 +793,16 @@ def _migrate_group_daily_memory(content: str) -> str:
         if not stripped or stripped.startswith("#"):
             continue
         result = _append_daily_section_line(result, "今日群聊大事", stripped, dedupe=True)
+    return result
+
+
+def _migrate_group_tomorrow_topics(content: str) -> str:
+    result = GROUP_TOMORROW_TOPICS_TEMPLATE
+    for line in (content or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        result = _append_topic_section_line(result, "未闭合话题", stripped, dedupe=True)
     return result
 
 
@@ -781,6 +865,29 @@ def _replace_daily_section(content: str, section: str, lines: list[str]) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
+def _replace_topic_section(content: str, section: str, lines: list[str]) -> str:
+    if not _is_valid_group_tomorrow_topics(content):
+        content = _migrate_group_tomorrow_topics(content)
+    out = []
+    in_section = False
+    replaced = False
+    for raw in content.rstrip().splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("## "):
+            if in_section and not replaced:
+                out.extend(lines)
+                replaced = True
+            in_section = stripped[3:].strip() == section
+            out.append(raw)
+            continue
+        if in_section:
+            continue
+        out.append(raw)
+    if in_section and not replaced:
+        out.extend(lines)
+    return "\n".join(out).rstrip() + "\n"
+
+
 def _append_section_line(content: str, section: str, line: str, dedupe: bool = False) -> str:
     lines = _section_lines(content, section)
     if not dedupe or line not in lines:
@@ -793,6 +900,13 @@ def _append_daily_section_line(content: str, section: str, line: str, dedupe: bo
     if not dedupe or line not in lines:
         lines.append(line)
     return _replace_daily_section(content, section, lines)
+
+
+def _append_topic_section_line(content: str, section: str, line: str, dedupe: bool = False) -> str:
+    lines = _section_lines(content, section)
+    if not dedupe or line not in lines:
+        lines.append(line if line.startswith(("-", "*", "•")) else f"- {line}")
+    return _replace_topic_section(content, section, lines)
 
 
 def _upsert_identity(content: str, sender_qid: str, nickname: str) -> str:

@@ -32,6 +32,7 @@ _DEFAULTS = {
             "allow_roll_reply": False,
             "allow_repetition": False,
             "allow_meme_send": False,
+            "allow_active_message": False,
             "allow_command_reply": True,
         },
         "groups": {},

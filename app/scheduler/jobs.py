@@ -13,16 +13,24 @@ from ..llm.client import LLMClient
 from ..core.settings import load_settings
 from ..llm.prompts import (
     build_context_checkpoint_messages,
+    build_group_context_checkpoint_messages,
     build_group_memory_analysis_messages,
     build_group_midnight_cleanup_messages,
     build_memory_analysis_messages,
     build_midnight_cleanup_messages,
 )
+from ..core.protocol import (
+    contains_internal_visible_protocol,
+    contains_malformed_visible_meme_marker,
+    contains_visible_meme_marker,
+)
 from ..storage.context_checkpoints import (
     latest_context_checkpoint_for_session,
+    latest_group_visible_event_id,
     latest_prompt_debug_for_session,
     latest_visible_event_id,
     load_conversation_context,
+    load_group_visible_events_for_checkpoint,
     load_visible_events_for_checkpoint,
     normalize_context_checkpoint_config,
 )
@@ -47,9 +55,28 @@ GROUP_MEMORY_EVENT_ROLES = {
     "command.mem": "user",
     "command.forget": "user",
     "onebot_group_send": "assistant",
-    "group_memory_command": "assistant",
     "group_repetition": "assistant",
 }
+GROUP_CHECKPOINT_FORBIDDEN_OUTPUT_TOKENS = (
+    "sender_card",
+    "sender_nickname",
+    "平台群名片",
+    "平台昵称",
+    "群名片",
+    "QQ昵称",
+    "qq昵称",
+    "message_id",
+    "onebot_message_id",
+    "reply_to_message_id",
+    "media_key",
+    "media_job_id",
+    "file_unique",
+    "file_id",
+    "local_path",
+    "file_path",
+    "http://",
+    "https://",
+)
 ACTIVE_DAILY_JOB_PREFIX = "active_daily:"
 ACTIVE_NEXT_JOB_PREFIX = "active_next:"
 ACTIVE_MESSAGE_TOPIC_TIME_RE = re.compile(
@@ -378,6 +405,9 @@ class SchedulerManager:
             ok, error = await self._run_group_midnight_cleanup_for_session(base_job_id, session_id)
             if not ok:
                 failures.append({"session_id": session_id, "job_type": "group_midnight_cleanup", "error": error})
+            checkpoint_ok, checkpoint_error = await self._run_group_context_checkpoint_for_session(checkpoint_job_id, session_id)
+            if not checkpoint_ok:
+                failures.append({"session_id": session_id, "job_type": "group_context_checkpoint", "error": checkpoint_error})
         return {"status": "completed" if not failures else "partial_failed", "failures": failures}
 
     async def _run_midnight_cleanup_for_session(self, base_job_id: str, session_id: str):
@@ -627,6 +657,177 @@ class SchedulerManager:
             result["llm_call_debug"] = llm_debug
         return result
 
+    async def _run_group_context_checkpoint_for_session(self, base_job_id: str, session_id: str):
+        job_id = f"{base_job_id}_group_{session_id}"
+        log_id = self._start_job(job_id, "group_context_checkpoint", session_id=session_id)
+        try:
+            result = await self._maybe_create_group_context_checkpoint(job_id, session_id)
+            self._record_context_checkpoint_audit(session_id, job_id, result, "completed")
+            self._finish_job(log_id, "completed", self._job_note(llm_debug=result.get("llm_call_debug")))
+            return True, None
+        except Exception as e:
+            llm_debug = getattr(e, "_llm_call_debug", None)
+            result = {
+                "status": "failed",
+                "scope": "group",
+                "error": str(e),
+            }
+            if llm_debug:
+                result["llm_call_debug"] = llm_debug
+            self._record_context_checkpoint_audit(session_id, job_id, result, "failed")
+            self._finish_job(log_id, "failed", self._job_note(error=str(e), llm_debug=llm_debug))
+            return False, str(e)
+
+    async def _maybe_create_group_context_checkpoint(self, job_id: str, session_id: str) -> dict:
+        config = normalize_context_checkpoint_config(load_settings().get("context_checkpoint"))
+        threshold_tokens = int(config["threshold_k"]) * 1000
+        latest_debug = latest_prompt_debug_for_session(session_id)
+        if not latest_debug:
+            return {
+                "status": "skipped",
+                "scope": "group",
+                "reason": "skipped_bounded_group_window",
+                "detail": "no_group_prompt_debug",
+                "threshold_tokens": threshold_tokens,
+            }
+
+        current_tokens = int(latest_debug.get("tokens") or 0)
+        if current_tokens < threshold_tokens:
+            return {
+                "status": "skipped",
+                "scope": "group",
+                "reason": "below_threshold",
+                "tokens": current_tokens,
+                "threshold_tokens": threshold_tokens,
+                "source_prompt_debug_id": latest_debug.get("id"),
+            }
+
+        latest_checkpoint = latest_context_checkpoint_for_session(session_id)
+        if (
+            latest_checkpoint
+            and latest_checkpoint.get("source_prompt_debug_id")
+            and latest_checkpoint["source_prompt_debug_id"] >= latest_debug["id"]
+        ):
+            return {
+                "status": "skipped",
+                "scope": "group",
+                "reason": "already_checkpointed_for_latest_debug",
+                "tokens": current_tokens,
+                "threshold_tokens": threshold_tokens,
+                "source_prompt_debug_id": latest_debug.get("id"),
+                "context_checkpoint_id": latest_checkpoint.get("id"),
+            }
+
+        through_event_id = latest_group_visible_event_id(session_id)
+        if not through_event_id:
+            return {
+                "status": "skipped",
+                "scope": "group",
+                "reason": "no_group_visible_events",
+                "tokens": current_tokens,
+                "threshold_tokens": threshold_tokens,
+                "source_prompt_debug_id": latest_debug.get("id"),
+            }
+
+        after_event_id = latest_checkpoint.get("covered_until_event_id") if latest_checkpoint else None
+        visible_events = load_group_visible_events_for_checkpoint(session_id, after_event_id, through_event_id)
+        if not visible_events and latest_checkpoint:
+            return {
+                "status": "skipped",
+                "scope": "group",
+                "reason": "no_new_group_visible_events_after_checkpoint",
+                "tokens": current_tokens,
+                "threshold_tokens": threshold_tokens,
+                "source_prompt_debug_id": latest_debug.get("id"),
+                "context_checkpoint_id": latest_checkpoint.get("id"),
+                "covered_until_raw_log_id": through_event_id,
+            }
+        if not visible_events:
+            return {
+                "status": "skipped",
+                "scope": "group",
+                "reason": "no_group_visible_events_to_compress",
+                "tokens": current_tokens,
+                "threshold_tokens": threshold_tokens,
+                "source_prompt_debug_id": latest_debug.get("id"),
+                "covered_until_raw_log_id": through_event_id,
+            }
+
+        if self.group_memory is None:
+            raise RuntimeError("group memory manager is not configured for group context checkpoint")
+        llm = self._llm_for_session(session_id)
+        if llm is None or not getattr(llm, "api_key", ""):
+            raise RuntimeError("LLM client is not configured for group context checkpoint")
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        messages = build_group_context_checkpoint_messages(
+            session_id=session_id,
+            previous_checkpoint_text=(latest_checkpoint or {}).get("checkpoint_text") or "",
+            group_visible_events=visible_events,
+            current_group_memory_md=self.group_memory.read(session_id),
+            today_group_memory_md=self.group_memory.read_dm_file(session_id, today),
+            group_tomorrow_topics_md=self.group_memory.read_tomorrow_topics(session_id),
+            estimated_tokens_before=current_tokens,
+        )
+        try:
+            raw_output = await llm.chat_completion(messages=messages, temperature=0.2)
+            data = self._parse_json_object(raw_output)
+        except Exception as exc:
+            try:
+                setattr(exc, "_llm_call_debug", self._llm_call_debug(llm))
+            except Exception:
+                pass
+            raise
+        llm_debug = self._llm_call_debug(llm)
+        checkpoint_text = (data.get("checkpoint_text") or "").strip()
+        if not checkpoint_text:
+            exc = RuntimeError("group context checkpoint response missing checkpoint_text")
+            try:
+                setattr(exc, "_llm_call_debug", llm_debug)
+            except Exception:
+                pass
+            raise exc
+        if self._is_unsafe_group_checkpoint_text(checkpoint_text):
+            exc = RuntimeError("group context checkpoint response contains forbidden internal/platform content")
+            try:
+                setattr(exc, "_llm_call_debug", llm_debug)
+            except Exception:
+                pass
+            raise exc
+
+        checkpoint_id = self._write_context_checkpoint(
+            session_id=session_id,
+            checkpoint_text=checkpoint_text,
+            covered_until_event_id=through_event_id,
+            source_prompt_debug_id=latest_debug["id"],
+            estimated_tokens_before=latest_debug.get("estimated_tokens"),
+            prompt_tokens_before=latest_debug.get("prompt_tokens"),
+        )
+        result = {
+            "status": "created",
+            "scope": "group",
+            "context_checkpoint_id": checkpoint_id,
+            "covered_until_event_id": through_event_id,
+            "covered_until_raw_log_id": through_event_id,
+            "source_prompt_debug_id": latest_debug["id"],
+            "tokens": current_tokens,
+            "threshold_tokens": threshold_tokens,
+            "compressed_event_count": len(visible_events),
+        }
+        if llm_debug:
+            result["llm_call_debug"] = llm_debug
+        return result
+
+    def _is_unsafe_group_checkpoint_text(self, text: str) -> bool:
+        value = str(text or "")
+        lowered = value.lower()
+        return (
+            contains_internal_visible_protocol(value)
+            or contains_malformed_visible_meme_marker(value)
+            or contains_visible_meme_marker(value)
+            or any(token.lower() in lowered for token in GROUP_CHECKPOINT_FORBIDDEN_OUTPUT_TOKENS)
+        )
+
     def _write_context_checkpoint(
         self,
         *,
@@ -661,8 +862,10 @@ class SchedulerManager:
                 event_id=f"context_checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}",
                 session_id=session_id,
                 event_type="context_checkpoint",
+                platform="qq_group" if str(session_id).startswith("qq_group_") else "webui",
                 raw_payload=json.dumps(payload or {}, ensure_ascii=False),
                 job_id=job_id,
+                action=str((payload or {}).get("scope") or "private"),
                 status=status,
             ))
             db.commit()

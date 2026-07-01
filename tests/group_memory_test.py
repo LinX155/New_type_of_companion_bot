@@ -68,10 +68,38 @@ class GroupMemoryManagerTest(unittest.TestCase):
             self.assertIn("平台群名片", system)
             self.assertIn("sender_card", system)
             self.assertIn("sender_nickname", system)
-            self.assertIn("私聊 MEMORY_CORE.md", system)
-            self.assertIn("私聊 TOMORROW_TOPICS.md", system)
+            self.assertIn("非当前群聊会话的 MEMORY_CORE.md", system)
+            self.assertIn("非当前群聊会话的 MEMORY_CORE.md、TODAY_MEMORY.md、TOMORROW_TOPICS.md", system)
             self.assertIn("[[quote]]", system)
             self.assertIn("tool tag", system)
+            self.assertIn("不要读取 raw chat log", system)
+            self.assertIn("CoT", system)
+            self.assertIn("只维护当前群自己的 dm、GROUP_MEMORY.md 和 group_tomorrow_topics_md", system)
+            self.assertIn("active_message_setting", system)
+            self.assertIn("群友原话 > 群友文字 + 图片理解 > 单独图片理解", system)
+            self.assertIn("对每条候选先判断生命周期", system)
+            self.assertIn("写入个人相关记忆时必须消除说话人歧义", system)
+
+        memory_system = prompts[0][0]["content"]
+        self.assertIn("assistant 可见回复只用于理解对话承接", memory_system)
+        self.assertIn("不写流水账", memory_system)
+        self.assertIn("完整的群聊 TOMORROW_TOPICS.md", memory_system)
+        self.assertIn("不要把提醒事项正文写入 dm 或 group_tomorrow_topics_md", memory_system)
+
+        cleanup_system = prompts[1][0]["content"]
+        self.assertIn("long 只能来自明确身份", cleanup_system)
+        self.assertIn("不要把当天情绪", cleanup_system)
+        self.assertIn("GROUP_MEMORY.md 中已有过期近期状态", cleanup_system)
+
+        mem_system = prompts[2][0]["content"]
+        self.assertIn("content_to_remember 是 sender_qid", mem_system)
+        self.assertIn("其中“我/我的/本人/俺”都指 sender_qid", mem_system)
+        self.assertIn("不要原样保留“我……”或“你……”", mem_system)
+
+        forget_system = prompts[3][0]["content"]
+        self.assertIn("按语义匹配要删除的条目", forget_system)
+        self.assertIn("权限不清或范围过大时宁可不删", forget_system)
+        self.assertIn("不能因为一句泛化请求清空共同记忆", forget_system)
 
     def test_mem_self_identity_updates_confirmed_qid_nickname_and_personal_memory(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -214,6 +242,15 @@ class GroupMemoryManagerTest(unittest.TestCase):
 ## q号相关近期状态
 - 550808201 当天参与赛博猫猫梗
 """,
+                    "group_tomorrow_topics_md": """# 明日话题
+
+## 未闭合话题
+- [pending] [2026-06-30]: 群里还可以自然接赛博猫猫梗
+
+## 昨日记忆
+
+## 生活感消息备选
+""",
                     "note": "updated",
                 })
 
@@ -238,8 +275,12 @@ class GroupMemoryManagerTest(unittest.TestCase):
                 dm = manager.read_dm_file("qq_group_123456", "2026-06-30")
                 self.assertIn("赛博猫猫梗当天反复出现", dm)
                 self.assertIn("550808201 明确自称小夏", dm)
+                topics = manager.read_tomorrow_topics("qq_group_123456")
+                self.assertIn("群里还可以自然接赛博猫猫梗", topics)
+                self.assertTrue(result["tomorrow_topics_updated"])
                 self.assertIn("群聊日间记忆线程", llm.messages[0]["content"])
                 self.assertIn("不能直接修改 GROUP_MEMORY.md", llm.messages[0]["content"])
+                self.assertIn("current_group_tomorrow_topics_md", llm.messages[1]["content"])
                 self.assertNotIn("MEMORY_CORE.md 的合适分区", llm.messages[0]["content"])
 
         asyncio.run(scenario())

@@ -8,6 +8,7 @@ type GroupPolicy = {
   allow_roll_reply?: boolean;
   allow_repetition?: boolean;
   allow_meme_send?: boolean;
+  allow_active_message?: boolean;
   allow_command_reply?: boolean;
   configured?: boolean;
 };
@@ -37,6 +38,7 @@ const GroupChatOpsConfig: React.FC = () => {
   const [allowRoll, setAllowRoll] = useState(false);
   const [allowRepetition, setAllowRepetition] = useState(false);
   const [allowMeme, setAllowMeme] = useState(false);
+  const [allowActiveMessage, setAllowActiveMessage] = useState(false);
   const [allowCommand, setAllowCommand] = useState(true);
   const [dirty, setDirty] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -55,6 +57,7 @@ const GroupChatOpsConfig: React.FC = () => {
     setAllowRoll(Boolean(policy.allow_roll_reply));
     setAllowRepetition(Boolean(policy.allow_repetition));
     setAllowMeme(Boolean(policy.allow_meme_send));
+    setAllowActiveMessage(Boolean(policy.allow_active_message));
     setAllowCommand(policy.allow_command_reply !== false);
     setDirty(false);
   };
@@ -92,6 +95,7 @@ const GroupChatOpsConfig: React.FC = () => {
           allow_roll_reply: allowRoll,
           allow_repetition: allowRepetition,
           allow_meme_send: allowMeme,
+          allow_active_message: allowActiveMessage,
           allow_command_reply: allowCommand,
         }),
       });
@@ -216,6 +220,7 @@ const GroupChatOpsConfig: React.FC = () => {
           {checkboxLabel('允许 roll 回复', allowRoll, setAllowRoll, observeOnly)}
           {checkboxLabel('允许复读', allowRepetition, setAllowRepetition, observeOnly)}
           {checkboxLabel('允许发表情包', allowMeme, setAllowMeme, observeOnly)}
+          {checkboxLabel('允许主动消息', allowActiveMessage, setAllowActiveMessage, observeOnly)}
           {checkboxLabel('允许命令回执', allowCommand, setAllowCommand, observeOnly)}
         </div>
       </div>

@@ -14,6 +14,7 @@ DEFAULT_GROUP_SEND_CONFIG = {
         "allow_roll_reply": False,
         "allow_repetition": False,
         "allow_meme_send": False,
+        "allow_active_message": False,
         "allow_command_reply": True,
     },
     "groups": {},
@@ -197,6 +198,7 @@ def normalize_group_policy(policy: Optional[dict] = None) -> dict:
         "allow_roll_reply": bool(raw.get("allow_roll_reply")),
         "allow_repetition": bool(raw.get("allow_repetition")),
         "allow_meme_send": bool(raw.get("allow_meme_send")),
+        "allow_active_message": bool(raw.get("allow_active_message")),
         "allow_command_reply": bool(raw.get("allow_command_reply")),
     }
 
@@ -284,6 +286,8 @@ def _trigger_policy_block_reason(policy: dict, trigger_reason: str) -> Optional[
         return "group_repetition_disabled"
     if trigger_reason in {"group.command.mem", "group.command.forget"} and not policy.get("allow_command_reply"):
         return "group_command_reply_disabled"
+    if trigger_reason == "active_message" and not policy.get("allow_active_message"):
+        return "group_active_message_disabled"
     return None
 
 

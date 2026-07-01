@@ -1,14 +1,25 @@
+import json
+import tempfile
 import unittest
 from datetime import datetime
+from pathlib import Path
 
 from app.core.group_activity import GroupActivityTracker, day_type_for_datetime
 
 
 class GroupActivityTrackerTest(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.base_dir = self._tmpdir.name
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
     def test_daily_update_builds_weekday_active_and_quiet_labels(self):
         tracker = GroupActivityTracker(
             config={"ema_alpha": 1.0, "update_hour": 6},
             now_func=lambda: datetime(2026, 6, 30, 6, 0),
+            base_dir=self.base_dir,
         )
         entries = [
             _entry("2026-06-29T21:00:00"),
@@ -27,7 +38,11 @@ class GroupActivityTrackerTest(unittest.TestCase):
 
     def test_update_runs_once_after_six_unless_forced(self):
         now = datetime(2026, 6, 30, 6, 0)
-        tracker = GroupActivityTracker(config={"ema_alpha": 1.0}, now_func=lambda: now)
+        tracker = GroupActivityTracker(
+            config={"ema_alpha": 1.0},
+            now_func=lambda: now,
+            base_dir=self.base_dir,
+        )
 
         first = tracker.maybe_update("qq_group_123456", [_entry("2026-06-29T21:00:00")])
         second = tracker.maybe_update("qq_group_123456", [_entry("2026-06-29T22:00:00")])
@@ -48,6 +63,7 @@ class GroupActivityTrackerTest(unittest.TestCase):
                 "max_roll_cooldown_minutes": 120.0,
             },
             now_func=lambda: clock["now"],
+            base_dir=self.base_dir,
         )
         tracker.maybe_update(
             "qq_group_123456",
@@ -74,6 +90,82 @@ class GroupActivityTrackerTest(unittest.TestCase):
         self.assertEqual(active["roll_cooldown_minutes"], 15.0)
         self.assertEqual(quiet["label"], "quiet")
         self.assertEqual(quiet["roll_cooldown_minutes"], 60.0)
+
+    def test_activity_profile_persists_and_loads_after_restart(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tracker = GroupActivityTracker(
+                config={
+                    "ema_alpha": 1.0,
+                    "active_cooldown_multiplier": 0.5,
+                    "quiet_cooldown_multiplier": 2.0,
+                    "min_roll_cooldown_minutes": 1.0,
+                    "max_roll_cooldown_minutes": 120.0,
+                },
+                now_func=lambda: datetime(2026, 6, 30, 6, 0),
+                base_dir=tmpdir,
+            )
+            result = tracker.maybe_update(
+                "qq_group_123456",
+                [
+                    _entry("2026-06-29T21:00:00"),
+                    _entry("2026-06-29T21:05:00"),
+                    _entry("2026-06-29T21:10:00"),
+                ],
+                force=True,
+            )
+
+            profile_path = Path(tmpdir) / "memory" / "sessions" / "qq_group_123456" / "GROUP_ACTIVITY.json"
+            self.assertTrue(result["profile_persisted"])
+            self.assertEqual(Path(result["profile_path"]), profile_path)
+            self.assertTrue(profile_path.exists())
+
+            payload = json.loads(profile_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["session_id"], "qq_group_123456")
+            self.assertEqual(payload["last_source_event_count"], 3)
+            self.assertIn(21, payload["labels"]["weekday"]["active_hours"])
+            self.assertIn("config_snapshot", payload)
+
+            restarted = GroupActivityTracker(
+                config={
+                    "active_cooldown_multiplier": 0.5,
+                    "quiet_cooldown_multiplier": 2.0,
+                    "min_roll_cooldown_minutes": 1.0,
+                    "max_roll_cooldown_minutes": 120.0,
+                },
+                now_func=lambda: datetime(2026, 6, 30, 21, 0),
+                base_dir=tmpdir,
+            )
+            active = restarted.roll_cooldown_adjustment(
+                "qq_group_123456",
+                30.0,
+                now=datetime(2026, 6, 30, 21, 0),
+            )
+            status = restarted.status("qq_group_123456")
+
+            self.assertEqual(active["label"], "active")
+            self.assertEqual(active["roll_cooldown_minutes"], 15.0)
+            self.assertTrue(status["profile_persisted"])
+            self.assertEqual(Path(status["profile_path"]), profile_path)
+
+    def test_clear_removes_persisted_activity_profile(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tracker = GroupActivityTracker(
+                config={"ema_alpha": 1.0},
+                now_func=lambda: datetime(2026, 6, 30, 6, 0),
+                base_dir=tmpdir,
+            )
+            tracker.maybe_update(
+                "qq_group_123456",
+                [_entry("2026-06-29T21:00:00")],
+                force=True,
+            )
+            profile_path = Path(tmpdir) / "memory" / "sessions" / "qq_group_123456" / "GROUP_ACTIVITY.json"
+            self.assertTrue(profile_path.exists())
+
+            tracker.clear("qq_group_123456")
+
+            self.assertFalse(profile_path.exists())
+            self.assertFalse(tracker.status("qq_group_123456")["profile_persisted"])
 
     def test_day_type_distinguishes_weekend(self):
         self.assertEqual(day_type_for_datetime(datetime(2026, 6, 30, 12, 0)), "weekday")

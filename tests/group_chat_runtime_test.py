@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from app.core.decisions import Action
+from app.core.decisions import Action, SendItemType
 from app.core.group_chat import (
     classify_group_visible_text,
     group_chat_runtime_status,
@@ -18,20 +18,35 @@ class GroupChatRuntimeTest(unittest.TestCase):
         messages = build_group_chat_messages(
             group_window=window,
             trigger={"reason": "debug"},
+            group_soul="# GROUP_SOUL\n群聊里有主见但不抢戏。",
             current_time="2026-06-30 23:30",
         )
 
         self.assertEqual(messages[0]["role"], "system")
         self.assertIn("你不是任何人的女友", messages[0]["content"])
-        self.assertIn("只允许输出 WAIT 或一条短自然文本", messages[0]["content"])
+        self.assertIn("group_soul", messages[0]["content"])
+        self.assertIn("只允许输出 WAIT、一条短自然文本", messages[0]["content"])
+        self.assertIn("不要立即给建议", messages[0]["content"])
+        self.assertIn("沉默后的补接", messages[0]["content"])
+        self.assertIn("不要默认以提问收尾", messages[0]["content"])
+        self.assertIn("current_time", messages[0]["content"])
+        self.assertIn("&&category:keywords&&", messages[0]["content"])
+        self.assertIn("不要输出 `meme:...`", messages[0]["content"])
+        self.assertIn("主动性与日程边界", messages[0]["content"])
+        self.assertIn("群聊主回复可以处理明确的主动消息时间设置请求", messages[0]["content"])
+        self.assertIn("不是提醒工具", messages[0]["content"])
+        self.assertIn("next/daily", messages[0]["content"])
         self.assertNotIn("SOUL.md", messages[0]["content"])
         self.assertNotIn("HOT", messages[0]["content"])
         self.assertNotIn("COLD", messages[0]["content"])
+        self.assertNotIn("ENTER_CHAT", messages[0]["content"])
 
         payload = json.loads(messages[1]["content"])
         self.assertEqual(payload["task"], "group_chat_decision")
+        self.assertEqual(payload["group_soul"], "# GROUP_SOUL\n群聊里有主见但不抢戏。")
         self.assertEqual(payload["group_window"], window)
         self.assertFalse(payload["output_contract"]["send_enabled"])
+        self.assertIn("short_natural_text_with_one_meme_marker", payload["output_contract"]["allowed"])
 
     def test_group_prompt_only_contains_confirmed_nickname_mapping(self):
         messages = build_group_chat_messages(
@@ -72,6 +87,25 @@ class GroupChatRuntimeTest(unittest.TestCase):
         self.assertTrue(text_result.should_send)
         self.assertEqual(text_result.decision.text_bubbles(), ["这个槽点可以先记一笔"])
 
+    def test_parse_group_text_with_meme_marker_becomes_internal_search_item(self):
+        result = parse_group_chat_output("笑死，这个角度太离谱了 &&amused:laughing cat&&")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.decision.action, Action.REACT)
+        self.assertTrue(result.should_send)
+        items = result.decision.all_items()
+        self.assertEqual([item.type for item in items], [SendItemType.TEXT, SendItemType.SEARCH_MEME])
+        self.assertEqual(items[0].content, "笑死，这个角度太离谱了")
+        self.assertEqual(items[1].harness_value(), "amused:laughing cat")
+
+    def test_parse_group_marker_only_is_typed_but_not_send_ready_until_selector_layer(self):
+        result = parse_group_chat_output("&&amused:laugh&&")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.decision.action, Action.REACT)
+        self.assertFalse(result.should_send)
+        self.assertEqual(result.decision.search_meme_items()[0].harness_value(), "amused:laugh")
+
     def test_parse_group_output_blocks_qid_leak(self):
         result = parse_group_chat_output("550808201 这句别直接念出来", known_qids=["550808201"])
 
@@ -90,12 +124,21 @@ class GroupChatRuntimeTest(unittest.TestCase):
         self.assertEqual(result.decision.action, Action.WAIT)
         self.assertEqual(result.safety.reason, "known_message_id_leak")
 
+    def test_parse_group_output_allows_active_message_side_effect_after_topic_layer(self):
+        result = parse_group_chat_output("行，我明天叫你 &&daily:08:00&&")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.decision.action, Action.REPLY)
+        self.assertEqual(result.decision.text_bubbles(), ["行，我明天叫你"])
+        self.assertEqual(result.decision.active_message_setting(), {"type": "daily", "time": "08:00"})
+
     def test_parse_group_output_blocks_internal_protocol_leaks(self):
         bad_samples = [
             "[[quote]]991122",
             "<tool_call>",
             "<meme:amused_cat>",
             "meme:amused_cat",
+            "search_meme:amused:laugh",
             "unknown",
             "message_id=99112233",
             '{"action":"REPLY","items":[{"text":"hi"}]}',
@@ -155,6 +198,12 @@ class GroupChatRuntimeTest(unittest.TestCase):
         self.assertTrue(status["activity_dynamic_cooldown_enabled"])
         self.assertFalse(status["uses_private_hot_cold"])
         self.assertFalse(status["uses_private_input_gate"])
+        self.assertEqual(status["state_machine"], "GROUP_TYPED_ACTION_HARNESS")
+        self.assertIn("text_with_meme_marker", status["allowed_outputs"])
+        self.assertIn("text_with_active_message_marker", status["allowed_outputs"])
+        self.assertIn("search_meme", status["internal_typed_items"])
+        self.assertEqual(status["search_meme_resolution"], "shared_meme_selector")
+        self.assertEqual(status["active_message_side_effect"], "group_scoped_after_successful_send")
 
 
 if __name__ == "__main__":

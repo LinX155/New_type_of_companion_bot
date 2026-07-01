@@ -11,6 +11,7 @@ from app.adapters.onebot11.client import OneBotConnectionManager
 from app.adapters.onebot11.events import parse_onebot_event
 from app.core.event_gate import EventGate, USER_COMPOSING_MAX_BLOCK_SECONDS
 from app.core.events import ChatEvent, EventType
+from app.core.group_activity import GroupActivityTracker
 from app.core.group_buffer import GroupChatBuffer
 from app.core.group_memory import GroupMemoryManager
 from app.core.group_repetition import GroupRepetitionDetector
@@ -29,6 +30,15 @@ async def _append_async(target, value):
 
 
 class OneBotAdapterTest(unittest.TestCase):
+    def setUp(self):
+        self._group_activity_tmpdir = tempfile.TemporaryDirectory()
+        self._original_group_activity_tracker = routes.group_activity_tracker
+        routes.group_activity_tracker = GroupActivityTracker(base_dir=self._group_activity_tmpdir.name)
+
+    def tearDown(self):
+        routes.group_activity_tracker = self._original_group_activity_tracker
+        self._group_activity_tmpdir.cleanup()
+
     def test_onebot_client_send_group_text_uses_group_msg_with_reply_segment(self):
         async def scenario():
             manager = OneBotConnectionManager()
@@ -330,6 +340,7 @@ class OneBotAdapterTest(unittest.TestCase):
                 "_emit_state": routes._emit_state,
                 "_runtime_for_event": routes._runtime_for_event,
                 "_ensure_group_reply_scheduler": routes._ensure_group_reply_scheduler,
+                "_maybe_update_group_activity": routes._maybe_update_group_activity,
                 "init_gate": routes.init_gate,
                 "group_chat_buffer": routes.group_chat_buffer,
             }
@@ -358,6 +369,7 @@ class OneBotAdapterTest(unittest.TestCase):
             routes._emit_state = fake_state
             routes._runtime_for_event = fail_runtime
             routes._ensure_group_reply_scheduler = lambda: FakeGroupScheduler()
+            routes._maybe_update_group_activity = lambda _session_id: {"status": "skipped", "reason": "test"}
             routes.init_gate = fail_init_gate
             routes.group_chat_buffer = GroupChatBuffer()
             try:
@@ -376,6 +388,7 @@ class OneBotAdapterTest(unittest.TestCase):
                 routes._emit_state = originals["_emit_state"]
                 routes._runtime_for_event = originals["_runtime_for_event"]
                 routes._ensure_group_reply_scheduler = originals["_ensure_group_reply_scheduler"]
+                routes._maybe_update_group_activity = originals["_maybe_update_group_activity"]
                 routes.init_gate = originals["init_gate"]
                 routes.group_chat_buffer = originals["group_chat_buffer"]
 
