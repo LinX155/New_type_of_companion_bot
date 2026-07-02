@@ -16,23 +16,28 @@ from .sessions import normalize_session_id
 DEFAULT_GROUP_ROLL_CONFIG = {
     "mention_pending_seconds": 120.0,
     "roll_cooldown_minutes": 30.0,  # X
-    "roll_attempt_cooldown_seconds": 60.0,
+    "roll_cooldown_random_enabled": True,
+    "roll_cooldown_random_min_minutes": 5.0,
+    "roll_cooldown_random_max_minutes": 30.0,
+    "roll_attempt_cooldown_seconds": 10.0,
     "roll_random_min": 0.0,
     "roll_random_max": 10.0,
     "base_threshold": 8.8,  # b
-    "message_count_high": 12,  # A: over this, add q1
-    "message_count_low": 4,  # B: under this, subtract p1
+    "message_count_high": 10,  # A: over this, add q1
+    "message_count_low": 3,  # B: under this, subtract p1
     "density_q1": 1.25,
-    "image_q2": 1.10,  # q2 < q1
-    "low_activity_p1": 1.40,
+    "image_q2": 1.05,  # q2 < q1
+    "low_activity_p1": 1.15,
     "meme_ratio_threshold": 0.55,  # o
-    "meme_p2": 1.15,  # p2 < p1
+    "meme_p2": 1.05,  # p2 < p1
     "roll_window_minutes": 20.0,
     "model_window_limit": 50,
     "max_stale_reruns": 1,
     "roll_hot_enabled": True,
-    "roll_hot_a_step": 2,
-    "roll_hot_a_min": 4,
+    "roll_hot_x_step_minutes": 10.0,
+    "roll_hot_x_min_minutes": 0.0,
+    "roll_hot_a_step": 0,
+    "roll_hot_a_min": 0,
 }
 
 
@@ -115,6 +120,7 @@ class GroupReplyScheduler:
         self._last_roll_attempt_at: dict[str, datetime] = {}
         self._last_decision_by_session: dict[str, dict] = {}
         self._roll_hot_level_by_session: dict[str, int] = {}
+        self._roll_cooldown_base_minutes_by_session: dict[str, float] = {}
 
     async def on_group_event(self, event: ChatEvent, group_window: dict) -> dict:
         session_id = normalize_session_id(event.session_id)
@@ -168,9 +174,12 @@ class GroupReplyScheduler:
         )
 
     def evaluate_roll(self, session_id: str, stats: dict) -> dict:
+        sid = normalize_session_id(session_id)
         now = self.now_func()
-        last_candidate_at = self._last_candidate_at.get(session_id)
-        activity = self._activity_adjustment(session_id, now)
+        last_candidate_at = self._last_candidate_at.get(sid)
+        cooldown_context = self._roll_cooldown_context(sid, create=last_candidate_at is not None)
+        activity = self._activity_adjustment(sid, now, cooldown_context["effective_x_minutes"])
+        activity["roll_cooldown"] = cooldown_context
         cooldown_seconds = float(activity["roll_cooldown_minutes"]) * 60.0
         if last_candidate_at and (now - last_candidate_at).total_seconds() < cooldown_seconds:
             return {
@@ -180,9 +189,11 @@ class GroupReplyScheduler:
                 "last_candidate_at": last_candidate_at.isoformat(),
                 "cooldown_seconds": cooldown_seconds,
                 "activity": activity,
+                "roll_hot": cooldown_context["roll_hot"],
+                "cooldown": cooldown_context,
             }
 
-        last_roll_at = self._last_roll_attempt_at.get(session_id)
+        last_roll_at = self._last_roll_attempt_at.get(sid)
         attempt_cooldown = float(self.config["roll_attempt_cooldown_seconds"])
         if last_roll_at and (now - last_roll_at).total_seconds() < attempt_cooldown:
             return {
@@ -198,7 +209,7 @@ class GroupReplyScheduler:
         if roll_max < roll_min:
             roll_min, roll_max = roll_max, roll_min
         raw_roll_value = float(self.random_func(roll_min, roll_max))
-        roll_hot = self._roll_hot_context(session_id)
+        roll_hot = self._roll_hot_context(sid)
         adjusted_roll_value, operations = self._adjust_roll_value(raw_roll_value, stats, roll_hot=roll_hot)
         threshold_value = float(self.config["base_threshold"])
         should_schedule = adjusted_roll_value > threshold_value
@@ -218,6 +229,7 @@ class GroupReplyScheduler:
             "params_snapshot": deepcopy(self.config),
             "activity": activity,
             "roll_hot": roll_hot,
+            "cooldown": cooldown_context,
             "roll_hot_update": roll_hot_update,
             "stats": deepcopy(stats),
         }
@@ -278,6 +290,7 @@ class GroupReplyScheduler:
             self._last_roll_attempt_at.pop(sid, None)
             self._last_decision_by_session.pop(sid, None)
             self._roll_hot_level_by_session.pop(sid, None)
+            self._roll_cooldown_base_minutes_by_session.pop(sid, None)
             return
         for task in self._tasks_by_session.values():
             task.cancel()
@@ -287,6 +300,7 @@ class GroupReplyScheduler:
         self._last_roll_attempt_at.clear()
         self._last_decision_by_session.clear()
         self._roll_hot_level_by_session.clear()
+        self._roll_cooldown_base_minutes_by_session.clear()
 
     async def _schedule_from_event(
         self,
@@ -458,6 +472,12 @@ class GroupReplyScheduler:
             result["send_result"] = deepcopy(send_result)
         if decision.get("should_send_candidate"):
             self._last_candidate_at[trigger.session_id] = self.now_func()
+            if self.config["roll_cooldown_random_enabled"]:
+                self._roll_cooldown_base_minutes_by_session[trigger.session_id] = (
+                    self._sample_roll_cooldown_base_minutes()
+                )
+            else:
+                self._roll_cooldown_base_minutes_by_session.pop(trigger.session_id, None)
         self._last_decision_by_session[trigger.session_id] = deepcopy(result)
         await self._debug("group_reply_decision_finished", result)
         return result
@@ -467,7 +487,7 @@ class GroupReplyScheduler:
         operations: list[dict] = []
         count = int(stats.get("event_count") or 0)
         low = int(self.config["message_count_low"])
-        high = max(low, int((roll_hot or {}).get("effective_A") or self.config["message_count_high"]))
+        high = max(low, int(self.config["message_count_high"]))
 
         if count > high:
             delta = float(self.config["density_q1"])
@@ -513,26 +533,69 @@ class GroupReplyScheduler:
 
         return adjusted, operations
 
-    def _roll_hot_context(self, session_id: str) -> dict:
+    def _roll_hot_context(self, session_id: str, *, base_x_minutes: Optional[float] = None) -> dict:
         sid = normalize_session_id(session_id)
         enabled = bool(self.config["roll_hot_enabled"])
         low = int(self.config["message_count_low"])
         base_a = max(low, int(self.config["message_count_high"]))
-        a_step = max(0, int(self.config["roll_hot_a_step"]))
-        a_min = min(base_a, max(low, int(self.config["roll_hot_a_min"])))
+        x_base = (
+            _nonnegative_float(base_x_minutes)
+            if base_x_minutes is not None
+            else self._roll_cooldown_base_minutes(sid, create=False)[0]
+        )
+        x_step = _nonnegative_float(self.config["roll_hot_x_step_minutes"])
+        x_min = min(x_base, _nonnegative_float(self.config["roll_hot_x_min_minutes"]))
         level = max(0, int(self._roll_hot_level_by_session.get(sid, 0)))
-        effective_a = base_a
+        effective_x = x_base
         if enabled:
-            effective_a = max(a_min, base_a - level * a_step)
+            effective_x = max(x_min, x_base - level * x_step)
         return {
             "enabled": enabled,
             "session_id": sid,
             "level": level if enabled else 0,
             "base_A": base_a,
-            "effective_A": effective_a,
-            "a_step": a_step,
-            "a_min": a_min,
+            "effective_A": base_a,
+            "base_X_minutes": x_base,
+            "effective_X_minutes": effective_x,
+            "x_step_minutes": x_step,
+            "x_min_minutes": x_min,
         }
+
+    def _roll_cooldown_context(self, session_id: str, *, create: bool = False) -> dict:
+        sid = normalize_session_id(session_id)
+        base_x, source = self._roll_cooldown_base_minutes(sid, create=create)
+        roll_hot = self._roll_hot_context(sid, base_x_minutes=base_x)
+        return {
+            "session_id": sid,
+            "random_enabled": bool(self.config["roll_cooldown_random_enabled"]),
+            "base_x_minutes": base_x,
+            "base_x_source": source,
+            "effective_x_minutes": max(0.0, float(roll_hot["effective_X_minutes"])),
+            "roll_hot": roll_hot,
+        }
+
+    def _roll_cooldown_base_minutes(self, session_id: str, *, create: bool = False) -> tuple[float, str]:
+        sid = normalize_session_id(session_id)
+        if not bool(self.config["roll_cooldown_random_enabled"]):
+            return _nonnegative_float(self.config["roll_cooldown_minutes"]), "fixed"
+        existing = self._roll_cooldown_base_minutes_by_session.get(sid)
+        if existing is not None:
+            return _nonnegative_float(existing), "stored_random"
+        if create:
+            sampled = self._sample_roll_cooldown_base_minutes()
+            self._roll_cooldown_base_minutes_by_session[sid] = sampled
+            return sampled, "sampled_random"
+        return _nonnegative_float(self.config["roll_cooldown_random_max_minutes"]), "random_preview_max"
+
+    def _sample_roll_cooldown_base_minutes(self) -> float:
+        left = _nonnegative_float(self.config["roll_cooldown_random_min_minutes"])
+        right = _nonnegative_float(self.config["roll_cooldown_random_max_minutes"])
+        if right < left:
+            left, right = right, left
+        if right <= left:
+            return left
+        sampled = float(self.random_func(left, right))
+        return min(right, max(left, sampled))
 
     def _promote_roll_hot(self, session_id: str) -> dict:
         sid = normalize_session_id(session_id)
@@ -579,8 +642,10 @@ class GroupReplyScheduler:
             "buffered_events_total": len(all_entries),
         }
 
-    def _activity_adjustment(self, session_id: str, now: datetime) -> dict:
-        base_minutes = float(self.config["roll_cooldown_minutes"])
+    def _activity_adjustment(self, session_id: str, now: datetime, base_minutes: Optional[float] = None) -> dict:
+        base_minutes = _nonnegative_float(
+            self.config["roll_cooldown_minutes"] if base_minutes is None else base_minutes
+        )
         if not self.activity_callback:
             return {
                 "enabled": False,
@@ -628,6 +693,9 @@ def normalize_group_roll_config(config: Optional[dict] = None) -> dict:
     normalized = {
         "mention_pending_seconds": max(0.0, float(merged["mention_pending_seconds"])),
         "roll_cooldown_minutes": max(0.0, float(merged["roll_cooldown_minutes"])),
+        "roll_cooldown_random_enabled": bool(merged["roll_cooldown_random_enabled"]),
+        "roll_cooldown_random_min_minutes": max(0.0, float(merged["roll_cooldown_random_min_minutes"])),
+        "roll_cooldown_random_max_minutes": max(0.0, float(merged["roll_cooldown_random_max_minutes"])),
         "roll_attempt_cooldown_seconds": max(0.0, float(merged["roll_attempt_cooldown_seconds"])),
         "roll_random_min": float(merged["roll_random_min"]),
         "roll_random_max": float(merged["roll_random_max"]),
@@ -651,9 +719,19 @@ def normalize_group_roll_config(config: Optional[dict] = None) -> dict:
         "model_window_limit": max(1, int(merged["model_window_limit"])),
         "max_stale_reruns": max(0, int(merged["max_stale_reruns"])),
         "roll_hot_enabled": bool(merged["roll_hot_enabled"]),
+        "roll_hot_x_step_minutes": max(0.0, float(merged["roll_hot_x_step_minutes"])),
+        "roll_hot_x_min_minutes": max(0.0, float(merged["roll_hot_x_min_minutes"])),
         "roll_hot_a_step": max(0, int(merged["roll_hot_a_step"])),
         "roll_hot_a_min": max(0, int(merged["roll_hot_a_min"])),
     }
+    if normalized["roll_cooldown_random_max_minutes"] < normalized["roll_cooldown_random_min_minutes"]:
+        (
+            normalized["roll_cooldown_random_min_minutes"],
+            normalized["roll_cooldown_random_max_minutes"],
+        ) = (
+            normalized["roll_cooldown_random_max_minutes"],
+            normalized["roll_cooldown_random_min_minutes"],
+        )
     return normalized
 
 
@@ -670,6 +748,16 @@ def _merged_roll_delta(raw_config: dict, merged: dict, primary: str, legacy: str
 
 def _normalize_roll_delta(value: float) -> float:
     return max(1.000001, float(value))
+
+
+def _nonnegative_float(value) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if result != result:
+        return 0.0
+    return max(0.0, result)
 
 
 def group_event_mentions_bot(event: ChatEvent) -> bool:

@@ -13,9 +13,12 @@ class GroupReplySchedulerTest(unittest.TestCase):
 
         self.assertEqual(config["roll_random_min"], 0.0)
         self.assertEqual(config["roll_random_max"], 10.0)
+        self.assertTrue(config["roll_cooldown_random_enabled"])
+        self.assertGreaterEqual(config["roll_cooldown_random_min_minutes"], 0.0)
+        self.assertLessEqual(config["roll_cooldown_random_max_minutes"], 30.0)
         self.assertTrue(config["roll_hot_enabled"])
-        self.assertGreater(config["roll_hot_a_step"], 0)
-        self.assertGreaterEqual(config["roll_hot_a_min"], 0)
+        self.assertGreater(config["roll_hot_x_step_minutes"], 0)
+        self.assertGreaterEqual(config["roll_hot_x_min_minutes"], 0)
         for key in ("density_q1", "image_q2", "low_activity_p1", "meme_p2"):
             self.assertGreater(config[key], 1.0)
         self.assertLess(config["image_q2"], config["density_q1"])
@@ -298,7 +301,7 @@ class GroupReplySchedulerTest(unittest.TestCase):
             scheduler = GroupReplyScheduler(
                 group_buffer=buffer,
                 decision_callback=lambda *_args: {"status": "wait", "should_send_candidate": False},
-                config={"roll_cooldown_minutes": 30},
+                config={"roll_cooldown_minutes": 30, "roll_cooldown_random_enabled": False},
                 random_func=lambda _left, _right: 0.0,
                 now_func=lambda: now,
                 create_tasks=False,
@@ -346,24 +349,35 @@ class GroupReplySchedulerTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_roll_hot_lowers_effective_a_until_next_real_miss(self):
+    def test_roll_hot_lowers_effective_x_until_next_real_miss(self):
         async def scenario():
             buffer = GroupChatBuffer()
-            rolls = iter([10.0, 5.0, 0.0])
+            now = datetime(2026, 6, 30, 23, 30)
+            rolls = iter([10.0, 0.0])
+
+            async def decide(_session_id, _trigger, _model_window):
+                return {
+                    "status": "candidate_ready",
+                    "should_send_candidate": True,
+                    "final_text": "命中后进入热态",
+                }
+
             scheduler = GroupReplyScheduler(
                 group_buffer=buffer,
-                decision_callback=lambda *_args: {"status": "wait", "should_send_candidate": False},
+                decision_callback=decide,
                 config={
-                    "roll_cooldown_minutes": 0,
+                    "roll_cooldown_minutes": 30,
+                    "roll_cooldown_random_enabled": False,
                     "roll_attempt_cooldown_seconds": 0,
                     "base_threshold": 6.0,
                     "message_count_high": 6,
                     "message_count_low": 2,
                     "density_q1": 2.0,
-                    "roll_hot_a_step": 2,
-                    "roll_hot_a_min": 2,
+                    "roll_hot_x_step_minutes": 10,
+                    "roll_hot_x_min_minutes": 5,
                 },
                 random_func=lambda _left, _right: next(rolls),
+                now_func=lambda: now,
                 create_tasks=False,
             )
             event = _group_event("evt_roll_hot", "99112243", "普通群聊")
@@ -371,19 +385,22 @@ class GroupReplySchedulerTest(unittest.TestCase):
 
             schedule = await scheduler.on_group_event(event, append_result)
             self.assertEqual(schedule["status"], "scheduled")
-            self.assertEqual(schedule["trigger"]["roll"]["roll_hot"]["effective_A"], 6)
-            self.assertEqual(schedule["trigger"]["roll"]["roll_hot_update"]["after"]["effective_A"], 4)
+            self.assertEqual(schedule["trigger"]["roll"]["roll_hot"]["effective_X_minutes"], 30)
+            self.assertEqual(schedule["trigger"]["roll"]["roll_hot_update"]["after"]["effective_X_minutes"], 20)
+            await scheduler.run_pending_now("qq_group_123456")
             self.assertEqual(scheduler.status("qq_group_123456")["roll_hot"]["level"], 1)
 
-            hot_hit = scheduler.evaluate_roll(
+            now = datetime(2026, 6, 30, 23, 45)
+            cooldown = scheduler.evaluate_roll(
                 "qq_group_123456",
                 {"event_count": 5, "image_count": 0, "meme_ratio": 0.0},
             )
-            self.assertTrue(hot_hit["should_schedule"])
-            self.assertEqual(hot_hit["roll_hot"]["effective_A"], 4)
-            self.assertEqual(hot_hit["operations"][0]["reason"], "message_count_above_A")
-            self.assertEqual(hot_hit["operations"][0]["effective_A"], 4)
+            self.assertFalse(cooldown["should_schedule"])
+            self.assertEqual(cooldown["skip_reason"], "candidate_cooldown")
+            self.assertEqual(cooldown["cooldown"]["effective_x_minutes"], 20)
+            self.assertEqual(cooldown["activity"]["roll_cooldown_minutes"], 20)
 
+            now = datetime(2026, 6, 30, 23, 51)
             miss = scheduler.evaluate_roll(
                 "qq_group_123456",
                 {"event_count": 0, "image_count": 0, "meme_ratio": 0.0},
@@ -391,9 +408,38 @@ class GroupReplySchedulerTest(unittest.TestCase):
             self.assertFalse(miss["should_schedule"])
             self.assertEqual(miss["roll_hot_update"]["event"], "roll_miss_reset")
             self.assertEqual(scheduler.status("qq_group_123456")["roll_hot"]["level"], 0)
-            self.assertEqual(scheduler.status("qq_group_123456")["roll_hot"]["effective_A"], 6)
+            self.assertEqual(scheduler.status("qq_group_123456")["roll_hot"]["effective_X_minutes"], 30)
 
         asyncio.run(scenario())
+
+    def test_random_x_is_clamped_before_hot_subtraction(self):
+        now = datetime(2026, 6, 30, 23, 55)
+        scheduler = GroupReplyScheduler(
+            group_buffer=GroupChatBuffer(),
+            decision_callback=lambda *_args: {"status": "wait", "should_send_candidate": False},
+            config={
+                "roll_cooldown_random_enabled": True,
+                "roll_cooldown_random_min_minutes": 5,
+                "roll_cooldown_random_max_minutes": 30,
+                "roll_hot_x_step_minutes": 50,
+                "roll_hot_x_min_minutes": 2,
+            },
+            random_func=lambda _left, _right: -100.0,
+            now_func=lambda: now,
+            create_tasks=False,
+        )
+        scheduler._last_candidate_at["qq_group_123456"] = now - timedelta(minutes=1)
+        scheduler._roll_hot_level_by_session["qq_group_123456"] = 10
+
+        result = scheduler.evaluate_roll(
+            "qq_group_123456",
+            {"event_count": 1, "image_count": 0, "meme_ratio": 0.0},
+        )
+
+        self.assertEqual(result["skip_reason"], "candidate_cooldown")
+        self.assertEqual(result["cooldown"]["base_x_minutes"], 5)
+        self.assertEqual(result["cooldown"]["effective_x_minutes"], 2)
+        self.assertEqual(result["cooldown_seconds"], 120.0)
 
     def test_mentions_bot_reads_engineering_flag(self):
         self.assertTrue(group_event_mentions_bot(_group_event("evt", "1", "hi", mentions_bot=True)))

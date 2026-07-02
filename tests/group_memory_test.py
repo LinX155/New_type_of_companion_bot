@@ -79,6 +79,7 @@ class GroupMemoryManagerTest(unittest.TestCase):
             self.assertIn("群友原话 > 群友文字 + 图片理解 > 单独图片理解", system)
             self.assertIn("对每条候选先判断生命周期", system)
             self.assertIn("写入个人相关记忆时必须消除说话人歧义", system)
+            self.assertIn("如果用户存在攻击、玩笑、辱骂等内容，不得记录", system)
 
         memory_system = prompts[0][0]["content"]
         self.assertIn("assistant 可见回复只用于理解对话承接", memory_system)
