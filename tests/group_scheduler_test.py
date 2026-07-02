@@ -13,6 +13,9 @@ class GroupReplySchedulerTest(unittest.TestCase):
 
         self.assertEqual(config["roll_random_min"], 0.0)
         self.assertEqual(config["roll_random_max"], 10.0)
+        self.assertTrue(config["roll_hot_enabled"])
+        self.assertGreater(config["roll_hot_a_step"], 0)
+        self.assertGreaterEqual(config["roll_hot_a_min"], 0)
         for key in ("density_q1", "image_q2", "low_activity_p1", "meme_p2"):
             self.assertGreater(config[key], 1.0)
         self.assertLess(config["image_q2"], config["density_q1"])
@@ -340,6 +343,55 @@ class GroupReplySchedulerTest(unittest.TestCase):
             self.assertEqual(result["roll"]["skip_reason"], "candidate_cooldown")
             self.assertEqual(result["roll"]["activity"]["label"], "quiet")
             self.assertEqual(result["roll"]["activity"]["roll_cooldown_minutes"], 60.0)
+
+        asyncio.run(scenario())
+
+    def test_roll_hot_lowers_effective_a_until_next_real_miss(self):
+        async def scenario():
+            buffer = GroupChatBuffer()
+            rolls = iter([10.0, 5.0, 0.0])
+            scheduler = GroupReplyScheduler(
+                group_buffer=buffer,
+                decision_callback=lambda *_args: {"status": "wait", "should_send_candidate": False},
+                config={
+                    "roll_cooldown_minutes": 0,
+                    "roll_attempt_cooldown_seconds": 0,
+                    "base_threshold": 6.0,
+                    "message_count_high": 6,
+                    "message_count_low": 2,
+                    "density_q1": 2.0,
+                    "roll_hot_a_step": 2,
+                    "roll_hot_a_min": 2,
+                },
+                random_func=lambda _left, _right: next(rolls),
+                create_tasks=False,
+            )
+            event = _group_event("evt_roll_hot", "99112243", "普通群聊")
+            append_result = await buffer.append(event)
+
+            schedule = await scheduler.on_group_event(event, append_result)
+            self.assertEqual(schedule["status"], "scheduled")
+            self.assertEqual(schedule["trigger"]["roll"]["roll_hot"]["effective_A"], 6)
+            self.assertEqual(schedule["trigger"]["roll"]["roll_hot_update"]["after"]["effective_A"], 4)
+            self.assertEqual(scheduler.status("qq_group_123456")["roll_hot"]["level"], 1)
+
+            hot_hit = scheduler.evaluate_roll(
+                "qq_group_123456",
+                {"event_count": 5, "image_count": 0, "meme_ratio": 0.0},
+            )
+            self.assertTrue(hot_hit["should_schedule"])
+            self.assertEqual(hot_hit["roll_hot"]["effective_A"], 4)
+            self.assertEqual(hot_hit["operations"][0]["reason"], "message_count_above_A")
+            self.assertEqual(hot_hit["operations"][0]["effective_A"], 4)
+
+            miss = scheduler.evaluate_roll(
+                "qq_group_123456",
+                {"event_count": 0, "image_count": 0, "meme_ratio": 0.0},
+            )
+            self.assertFalse(miss["should_schedule"])
+            self.assertEqual(miss["roll_hot_update"]["event"], "roll_miss_reset")
+            self.assertEqual(scheduler.status("qq_group_123456")["roll_hot"]["level"], 0)
+            self.assertEqual(scheduler.status("qq_group_123456")["roll_hot"]["effective_A"], 6)
 
         asyncio.run(scenario())
 

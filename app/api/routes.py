@@ -89,6 +89,7 @@ from ..memory.files import MemoryFileManager, TOMORROW_TOPICS_TEMPLATE
 from ..memes.catalog import MemeCatalog
 from ..memes.renderer import MemeRenderer
 from ..memes.search import MemeSearch
+from ..memes.reclassify import MemeReclassifier, MemeReclassifyQueue
 from ..memes.steal import MemeStealAnalyzer, MemeStealSaver
 from ..scheduler.jobs import SchedulerManager
 from ..storage.context_checkpoints import (
@@ -253,6 +254,15 @@ group_meme_search = MemeSearch(meme_catalog)
 group_meme_renderer = MemeRenderer(meme_catalog)
 meme_steal_analyzer = MemeStealAnalyzer(meme_catalog, ROOT_DIR)
 meme_steal_saver = MemeStealSaver(meme_catalog, ROOT_DIR)
+meme_reclassifier = MemeReclassifier(
+    catalog=meme_catalog,
+    analyzer=meme_steal_analyzer,
+    saver=meme_steal_saver,
+)
+meme_reclassify_queue = MemeReclassifyQueue(
+    reclassifier=meme_reclassifier,
+    llm_client_factory=lambda: llm_client,
+)
 scheduler_manager = SchedulerManager(memory_manager, llm_client)
 onebot_manager = OneBotConnectionManager()
 onebot_media_downloader = OneBotMediaDownloader(ROOT_DIR, onebot_manager)
@@ -370,6 +380,12 @@ class NudgeRequest(BaseModel):
 class MemeStealAnalyzeRequest(BaseModel):
     image_ref: str
     context_text: str = ""
+
+
+class MemeReclassifyRequest(BaseModel):
+    from_category: str
+    file_stem: str
+    target_category: str
 
 
 def init_gate():
@@ -5656,6 +5672,41 @@ async def delete_meme_image(category_id: str, file_stem: str):
     if success:
         return {"status": "ok"}
     raise HTTPException(status_code=404, detail="Image not found")
+
+
+@router.post("/api/memes/reclassify")
+async def reclassify_meme(req: MemeReclassifyRequest):
+    if not llm_client.api_key:
+        raise HTTPException(status_code=400, detail="LLM API key is not configured")
+    categories = meme_catalog.get_categories()
+    if req.from_category not in categories:
+        raise HTTPException(status_code=400, detail="from_category is not a known meme category")
+    if req.target_category not in categories:
+        raise HTTPException(status_code=400, detail="target_category is not a known meme category")
+    if not meme_catalog.get_image_path(req.from_category, req.file_stem):
+        raise HTTPException(status_code=404, detail="Image not found")
+    try:
+        job = await meme_reclassify_queue.submit(
+            from_category=req.from_category,
+            file_stem=req.file_stem,
+            target_category=req.target_category,
+        )
+        return {"status": "queued", "job": job}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"meme reclassify enqueue failed: {e}")
+
+
+@router.get("/api/memes/reclassify/jobs")
+async def get_meme_reclassify_jobs():
+    return meme_reclassify_queue.status()
+
+
+@router.get("/api/memes/reclassify/jobs/{job_id}")
+async def get_meme_reclassify_job(job_id: str):
+    job = meme_reclassify_queue.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Meme reclassify job not found")
+    return job
 
 
 @router.get("/api/memes/render")

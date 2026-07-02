@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 
 interface CategoryInfo {
   id: string;
@@ -13,7 +13,30 @@ interface MemeStats {
   data_dir: string;
 }
 
+interface DraggedMeme {
+  category: string;
+  stem: string;
+}
+
+interface ReclassifyJob {
+  job_id: string;
+  from_category: string;
+  file_stem: string;
+  target_category: string;
+  status: string;
+  queue_position?: number;
+  result?: {
+    status?: string;
+    file_stem?: string;
+    target_category?: string;
+    error?: string | null;
+  } | null;
+  error?: string | null;
+}
+
 const API_BASE = '';
+
+const terminalJobStatuses = new Set(['completed', 'failed']);
 
 const MemeManager: React.FC = () => {
   const [categories, setCategories] = useState<CategoryInfo[]>([]);
@@ -22,98 +45,224 @@ const MemeManager: React.FC = () => {
   const [images, setImages] = useState<string[]>([]);
   const [filteredCount, setFilteredCount] = useState(0);
   const [previewImage, setPreviewImage] = useState<string | null>(null);
+  const [draggedMeme, setDraggedMeme] = useState<DraggedMeme | null>(null);
+  const [dragOverCategory, setDragOverCategory] = useState<string | null>(null);
+  const [reclassifyJobs, setReclassifyJobs] = useState<Record<string, ReclassifyJob>>({});
 
   useEffect(() => {
-    fetchCategories();
-    fetchStats();
-    fetchFiltered();
+    void fetchCategories();
+    void fetchStats();
+    void fetchFiltered();
   }, []);
 
-  const fetchCategories = () => {
-    fetch(`${API_BASE}/api/memes/categories`)
-      .then(r => r.json())
-      .then(data => setCategories(data))
-      .catch(() => {});
+  const fetchCategories = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/memes/categories`);
+      if (res.ok) setCategories(await res.json() as CategoryInfo[]);
+    } catch {}
   };
 
-  const fetchStats = () => {
-    fetch(`${API_BASE}/api/memes/stats`)
-      .then(r => r.json())
-      .then(data => setStats(data))
-      .catch(() => {});
+  const fetchStats = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/memes/stats`);
+      if (res.ok) setStats(await res.json() as MemeStats);
+    } catch {}
   };
 
-  const fetchFiltered = () => {
-    fetch(`${API_BASE}/api/memes/filtered`)
-      .then(r => r.json())
-      .then(data => setFilteredCount(data.count || 0))
-      .catch(() => {});
+  const fetchFiltered = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/memes/filtered`);
+      if (res.ok) {
+        const data = await res.json() as { count?: number };
+        setFilteredCount(data.count || 0);
+      }
+    } catch {}
   };
 
-  const selectCategory = (catId: string) => {
+  const selectCategory = async (catId: string) => {
     setSelectedCategory(catId);
-    fetch(`${API_BASE}/api/memes/category/${catId}`)
-      .then(r => r.json())
-      .then(data => setImages(data.images || []))
-      .catch(() => setImages([]));
+    try {
+      const res = await fetch(`${API_BASE}/api/memes/category/${catId}`);
+      if (!res.ok) {
+        setImages([]);
+        return;
+      }
+      const data = await res.json() as { images?: string[] };
+      setImages(data.images || []);
+    } catch {
+      setImages([]);
+    }
+  };
+
+  const refreshMemeLists = async () => {
+    await Promise.all([fetchCategories(), fetchStats(), fetchFiltered()]);
+    if (selectedCategory) await selectCategory(selectedCategory);
   };
 
   const deleteImage = async (fileStem: string) => {
-    if (!confirm(`确定要删除 ${fileStem} 吗？`)) return;
+    if (!confirm(`确认删除 ${fileStem}？`)) return;
     const catId = selectedCategory;
     if (!catId) return;
     try {
       const res = await fetch(`${API_BASE}/api/memes/image/${catId}/${fileStem}`, { method: 'DELETE' });
       if (res.ok) {
         setImages(prev => prev.filter(i => i !== fileStem));
-        fetchStats();
-        fetchCategories();
+        await Promise.all([fetchStats(), fetchCategories()]);
       }
     } catch {}
   };
 
   const copyMemeId = (fileStem: string) => {
-    navigator.clipboard.writeText(`meme:${fileStem}`);
+    void navigator.clipboard.writeText(`meme:${fileStem}`);
   };
+
+  const jobKey = (category: string, stem: string) => `${category}:${stem}`;
+
+  const isJobActive = (job?: ReclassifyJob) => Boolean(job && !terminalJobStatuses.has(job.status));
+
+  const parseDraggedMeme = (event: React.DragEvent): DraggedMeme | null => {
+    if (draggedMeme) return draggedMeme;
+    const raw = event.dataTransfer.getData('application/json') || event.dataTransfer.getData('text/plain');
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as DraggedMeme;
+      if (parsed.category && parsed.stem) return parsed;
+    } catch {}
+    return null;
+  };
+
+  const pollReclassifyJob = (jobId: string, key: string) => {
+    const poll = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/memes/reclassify/jobs/${encodeURIComponent(jobId)}`);
+        if (!res.ok) throw new Error('poll_failed');
+        const job = await res.json() as ReclassifyJob;
+        setReclassifyJobs(prev => ({ ...prev, [key]: job }));
+        if (terminalJobStatuses.has(job.status)) {
+          await refreshMemeLists();
+          return;
+        }
+        window.setTimeout(poll, 1000);
+      } catch {
+        setReclassifyJobs(prev => ({
+          ...prev,
+          [key]: {
+            ...(prev[key] || {
+              job_id: jobId,
+              from_category: '',
+              file_stem: '',
+              target_category: '',
+            }),
+            status: 'failed',
+            error: 'poll_failed',
+          },
+        }));
+      }
+    };
+    window.setTimeout(poll, 700);
+  };
+
+  const requestReclassify = async (targetCategory: string, item: DraggedMeme | null) => {
+    setDragOverCategory(null);
+    setDraggedMeme(null);
+    if (!item || item.category === targetCategory) return;
+
+    const key = jobKey(item.category, item.stem);
+    const optimisticJob: ReclassifyJob = {
+      job_id: '',
+      from_category: item.category,
+      file_stem: item.stem,
+      target_category: targetCategory,
+      status: 'queued',
+    };
+    setReclassifyJobs(prev => ({ ...prev, [key]: optimisticJob }));
+
+    try {
+      const res = await fetch(`${API_BASE}/api/memes/reclassify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from_category: item.category,
+          file_stem: item.stem,
+          target_category: targetCategory,
+        }),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || 'request_failed');
+      }
+      const data = await res.json() as { job: ReclassifyJob };
+      setReclassifyJobs(prev => ({ ...prev, [key]: data.job }));
+      pollReclassifyJob(data.job.job_id, key);
+    } catch (error) {
+      setReclassifyJobs(prev => ({
+        ...prev,
+        [key]: {
+          ...optimisticJob,
+          status: 'failed',
+          error: error instanceof Error ? error.message : 'request_failed',
+        },
+      }));
+    }
+  };
+
+  const activeJobCount = Object.values(reclassifyJobs).filter(job => isJobActive(job)).length;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-      {/* Stats bar */}
       <div style={{ background: '#fff', padding: '16px', borderRadius: '8px', display: 'flex', gap: '24px', flexWrap: 'wrap' }}>
         <div><strong>表情总数:</strong> {stats?.total ?? '-'}</div>
-        <div><strong>数据目录:</strong> {stats?.data_dir ?? '-'}</div>
+        <div><strong>表情目录:</strong> {stats?.data_dir ?? '-'}</div>
         <div><strong>过滤记录:</strong> {filteredCount}</div>
+        <div><strong>重分类队列:</strong> {activeJobCount}</div>
       </div>
 
-      <div style={{ display: 'flex', gap: '16px', flex: 1 }}>
-        {/* Category list */}
+      <div style={{ display: 'flex', gap: '16px', flex: 1, minHeight: 0 }}>
         <div style={{ width: '260px', background: '#fff', borderRadius: '8px', padding: '16px' }}>
           <h3 style={{ marginBottom: '12px', fontSize: '15px' }}>分类列表</h3>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-            {categories.map(cat => (
-              <button
-                key={cat.id}
-                onClick={() => selectCategory(cat.id)}
-                style={{
-                  textAlign: 'left',
-                  padding: '10px 12px',
-                  border: '1px solid #eee',
-                  borderRadius: '6px',
-                  background: selectedCategory === cat.id ? '#3498db' : '#fff',
-                  color: selectedCategory === cat.id ? '#fff' : '#2c3e50',
-                  cursor: 'pointer',
-                  fontSize: '13px',
-                }}
-              >
-                <div style={{ fontWeight: 600 }}>{cat.name} ({cat.count})</div>
-                <div style={{ fontSize: '11px', opacity: 0.8, marginTop: '2px' }}>{cat.description}</div>
-              </button>
-            ))}
+            {categories.map(cat => {
+              const canDrop = Boolean(draggedMeme && draggedMeme.category !== cat.id);
+              const isDragOver = dragOverCategory === cat.id && canDrop;
+              return (
+                <button
+                  key={cat.id}
+                  onClick={() => void selectCategory(cat.id)}
+                  onDragOver={event => {
+                    if (!canDrop) return;
+                    event.preventDefault();
+                    event.dataTransfer.dropEffect = 'move';
+                  }}
+                  onDragEnter={() => {
+                    if (canDrop) setDragOverCategory(cat.id);
+                  }}
+                  onDragLeave={() => {
+                    if (dragOverCategory === cat.id) setDragOverCategory(null);
+                  }}
+                  onDrop={event => {
+                    event.preventDefault();
+                    void requestReclassify(cat.id, parseDraggedMeme(event));
+                  }}
+                  style={{
+                    textAlign: 'left',
+                    padding: '10px 12px',
+                    border: isDragOver ? '1px solid #2ecc71' : '1px solid #eee',
+                    borderRadius: '6px',
+                    background: isDragOver ? '#ecfff4' : selectedCategory === cat.id ? '#3498db' : '#fff',
+                    color: selectedCategory === cat.id && !isDragOver ? '#fff' : '#2c3e50',
+                    cursor: 'pointer',
+                    fontSize: '13px',
+                  }}
+                >
+                  <div style={{ fontWeight: 600 }}>{cat.name} ({cat.count})</div>
+                  <div style={{ fontSize: '11px', opacity: 0.8, marginTop: '2px' }}>{cat.description}</div>
+                </button>
+              );
+            })}
           </div>
         </div>
 
-        {/* Image grid */}
-        <div style={{ flex: 1, background: '#fff', borderRadius: '8px', padding: '16px' }}>
+        <div style={{ flex: 1, background: '#fff', borderRadius: '8px', padding: '16px', minWidth: 0 }}>
           {selectedCategory ? (
             <>
               <div style={{ marginBottom: '12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -125,33 +274,77 @@ const MemeManager: React.FC = () => {
                 <div style={{ color: '#95a5a6', textAlign: 'center', padding: '40px' }}>暂无表情</div>
               ) : (
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: '12px' }}>
-                  {images.map(stem => (
-                    <div key={stem} style={{ border: '1px solid #eee', borderRadius: '8px', overflow: 'hidden', position: 'relative' }}>
-                      <img
-                        src={`${API_BASE}/api/memes/image/${selectedCategory}/${stem}`}
-                        alt={stem}
-                        style={{ width: '100%', height: '120px', objectFit: 'cover', cursor: 'pointer' }}
-                        onClick={() => setPreviewImage(`${API_BASE}/api/memes/image/${selectedCategory}/${stem}`)}
-                      />
-                      <div style={{ padding: '6px 8px', fontSize: '11px', wordBreak: 'break-all', color: '#555' }}>
-                        {stem}
+                  {images.map(stem => {
+                    const key = jobKey(selectedCategory, stem);
+                    const job = reclassifyJobs[key];
+                    const busy = isJobActive(job);
+                    const failed = job?.status === 'failed';
+                    return (
+                      <div
+                        key={stem}
+                        draggable={!busy}
+                        onDragStart={event => {
+                          const payload = { category: selectedCategory, stem };
+                          setDraggedMeme(payload);
+                          event.dataTransfer.effectAllowed = 'move';
+                          event.dataTransfer.setData('application/json', JSON.stringify(payload));
+                        }}
+                        onDragEnd={() => {
+                          setDraggedMeme(null);
+                          setDragOverCategory(null);
+                        }}
+                        style={{
+                          border: failed ? '1px solid #e74c3c' : '1px solid #eee',
+                          borderRadius: '8px',
+                          overflow: 'hidden',
+                          position: 'relative',
+                          opacity: busy ? 0.65 : 1,
+                          cursor: busy ? 'wait' : 'grab',
+                        }}
+                      >
+                        {job && (
+                          <div style={{
+                            position: 'absolute',
+                            top: '6px',
+                            right: '6px',
+                            zIndex: 1,
+                            fontSize: '11px',
+                            padding: '2px 6px',
+                            borderRadius: '999px',
+                            background: failed ? '#e74c3c' : busy ? '#f39c12' : '#2ecc71',
+                            color: '#fff',
+                          }}>
+                            {failed ? '失败' : busy ? '处理中' : '完成'}
+                          </div>
+                        )}
+                        <img
+                          src={`${API_BASE}/api/memes/image/${selectedCategory}/${stem}`}
+                          alt={stem}
+                          style={{ width: '100%', height: '120px', objectFit: 'cover', cursor: 'pointer' }}
+                          onClick={() => setPreviewImage(`${API_BASE}/api/memes/image/${selectedCategory}/${stem}`)}
+                        />
+                        <div style={{ padding: '6px 8px', fontSize: '11px', wordBreak: 'break-all', color: '#555', minHeight: '34px' }}>
+                          {stem}
+                        </div>
+                        <div style={{ display: 'flex', gap: '4px', padding: '0 8px 8px' }}>
+                          <button
+                            onClick={() => copyMemeId(stem)}
+                            disabled={busy}
+                            style={{ flex: 1, padding: '4px', fontSize: '11px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: busy ? 'not-allowed' : 'pointer' }}
+                          >
+                            复制ID
+                          </button>
+                          <button
+                            onClick={() => void deleteImage(stem)}
+                            disabled={busy}
+                            style={{ flex: 1, padding: '4px', fontSize: '11px', border: '1px solid #e74c3c', borderRadius: '4px', background: '#fff', color: '#e74c3c', cursor: busy ? 'not-allowed' : 'pointer' }}
+                          >
+                            删除
+                          </button>
+                        </div>
                       </div>
-                      <div style={{ display: 'flex', gap: '4px', padding: '0 8px 8px' }}>
-                        <button
-                          onClick={() => copyMemeId(stem)}
-                          style={{ flex: 1, padding: '4px', fontSize: '11px', border: '1px solid #ddd', borderRadius: '4px', background: '#fff', cursor: 'pointer' }}
-                        >
-                          复制ID
-                        </button>
-                        <button
-                          onClick={() => deleteImage(stem)}
-                          style={{ flex: 1, padding: '4px', fontSize: '11px', border: '1px solid #e74c3c', borderRadius: '4px', background: '#fff', color: '#e74c3c', cursor: 'pointer' }}
-                        >
-                          删除
-                        </button>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </>
@@ -161,7 +354,6 @@ const MemeManager: React.FC = () => {
         </div>
       </div>
 
-      {/* Preview modal */}
       {previewImage && (
         <div
           onClick={() => setPreviewImage(null)}
@@ -179,7 +371,7 @@ const MemeManager: React.FC = () => {
             src={previewImage}
             alt="preview"
             style={{ maxWidth: '80%', maxHeight: '80%', borderRadius: '8px' }}
-            onClick={e => e.stopPropagation()}
+            onClick={event => event.stopPropagation()}
           />
         </div>
       )}

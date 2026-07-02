@@ -30,6 +30,9 @@ DEFAULT_GROUP_ROLL_CONFIG = {
     "roll_window_minutes": 20.0,
     "model_window_limit": 50,
     "max_stale_reruns": 1,
+    "roll_hot_enabled": True,
+    "roll_hot_a_step": 2,
+    "roll_hot_a_min": 4,
 }
 
 
@@ -111,6 +114,7 @@ class GroupReplyScheduler:
         self._last_candidate_at: dict[str, datetime] = {}
         self._last_roll_attempt_at: dict[str, datetime] = {}
         self._last_decision_by_session: dict[str, dict] = {}
+        self._roll_hot_level_by_session: dict[str, int] = {}
 
     async def on_group_event(self, event: ChatEvent, group_window: dict) -> dict:
         session_id = normalize_session_id(event.session_id)
@@ -153,6 +157,7 @@ class GroupReplyScheduler:
             return result
 
         self._last_roll_attempt_at[session_id] = self.now_func()
+        roll["roll_hot_update"] = self._promote_roll_hot(session_id)
         return await self._schedule_from_event(
             event,
             group_window,
@@ -193,11 +198,16 @@ class GroupReplyScheduler:
         if roll_max < roll_min:
             roll_min, roll_max = roll_max, roll_min
         raw_roll_value = float(self.random_func(roll_min, roll_max))
-        adjusted_roll_value, operations = self._adjust_roll_value(raw_roll_value, stats)
+        roll_hot = self._roll_hot_context(session_id)
+        adjusted_roll_value, operations = self._adjust_roll_value(raw_roll_value, stats, roll_hot=roll_hot)
         threshold_value = float(self.config["base_threshold"])
+        should_schedule = adjusted_roll_value > threshold_value
+        roll_hot_update = None
+        if not should_schedule:
+            roll_hot_update = self._reset_roll_hot_on_miss(session_id)
         return {
             "eligible": True,
-            "should_schedule": adjusted_roll_value > threshold_value,
+            "should_schedule": should_schedule,
             "roll_value": adjusted_roll_value,
             "raw_roll_value": raw_roll_value,
             "adjusted_roll_value": adjusted_roll_value,
@@ -207,6 +217,8 @@ class GroupReplyScheduler:
             "operations": operations,
             "params_snapshot": deepcopy(self.config),
             "activity": activity,
+            "roll_hot": roll_hot,
+            "roll_hot_update": roll_hot_update,
             "stats": deepcopy(stats),
         }
 
@@ -224,6 +236,7 @@ class GroupReplyScheduler:
                 "last_decision": deepcopy(self._last_decision_by_session.get(sid)),
                 "last_candidate_at": _dt_to_text(self._last_candidate_at.get(sid)),
                 "last_roll_attempt_at": _dt_to_text(self._last_roll_attempt_at.get(sid)),
+                "roll_hot": self._roll_hot_context(sid),
                 "config": deepcopy(self.config),
             }
         return {
@@ -237,6 +250,7 @@ class GroupReplyScheduler:
                     "last_decision": deepcopy(self._last_decision_by_session.get(sid)),
                     "last_candidate_at": _dt_to_text(self._last_candidate_at.get(sid)),
                     "last_roll_attempt_at": _dt_to_text(self._last_roll_attempt_at.get(sid)),
+                    "roll_hot": self._roll_hot_context(sid),
                 }
                 for sid, pending in sorted(self._pending_by_session.items())
             },
@@ -263,6 +277,7 @@ class GroupReplyScheduler:
             self._last_candidate_at.pop(sid, None)
             self._last_roll_attempt_at.pop(sid, None)
             self._last_decision_by_session.pop(sid, None)
+            self._roll_hot_level_by_session.pop(sid, None)
             return
         for task in self._tasks_by_session.values():
             task.cancel()
@@ -271,6 +286,7 @@ class GroupReplyScheduler:
         self._last_candidate_at.clear()
         self._last_roll_attempt_at.clear()
         self._last_decision_by_session.clear()
+        self._roll_hot_level_by_session.clear()
 
     async def _schedule_from_event(
         self,
@@ -446,12 +462,12 @@ class GroupReplyScheduler:
         await self._debug("group_reply_decision_finished", result)
         return result
 
-    def _adjust_roll_value(self, roll_value: float, stats: dict) -> tuple[float, list[dict]]:
+    def _adjust_roll_value(self, roll_value: float, stats: dict, *, roll_hot: Optional[dict] = None) -> tuple[float, list[dict]]:
         adjusted = float(roll_value)
         operations: list[dict] = []
         count = int(stats.get("event_count") or 0)
         low = int(self.config["message_count_low"])
-        high = max(low, int(self.config["message_count_high"]))
+        high = max(low, int((roll_hot or {}).get("effective_A") or self.config["message_count_high"]))
 
         if count > high:
             delta = float(self.config["density_q1"])
@@ -460,6 +476,8 @@ class GroupReplyScheduler:
                 "reason": "message_count_above_A",
                 "op": "add",
                 "value": delta,
+                "event_count": count,
+                "effective_A": high,
                 "value_after": adjusted,
             })
 
@@ -494,6 +512,45 @@ class GroupReplyScheduler:
             })
 
         return adjusted, operations
+
+    def _roll_hot_context(self, session_id: str) -> dict:
+        sid = normalize_session_id(session_id)
+        enabled = bool(self.config["roll_hot_enabled"])
+        low = int(self.config["message_count_low"])
+        base_a = max(low, int(self.config["message_count_high"]))
+        a_step = max(0, int(self.config["roll_hot_a_step"]))
+        a_min = min(base_a, max(low, int(self.config["roll_hot_a_min"])))
+        level = max(0, int(self._roll_hot_level_by_session.get(sid, 0)))
+        effective_a = base_a
+        if enabled:
+            effective_a = max(a_min, base_a - level * a_step)
+        return {
+            "enabled": enabled,
+            "session_id": sid,
+            "level": level if enabled else 0,
+            "base_A": base_a,
+            "effective_A": effective_a,
+            "a_step": a_step,
+            "a_min": a_min,
+        }
+
+    def _promote_roll_hot(self, session_id: str) -> dict:
+        sid = normalize_session_id(session_id)
+        before = self._roll_hot_context(sid)
+        if not before["enabled"]:
+            return {"event": "disabled", "before": before, "after": before}
+        self._roll_hot_level_by_session[sid] = before["level"] + 1
+        after = self._roll_hot_context(sid)
+        return {"event": "roll_hit", "before": before, "after": after}
+
+    def _reset_roll_hot_on_miss(self, session_id: str) -> dict:
+        sid = normalize_session_id(session_id)
+        before = self._roll_hot_context(sid)
+        if not before["enabled"]:
+            return {"event": "disabled", "before": before, "after": before}
+        self._roll_hot_level_by_session.pop(sid, None)
+        after = self._roll_hot_context(sid)
+        return {"event": "roll_miss_reset", "before": before, "after": after}
 
     def _window_stats(self, session_id: str) -> dict:
         now = self.now_func()
@@ -593,6 +650,9 @@ def normalize_group_roll_config(config: Optional[dict] = None) -> dict:
         "roll_window_minutes": max(0.0, float(merged["roll_window_minutes"])),
         "model_window_limit": max(1, int(merged["model_window_limit"])),
         "max_stale_reruns": max(0, int(merged["max_stale_reruns"])),
+        "roll_hot_enabled": bool(merged["roll_hot_enabled"]),
+        "roll_hot_a_step": max(0, int(merged["roll_hot_a_step"])),
+        "roll_hot_a_min": max(0, int(merged["roll_hot_a_min"])),
     }
     return normalized
 

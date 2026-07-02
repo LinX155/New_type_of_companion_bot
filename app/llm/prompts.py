@@ -1000,6 +1000,62 @@ def build_meme_steal_analysis_messages(
     ]
 
 
+def build_meme_reclassify_messages(
+    *,
+    image_url: str,
+    categories_text: str,
+    source_category: str,
+    target_category: str,
+    current_file_stem: str,
+) -> list:
+    """Build a narrow vision prompt for WebUI meme reclassification."""
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是本地表情包库的重分类线程，不是聊天角色。\n"
+                "用户已经通过 WebUI 拖拽明确指定了新的固定分类；你不能更改分类，只能在目标分类下重新生成规范文件名。\n"
+                "只输出一个 JSON 对象，不要输出 Markdown、解释、前后缀或自然文本。\n\n"
+                "输出 schema:\n"
+                "{\n"
+                '  "save_name": "lower_snake_case_without_ext",\n'
+                '  "keywords": ["english", "tokens"],\n'
+                '  "reason": "一句简短原因",\n'
+                '  "safety": "ok | unclear"\n'
+                "}\n\n"
+                "命名规范:\n"
+                f"- target_category 已固定为 {target_category}，save_name 必须以 {target_category}_ 开头。\n"
+                "- save_name 只能使用英文小写、数字和下划线，不要扩展名、空格、中文或路径。\n"
+                "- save_name 推荐 3-6 个英文 token，格式为 <category>_<subject>_<expression_or_action>[_scene_or_text]。\n"
+                "- 文件名要描述画面主体、表情/动作、常见用途或图中文字，不要使用 generic、random、image、sticker、meme 这类空泛 token。\n"
+                "- keywords 使用简短英文 token，辅助表达情绪、主体、动作和使用场景。\n"
+                "- 如果图片含义不清，也必须按目标分类给一个保守但合规的 save_name，safety=unclear。\n\n"
+                "固定分类 ID:\n"
+                f"{categories_text}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "请把这张已入库表情重新命名到用户拖拽指定的目标分类。\n"
+                        f"source_category: {source_category}\n"
+                        f"target_category: {target_category}\n"
+                        f"current_file_stem: {current_file_stem}\n"
+                        "再次强调：不要改变 target_category，只重新考虑 save_name、keywords、reason。"
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                },
+            ],
+        },
+    ]
+
+
 def build_image_understanding_messages(
     image_url: str,
     is_sticker: bool,
